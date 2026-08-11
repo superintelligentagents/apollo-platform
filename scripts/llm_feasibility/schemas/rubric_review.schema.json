@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apollo.internal/schemas/llm-rubric-review-v9.json",
+  "title": "Independent live-web rubric feasibility review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "rubric_id",
+    "verdict",
+    "confidence",
+    "tested_at_utc",
+    "summary",
+    "evidence",
+    "access_constraints",
+    "blockers",
+    "safety_notes",
+    "rubric_feedback",
+    "browser_verification"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "apollo-rubric-feasibility-v9"},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 300},
+    "rubric_id": {"type": "string", "minLength": 1, "maxLength": 100},
+    "verdict": {"type": "string", "enum": ["POSSIBLE", "SHORTFALL", "IMPOSSIBLE"]},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "tested_at_utc": {"type": "string", "format": "date-time"},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 360},
+    "evidence": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "url",
+          "title",
+          "observed_at_utc",
+          "access_status",
+          "authority_role",
+          "supports",
+          "fact_or_inference",
+          "limitations"
+        ],
+        "properties": {
+          "url": {"type": "string", "pattern": "^https?://", "maxLength": 4000},
+          "title": {"type": "string", "minLength": 1, "maxLength": 500},
+          "observed_at_utc": {"type": "string", "format": "date-time"},
+          "access_status": {"type": "string", "enum": ["OK", "BLOCKED", "DEAD", "PARKED", "LOGIN_REQUIRED"]},
+          "authority_role": {"type": "string", "enum": ["DISCOVERY", "VERIFICATION", "CORROBORATION"]},
+          "supports": {"type": "string", "minLength": 1, "maxLength": 3000},
+          "fact_or_inference": {"type": "string", "enum": ["FACT", "INFERENCE"]},
+          "limitations": {"type": "string", "maxLength": 3000}
+        }
+      }
+    },
+    "access_constraints": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {"type": "string", "minLength": 1, "maxLength": 360}
+    },
+    "blockers": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {"type": "string", "minLength": 1, "maxLength": 360}
+    },
+    "safety_notes": {"type": "string", "maxLength": 3000},
+    "rubric_feedback": {"type": ["string", "null"], "maxLength": 360},
+    "browser_verification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["needed", "limitation_only", "reason", "target_urls", "safe_actions"],
+      "properties": {
+        "needed": {"type": "boolean"},
+        "limitation_only": {"type": "boolean"},
+        "reason": {"type": ["string", "null"], "maxLength": 360},
+        "target_urls": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {"type": "string", "pattern": "^https?://", "maxLength": 4000}
+        },
+        "safe_actions": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {"type": "string", "minLength": 1, "maxLength": 360}
+        }
+      }
+    }
+  }
+}

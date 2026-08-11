@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apollo.internal/schemas/llm-evergreen-review-v1.json",
+  "title": "Independent runnable-at-any-time assessment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "verdict", "confidence", "reviewed_at_utc", "summary", "concerns"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "apollo-evergreen-review-v1"},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 300},
+    "verdict": {"type": "string", "enum": ["NOT_ASSESSED", "EVERGREEN", "NOT_EVERGREEN", "NEEDS_HUMAN_REVIEW"]},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "reviewed_at_utc": {"type": "string", "format": "date-time"},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 5000},
+    "concerns": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {"type": "string", "minLength": 1, "maxLength": 2000}
+    }
+  }
+}

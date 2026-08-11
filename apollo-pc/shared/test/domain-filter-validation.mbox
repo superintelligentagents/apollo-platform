@@ -1,0 +1,69 @@
+From amazon@test Tue Aug 04 09:00:00 +0000 2026
+Message-ID: <domain-amazon@test.example>
+Date: Tue, 04 Aug 2026 09:00:00 +0000
+From: Amazon Orders <orders@amazon.com>
+To: UI Check <ui-check@example.com>
+Subject: Amazon order validation
+Content-Type: text/plain; charset=utf-8
+
+Your test Amazon order is ready.
+
+From uber@test Tue Aug 04 10:00:00 +0000 2026
+Message-ID: <domain-uber@test.example>
+Date: Tue, 04 Aug 2026 10:00:00 +0000
+From: Uber Receipts <receipts@uber.com>
+To: UI Check <ui-check@example.com>
+Subject: Uber trip validation
+Content-Type: text/plain; charset=utf-8
+
+Your test Uber trip receipt.
+
+From instacart@test Tue Aug 04 11:00:00 +0000 2026
+Message-ID: <domain-instacart@test.example>
+Date: Tue, 04 Aug 2026 11:00:00 +0000
+From: Instacart Orders <orders@instacart.com>
+To: UI Check <ui-check@example.com>
+Subject: Instacart grocery validation
+Content-Type: text/plain; charset=utf-8
+
+Your test Instacart grocery order.
+
+From negative@test Tue Aug 04 12:00:00 +0000 2026
+Message-ID: <domain-notuber@test.example>
+Date: Tue, 04 Aug 2026 12:00:00 +0000
+From: Negative Control <alerts@notuber.com>
+To: UI Check <ui-check@example.com>
+Subject: Not Uber validation
+Content-Type: text/plain; charset=utf-8
+
+This must not appear when filtering for uber.com.
+
+From hoolishop@test Tue Aug 04 13:00:00 +0000 2026
+Message-ID: <domain-hoolishop@test.example>
+Date: Tue, 04 Aug 2026 13:00:00 +0000
+From: HooliShop Orders <orders@hoolishop.mypcbench.app>
+To: UI Check <ui-check@example.com>
+Subject: HooliShop clone validation
+Content-Type: text/plain; charset=utf-8
+
+Your simulated HooliShop order is ready.
+
+From etaxi@test Tue Aug 04 14:00:00 +0000 2026
+Message-ID: <domain-etaxi@test.example>
+Date: Tue, 04 Aug 2026 14:00:00 +0000
+From: eTaxi Receipts <receipts@etaxi.mypcbench.app>
+To: UI Check <ui-check@example.com>
+Subject: eTaxi clone validation
+Content-Type: text/plain; charset=utf-8
+
+Your simulated eTaxi trip receipt.
+
+From kwikemart@test Tue Aug 04 15:00:00 +0000 2026
+Message-ID: <domain-kwikemart@test.example>
+Date: Tue, 04 Aug 2026 15:00:00 +0000
+From: Kwik-E-Mart Orders <orders@kwik-e-mart.mypcbench.app>
+To: UI Check <ui-check@example.com>
+Subject: Kwik-E-Mart clone validation
+Content-Type: text/plain; charset=utf-8
+
+Your simulated Kwik-E-Mart grocery order.

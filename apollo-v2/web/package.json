@@ -1,0 +1,21 @@
+{
+  "name": "apollo-v2-web",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "prepare": "node -e \"const fs=require('fs');fs.mkdirSync('public',{recursive:true});for(const f of ['sql-wasm.wasm','sql-wasm-browser.wasm'])fs.copyFileSync(require.resolve('sql.js/dist/'+f),'public/'+f)\"",
+    "dev": "npm run prepare && vite",
+    "build": "npm run prepare && tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@odyssey/shared": "*",
+    "sql.js": "^1.10.3"
+  },
+  "devDependencies": {
+    "@types/sql.js": "^1.4.9",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3"
+  }
+}

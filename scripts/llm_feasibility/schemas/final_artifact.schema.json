@@ -1,0 +1,184 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apollo.internal/schemas/llm-feasibility-artifact-v11.json",
+  "title": "Apollo task feasibility artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "pipeline_version",
+    "task_id",
+    "task_content_hash",
+    "created_at_utc",
+    "source",
+    "rubric_reviews",
+    "manager_review",
+    "feedback",
+    "repair_plan",
+    "status",
+    "passed"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "apollo-llm-feasibility-artifact-v11"},
+    "pipeline_version": {"type": "string", "const": "apollo-llm-feasibility-v19"},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 300},
+    "task_content_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "created_at_utc": {"type": "string", "format": "date-time"},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["effective_task", "prompt", "rubrics"],
+      "properties": {
+        "effective_task": {"type": "object"},
+        "prompt": {"type": "string", "minLength": 1, "maxLength": 200000},
+        "rubrics": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["rubric_id", "criterion", "critical"],
+            "properties": {
+              "rubric_id": {"type": "string", "minLength": 1, "maxLength": 100},
+              "criterion": {"type": "string", "minLength": 1, "maxLength": 30000},
+              "critical": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    },
+    "rubric_reviews": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rubric_id", "status", "review", "browser_review", "effective_verdict", "error"],
+        "properties": {
+          "rubric_id": {"type": "string", "minLength": 1, "maxLength": 100},
+          "status": {"type": "string", "enum": ["COMPLETED", "ERROR"]},
+          "review": {"type": ["object", "null"]},
+          "browser_review": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["status", "review", "error"],
+            "properties": {
+              "status": {"type": "string", "enum": ["NOT_RUN", "COMPLETED", "ERROR"]},
+              "review": {"type": ["object", "null"]},
+              "error": {"type": ["string", "null"], "maxLength": 8000}
+            }
+          },
+          "effective_verdict": {"type": "string", "enum": ["POSSIBLE", "SHORTFALL", "IMPOSSIBLE", "WORKER_ERROR"]},
+          "error": {"type": ["string", "null"], "maxLength": 8000}
+        }
+      }
+    },
+    "manager_review": {"type": "object"},
+    "feedback": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["task", "rubrics"],
+      "properties": {
+        "task": {"type": ["string", "null"], "maxLength": 5000},
+        "rubrics": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["rubric_id", "feedback"],
+            "properties": {
+              "rubric_id": {"type": "string", "minLength": 1, "maxLength": 100},
+              "feedback": {"type": ["string", "null"], "maxLength": 5000}
+            }
+          }
+        }
+      }
+    },
+    "repair_plan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "task_id",
+        "created_at_utc",
+        "applied_automatically",
+        "source_changed",
+        "summary",
+        "suggested_task_prompt",
+        "task_prompt_edit_operations",
+        "rubric_repairs",
+        "unresolved_rubric_ids",
+        "cross_rubric_notes",
+        "preserves_task_flow",
+        "all_suggested_changes_verified",
+        "all_rubrics_projected_possible",
+        "projected_evergreen_review",
+        "projected_feasibility_review",
+        "projected_quality_review",
+        "projected_task_status"
+      ],
+      "properties": {
+        "schema_version": {"type": "string", "const": "apollo-task-repair-plan-v3"},
+        "task_id": {"type": "string", "minLength": 1, "maxLength": 300},
+        "created_at_utc": {"type": "string", "format": "date-time"},
+        "applied_automatically": {"type": "boolean", "const": false},
+        "source_changed": {"type": "boolean", "const": false},
+        "summary": {"type": "string", "minLength": 1, "maxLength": 5000},
+        "suggested_task_prompt": {"type": ["string", "null"], "maxLength": 200000},
+        "task_prompt_edit_operations": {"type": "array", "maxItems": 3, "items": {"type": "object"}},
+        "rubric_repairs": {"type": "array", "minItems": 1, "maxItems": 100, "items": {"type": "object"}},
+        "unresolved_rubric_ids": {"type": "array", "maxItems": 100, "items": {"type": "string"}},
+        "cross_rubric_notes": {"type": "array", "maxItems": 30, "items": {"type": "string"}},
+        "preserves_task_flow": {"type": "boolean"},
+        "all_suggested_changes_verified": {"type": "boolean", "const": true},
+        "all_rubrics_projected_possible": {"type": "boolean"},
+        "projected_evergreen_review": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "verdict", "confidence", "reviewed_at_utc", "summary", "concerns", "error"],
+          "properties": {
+            "status": {"type": "string", "enum": ["NOT_REQUIRED", "COMPLETED"]},
+            "verdict": {"type": "string", "enum": ["NOT_ASSESSED", "EVERGREEN", "NOT_EVERGREEN", "NEEDS_HUMAN_REVIEW"]},
+            "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+            "reviewed_at_utc": {"type": ["string", "null"], "format": "date-time"},
+            "summary": {"type": "string", "minLength": 1, "maxLength": 5000},
+            "concerns": {"type": "array", "maxItems": 30, "items": {"type": "string", "minLength": 1, "maxLength": 2000}},
+            "error": {"type": "null"}
+          }
+        },
+        "projected_feasibility_review": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "disposition", "confidence", "reviewed_at_utc", "summary", "cross_rubric_conflicts", "task_level_risks", "error"],
+          "properties": {
+            "status": {"type": "string", "enum": ["NOT_RUN", "NOT_REQUIRED", "COMPLETED"]},
+            "disposition": {"type": ["string", "null"], "enum": ["FEASIBLE", "NOT_FEASIBLE", "NEEDS_HUMAN_REVIEW", null]},
+            "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+            "reviewed_at_utc": {"type": ["string", "null"], "format": "date-time"},
+            "summary": {"type": "string", "minLength": 1, "maxLength": 5000},
+            "cross_rubric_conflicts": {"type": "array", "maxItems": 30, "items": {"type": "string", "minLength": 1, "maxLength": 2000}},
+            "task_level_risks": {"type": "array", "maxItems": 30, "items": {"type": "string", "minLength": 1, "maxLength": 2000}},
+            "error": {"type": "null"}
+          }
+        },
+        "projected_quality_review": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "review", "error"],
+          "properties": {
+            "status": {"type": "string", "enum": ["NOT_REQUIRED", "COMPLETED"]},
+            "review": {"type": "object"},
+            "error": {"type": "null"}
+          }
+        },
+        "projected_task_status": {"type": "string", "enum": ["POSSIBLE", "UNRESOLVED"]}
+      }
+    },
+    "status": {"type": "string", "enum": ["LLM_PASS", "LLM_FAIL", "NEEDS_HUMAN_REVIEW", "PIPELINE_ERROR"]},
+    "passed": {"type": "boolean"}
+  }
+}

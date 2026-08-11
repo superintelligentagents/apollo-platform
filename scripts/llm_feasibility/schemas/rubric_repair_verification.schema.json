@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apollo.internal/schemas/rubric-repair-verification-v3.json",
+  "title": "Independent live-web verification of an advisory rubric repair",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "rubric_id",
+    "verdict",
+    "quality_verdict",
+    "quality_summary",
+    "confidence",
+    "tested_at_utc",
+    "summary",
+    "evidence",
+    "blockers"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "apollo-rubric-repair-verification-v3"},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 300},
+    "rubric_id": {"type": "string", "minLength": 1, "maxLength": 100},
+    "verdict": {"type": "string", "enum": ["POSSIBLE", "SHORTFALL", "IMPOSSIBLE"]},
+    "quality_verdict": {"type": "string", "enum": ["PASS", "FAIL", "NEEDS_HUMAN_REVIEW"]},
+    "quality_summary": {"type": "string", "minLength": 1, "maxLength": 3000},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "tested_at_utc": {"type": "string", "format": "date-time"},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 5000},
+    "evidence": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url", "title", "observed_at_utc", "supports"],
+        "properties": {
+          "url": {"type": "string", "minLength": 1, "maxLength": 4000},
+          "title": {"type": "string", "minLength": 1, "maxLength": 500},
+          "observed_at_utc": {"type": "string", "format": "date-time"},
+          "supports": {"type": "string", "minLength": 1, "maxLength": 3000}
+        }
+      }
+    },
+    "blockers": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {"type": "string", "minLength": 1, "maxLength": 1000}
+    }
+  }
+}

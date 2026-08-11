@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Crect x=%2725%27 y=%2725%27 width=%2750%27 height=%2750%27 rx=%278%27 transform=%27rotate(45 50 50)%27 fill=%27%231d5c47%27/%3E%3C/svg%3E" />
+    <title>Apollo History Helper — Privacy Policy</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        max-width: 720px;
+        margin: 48px auto;
+        padding: 0 24px;
+        color: #16233a;
+        line-height: 1.6;
+      }
+      h1 { font-size: 26px; }
+      h2 { font-size: 18px; margin-top: 28px; }
+      code { background: #f0f2f6; padding: 1px 5px; border-radius: 4px; }
+      .updated { color: #6f7a8e; font-size: 14px; }
+    </style>
+  </head>
+  <body>
+    <h1>Apollo History Helper — Privacy Policy</h1>
+    <p class="updated">Last updated: July 2026</p>
+
+    <p>
+      The Apollo History Helper is a browser extension used with the Apollo research
+      application (<a href="https://apollo-v2-site.vercel.app">apollo-v2-site.vercel.app</a>),
+      a study that builds long-horizon web-task benchmarks from real browsing.
+    </p>
+
+    <h2>What the extension does</h2>
+    <p>
+      When you click "Import my Chrome history" on the Apollo web app, the extension reads your
+      recent Chrome browsing history — page URLs, page titles, visit times, and the internal
+      visit/referrer IDs Chrome uses to link a navigation to the page it came from — for roughly
+      the last 120 days, and hands it to the Apollo page open in your browser. It does this only
+      when you ask, and only for the Apollo web app's own pages (an allow-list built into the
+      extension). It communicates with no other website and runs no server of its own; it makes
+      no network requests at all.
+    </p>
+
+    <h2>Where your data goes</h2>
+    <p>
+      History read by the extension is processed <strong>on your device</strong> inside the Apollo
+      web page. Nothing is transmitted anywhere until <strong>you</strong> choose to submit a task.
+      Before entering the Apollo workspace, you must accept a data contribution consent at sign-in.
+      Apollo records the consent version and acceptance time with each submitted task. The review
+      screen still shows the number of selected journeys and visits before submission. When you
+      submit, the task you authored and the selected journeys are uploaded to the study's secure storage. Those journeys include
+      page URLs, titles, visit times, search terms, and navigation/referrer links. History you do not
+      select for a submitted task is never uploaded.
+    </p>
+
+    <h2>How submitted tasks are used</h2>
+    <p>
+      The tasks you author and submit are research contributions to a benchmark for evaluating
+      AI web agents. The <strong>authored task content</strong> — your written request, success
+      criteria, difficulty, and the sites involved — may be included in research datasets that
+      are published or licensed to organizations building or evaluating AI agents. You are
+      compensated for this contribution through the study.
+    </p>
+    <p>
+      Your <strong>raw browsing history is never sold, licensed, or published</strong>. The
+      visit-level detail attached to a submission is used internally only, to validate the task,
+      and is not part of any published or licensed dataset.
+    </p>
+
+    <h2>What we do <em>not</em> do</h2>
+    <ul>
+      <li>We never sell, license, or publish your browsing history.</li>
+      <li>We do not use your history for advertising, and we do not share it with data brokers.</li>
+      <li>The extension itself sends your data to no server; it only passes it to the Apollo page.</li>
+    </ul>
+
+    <h2>The <code>history</code> permission</h2>
+    <p>
+      The extension requests Chrome's <code>history</code> permission for the single purpose above:
+      letting you import your own history into the Apollo app with one click, instead of manually
+      exporting a file. That is its only function.
+    </p>
+
+    <h2>Removing it</h2>
+    <p>
+      You can uninstall the extension at any time from <code>chrome://extensions</code>. Removing it
+      stops all history access immediately.
+    </p>
+
+    <h2>Contact</h2>
+    <p>Questions: ljang@andrew.cmu.edu.</p>
+  </body>
+</html>

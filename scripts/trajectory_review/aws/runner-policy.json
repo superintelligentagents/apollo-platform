@@ -1,0 +1,24 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadBucketLocation",
+      "Effect": "Allow",
+      "Action": "s3:GetBucketLocation",
+      "Resource": "arn:aws:s3:::journeys-prolific"
+    },
+    {
+      "Sid": "PublishImmutableTrajectoryReviewPackages",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": [
+        "arn:aws:s3:::journeys-prolific/v2-review/trajectory-runs/*",
+        "arn:aws:s3:::journeys-prolific/v2-review/trajectory-inbox/*"
+      ]
+    }
+  ]
+}

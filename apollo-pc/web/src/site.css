@@ -1,0 +1,2 @@
+/* Web-shell-only tweaks. The app design system lives in shared/src/styles.css. */
+html { scroll-behavior: smooth; }

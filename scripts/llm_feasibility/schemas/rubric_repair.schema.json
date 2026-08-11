@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://apollo.internal/schemas/rubric-repair-v3.json",
+  "title": "Apollo advisory rubric repair",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "rubric_id",
+    "effective_verdict",
+    "quality_verdict",
+    "repair_kind",
+    "confidence",
+    "reason",
+    "edit_operations",
+    "verified_replacement_urls",
+    "human_input_needed",
+    "preserves_intent"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "apollo-rubric-repair-v3"},
+    "task_id": {"type": "string", "minLength": 1, "maxLength": 300},
+    "rubric_id": {"type": "string", "minLength": 1, "maxLength": 100},
+    "effective_verdict": {"type": "string", "enum": ["POSSIBLE", "SHORTFALL", "IMPOSSIBLE", "WORKER_ERROR"]},
+    "quality_verdict": {"type": "string", "enum": ["PASS", "FAIL", "NEEDS_HUMAN_REVIEW"]},
+    "repair_kind": {
+      "type": "string",
+      "enum": [
+        "NONE",
+        "REPLACE_SOURCE",
+        "ADD_MISSING_CONTEXT",
+        "CLARIFY_REQUIREMENT",
+        "REMOVE_UNVERIFIABLE_CLAUSE",
+        "REPLACE_PROHIBITED_ACTION",
+        "RETRY_VERIFICATION",
+        "HUMAN_INPUT_REQUIRED",
+        "HUMAN_REVIEW_REQUIRED"
+      ]
+    },
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    "reason": {"type": "string", "minLength": 1, "maxLength": 5000},
+    "edit_operations": {
+      "type": "array",
+      "maxItems": 3,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation", "old_text", "new_text"],
+        "properties": {
+          "operation": {"type": "string", "enum": ["REPLACE", "DELETE", "APPEND"]},
+          "old_text": {"type": ["string", "null"], "maxLength": 8000},
+          "new_text": {"type": "string", "maxLength": 8000}
+        }
+      }
+    },
+    "verified_replacement_urls": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["url", "title", "supports"],
+        "properties": {
+          "url": {"type": "string", "pattern": "^https?://", "maxLength": 4000},
+          "title": {"type": "string", "minLength": 1, "maxLength": 500},
+          "supports": {"type": "string", "minLength": 1, "maxLength": 3000}
+        }
+      }
+    },
+    "human_input_needed": {"type": ["string", "null"], "maxLength": 3000},
+    "preserves_intent": {"type": "boolean"}
+  }
+}

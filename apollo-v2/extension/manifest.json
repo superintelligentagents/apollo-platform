@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Apollo History Helper",
+  "version": "1.0.0",
+  "description": "Reads your Chrome history for the Apollo research study, with your permission. Everything stays on your device until you submit.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5CqwEIKi9A6Wr5n4JrE7aUNCQxZhNGhssSXhfPeUcjW9N/v30NiJbXUWpIre6YuQYuLBjG91sC1CiF2ZfSy5tLl4nMOytddRxDR6w5xwTU1dQBabFur3Xy88tDDaWLrbm8VxuKSZuy2bqrM+NMoFKS+RaXlS4k6VoEMsT+k8ZL6OR32LD83iRe3FwCf05Or6fOSUL6fiKDm175GgHlAbbBBUBo0g4OpimcZ27VUR3Eyi/FwoQK3pSaBUKnTZ4mFYGi6hgjMHGiRLi3AQcXZKW8vXmskh+jBk18E/wBSN2RytTuQ/tE5bn+5OojDAHIdHCc2vsnX2gyZWGzlGi27szQIDAQAB",
+  "permissions": [
+    "history"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "externally_connectable": {
+    "matches": [
+      "https://apollo-v2-site.vercel.app/*",
+      "http://127.0.0.1/*"
+    ]
+  },
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

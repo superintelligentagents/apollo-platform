@@ -1,0 +1,4 @@
+interface:
+  display_name: "Check Apollo Task Feasibility"
+  short_description: "Check task steps online in plain language"
+  default_prompt: "Use $review-live-web-feasibility to check whether each Apollo task step works on current public websites and report any problems in plain language."

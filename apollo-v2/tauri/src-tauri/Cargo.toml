@@ -1,0 +1,27 @@
+[package]
+name = "apollo-v2"
+version = "0.2.0"
+description = "Apollo v2 — long-horizon task collection"
+authors = ["Lawrence Jang"]
+edition = "2021"
+
+[lib]
+name = "apollo_v2_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = "0.30"
+reqwest = { version = "0.12", features = ["json", "multipart", "blocking"] }
+chrono = { version = "0.4", features = ["clock"] }
+url = "2.5"
+tempfile = "3.10"
+dirs = "5.0"
+sha2 = "0.10"

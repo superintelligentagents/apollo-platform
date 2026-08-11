@@ -1,0 +1,11 @@
+node_modules/
+dist/
+web/public/*.wasm
+tauri/src-tauri/target/
+tauri/src-tauri/gen/schemas/
+.vercel/
+extension/key.pem
+extension/pubkey.b64
+extension/dist_ext/
+extension/store_pkg/
+*.env.local
