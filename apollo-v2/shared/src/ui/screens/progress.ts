@@ -11,6 +11,8 @@ import {
 } from "../../review-client";
 import { participantKey } from "../identity";
 import { isAdminEmail } from "../../admin-access";
+import { pct, summarizeDistribution, type Share } from "../../distribution";
+import { regionShortLabel } from "../../taxonomy";
 
 const MODE_LABEL: Record<string, string> = {
   guided: "Write your own",
@@ -49,6 +51,31 @@ function barGroup(title: string, counts: Map<string, number>, order?: string[]):
         el("span", { class: "stat-key" }, k),
         el("span", { class: "stat-track" }, fill),
         el("span", { class: "stat-val mono" }, String(v))
+      )
+    );
+  }
+  return wrap;
+}
+
+// Same bars as barGroup, but keyed on a precomputed share so the percentage the
+// guidance is written in terms of is the number on screen.
+function shareGroup(title: string, rows: Share[], hint: string, empty: string): HTMLElement {
+  const wrap = el("div", { class: "stat-group" }, el("h3", null, title), el("p", { class: "field-hint" }, hint));
+  if (!rows.length) {
+    wrap.append(el("p", { class: "muted" }, empty));
+    return wrap;
+  }
+  const max = Math.max(...rows.map((r) => r.share));
+  for (const row of rows) {
+    const fill = el("span", { class: "stat-fill" });
+    fill.style.width = `${(row.share / max) * 100}%`;
+    wrap.append(
+      el(
+        "div",
+        { class: "stat-row share-row" },
+        el("span", { class: "stat-key", title: row.label }, row.label),
+        el("span", { class: "stat-track" }, fill),
+        el("span", { class: "stat-val mono" }, `${pct(row.share)} · ${row.count}`)
       )
     );
   }
@@ -96,10 +123,18 @@ function taskSnapshot(label: string, snapshot: AdminTaskSnapshot, extraClass = "
         )
       )
     : el("p", { class: "muted" }, "No authored steps.");
+  const meta = snapshot.metadata;
   return el(
     "section",
     { class: `admin-snapshot ${extraClass}`.trim() },
-    el("div", { class: "admin-snapshot-head" }, el("h5", null, label), el("span", { class: "chip tag" }, snapshot.difficulty)),
+    el(
+      "div",
+      { class: "admin-snapshot-head" },
+      el("h5", null, label),
+      meta?.region ? el("span", { class: "chip tag region-tag" }, regionShortLabel(meta.region)) : null,
+      ...(meta?.subjects ?? []).map((s) => el("span", { class: "chip" }, s)),
+      el("span", { class: "chip tag" }, snapshot.difficulty)
+    ),
     el("h6", null, snapshot.title || "Untitled task"),
     el("p", { class: "admin-request" }, snapshot.request || "No request text."),
     ...(snapshot.criteria.length ? [el("h6", null, "Success criteria"), criteria] : []),
@@ -216,11 +251,112 @@ function hydrateAdminPanel(panel: HTMLElement, data: AdminDashboard): void {
   });
   panel.append(
     stats,
+    teamDistribution(data.items),
     el("div", { class: "admin-filters" }, query, userSelect, statusSelect),
     resultCount,
     list
   );
   draw();
+}
+
+// Team-wide spread across places and subjects. Renders from whatever the admin
+// endpoint returns; while that endpoint omits `metadata` this says so plainly
+// rather than drawing an empty chart, which would read as "nobody is filling
+// the fields in" when the truth is "the server is not sending them".
+export function teamDistribution(items: readonly AdminSubmission[]): HTMLElement {
+  const authored = items.map((item) => item.final?.metadata ?? item.original.metadata ?? {});
+  const summary = summarizeDistribution(authored);
+  const panel = el(
+    "section",
+    { class: "stat-group team-distribution" },
+    el("h3", null, "Spread across the team")
+  );
+
+  if (!summary.labelled) {
+    panel.append(
+      el(
+        "p",
+        { class: "muted" },
+        "Region and subject are collected on every new task but the admin feed does not return them yet — they need adding to the submission snapshot in the reporting Lambda. Until then, use the per-task view or the reporting API with include=content."
+      )
+    );
+    return panel;
+  }
+
+  panel.append(
+    el(
+      "div",
+      { class: "stat-cols" },
+      shareGroup("By place", summary.regions, `${pct(summary.globalShare)} with no specific country`, "None recorded."),
+      shareGroup("By subject", summary.subjects, `${summary.subjects.length} of 21 groups covered`, "None recorded.")
+    ),
+    ...(summary.unlabelled
+      ? [el("p", { class: "muted small" }, `Based on ${summary.labelled} of ${items.length} submissions; the rest predate these fields.`)]
+      : [])
+  );
+  return panel;
+}
+
+// The author's own spread of places and subjects. This is the only place a
+// contributor can check the distribution guidance against their actual output —
+// the reporting feed is team-wide and does not come back to them.
+function distributionPanel(log: readonly UploadLogEntry[]): HTMLElement {
+  const summary = summarizeDistribution(log.filter((e) => e.mode !== "review"));
+  const panel = el(
+    "section",
+    { class: "stat-group distribution-panel" },
+    el("div", { class: "admin-section-head" },
+      el("div", null, el("p", { class: "eyebrow" }, "Your spread"), el("h3", null, "Places and subjects")),
+      el("p", { class: "muted" }, "Aim for about a third or less from any one country, and about a third with no specific country.")
+    )
+  );
+
+  if (!summary.labelled) {
+    panel.append(
+      el(
+        "p",
+        { class: "muted" },
+        summary.unlabelled
+          ? "Your recorded tasks were submitted before these fields existed, so there is nothing to chart yet. New tasks will appear here."
+          : "Nothing yet — submit a task and your spread will appear here."
+      )
+    );
+    return panel;
+  }
+
+  if (summary.advice) {
+    panel.append(el("p", { class: "notice info distribution-advice" }, summary.advice));
+  }
+
+  panel.append(
+    el(
+      "div",
+      { class: "stat-cols" },
+      shareGroup(
+        "By place",
+        summary.regions,
+        `${pct(summary.globalShare)} with no specific country`,
+        "No regions recorded yet."
+      ),
+      shareGroup(
+        "By subject",
+        summary.subjects,
+        `${summary.subjects.length} of 21 groups covered`,
+        "No subjects recorded yet."
+      )
+    )
+  );
+
+  if (summary.unlabelled) {
+    panel.append(
+      el(
+        "p",
+        { class: "muted small" },
+        `Based on ${summary.labelled} task${summary.labelled === 1 ? "" : "s"}. ${summary.unlabelled} earlier task${summary.unlabelled === 1 ? "" : "s"} predate these fields and are not counted.`
+      )
+    );
+  }
+  return panel;
 }
 
 export function renderProgress(ctx: Ctx): HTMLElement {
@@ -341,6 +477,8 @@ export function renderProgress(ctx: Ctx): HTMLElement {
       )
     );
 
+    body.append(distributionPanel(log));
+
     const recent = el("div", { class: "stat-group recent" }, el("h3", null, "Recent tasks"));
     for (const e of [...log].reverse().slice(0, 8)) {
       recent.append(
@@ -348,6 +486,7 @@ export function renderProgress(ctx: Ctx): HTMLElement {
           "div",
           { class: "recent-row" },
           el("span", { class: "recent-title" }, e.title || "(untitled)"),
+          e.region ? el("span", { class: "chip tag region-tag" }, regionShortLabel(e.region)) : null,
           el("span", { class: "chip tag" }, MODE_LABEL[e.mode] ?? e.mode),
           el("span", { class: "muted mono" }, new Date(e.at).toLocaleDateString())
         )

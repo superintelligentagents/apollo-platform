@@ -64,6 +64,12 @@ function displayNames(): Intl.DisplayNames | null {
   return regionNames;
 }
 
+// The picker needs the parenthetical to say what the option means. Charts and
+// chips have already established that context and only have room for the name.
+export function regionShortLabel(code: string): string {
+  return code === REGION_GLOBAL ? "No specific country" : regionLabel(code);
+}
+
 export function regionLabel(code: string): string {
   if (code === REGION_GLOBAL) return "No specific country (location-agnostic)";
   if (!REGION_SET.has(code)) return code;
