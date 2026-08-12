@@ -3,6 +3,7 @@ export * from "./chrome-time";
 export * from "./clustering";
 export * from "./themes";
 export * from "./taxonomy";
+export * from "./distribution";
 export * from "./schema";
 export * from "./upload";
 export * from "./templates";

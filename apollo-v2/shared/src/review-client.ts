@@ -43,6 +43,13 @@ export interface AdminTaskSnapshot {
   difficulty: string;
   criteria: string[];
   steps: { order: number; title: string; description: string }[];
+  // Distribution metadata, when the server sends it. Optional because the admin
+  // endpoint lives in the reporting Lambda rather than this repo and does not
+  // include it yet: it builds this snapshot field by field from the stored task,
+  // the same way buildReviewedTask does, so `metadata` has to be added there
+  // before the team-wide spread can be charted. The dashboard already renders it
+  // wherever it is present, so no client change is needed once it lands.
+  metadata?: { region?: string; subjects?: string[] };
 }
 
 export interface AdminSubmission {

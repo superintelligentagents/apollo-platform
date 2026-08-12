@@ -997,6 +997,16 @@ textarea::placeholder {
 .stat-track { flex: 1; height: 8px; background: var(--wash, #e8ecf3); border-radius: 4px; overflow: hidden; display: block; }
 .stat-fill { display: block; height: 100%; background: var(--cobalt); border-radius: 4px; }
 .stat-val { flex: 0 0 24px; text-align: right; font-size: 12.5px; }
+/* Share bars carry "33% · 12" rather than a bare count, and their keys are
+   country and subject-group names — both wider than the plain stat rows. */
+.share-row .stat-val { flex: 0 0 62px; }
+/* Country names are proper nouns — the tag chip lowercases by default. */
+.chip.region-tag { text-transform: none; font-family: var(--body); font-size: 11.5px; }
+.share-row .stat-key { flex: 0 0 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.distribution-panel, .team-distribution { margin-top: 22px; }
+.distribution-panel .field-hint, .team-distribution .field-hint { margin: -4px 0 10px; }
+.distribution-advice { margin: 0 0 16px; }
+
 .recent-row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; }
 .recent-row:last-child { border-bottom: none; }
 .recent-title { margin-right: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
