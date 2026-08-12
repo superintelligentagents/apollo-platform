@@ -1,8 +1,10 @@
 import type { Ctx } from "../context";
 import { BLANK_TEMPLATE, DELIVERABLE_OPTIONS, MIN_STEP_LENGTH } from "../../templates";
-import { MIN_REQUEST_LENGTH } from "../../schema";
+import { derivePrimaryDomains, MIN_REQUEST_LENGTH } from "../../schema";
 import { hasUnfilledSlots } from "../../drafts";
+import { sanitizeAttachedUrl } from "../pending";
 import { el, stepper } from "../components/helpers";
+import { metadataFields } from "../components/metadata";
 import { authoringStep, stepperLabels } from "./form";
 import { itinerary } from "../components/itinerary";
 
@@ -314,6 +316,24 @@ function renderStepEditor(ctx: Ctx): HTMLElement {
       el("div", { class: "field-head" }, el("span", { class: "field-label" }, "What should exist at the end?")),
       deliverableRow,
       customWrap
+    )
+  );
+
+  // This screen — not `form` — is where guided and freeform authors finish, so
+  // the distribution fields have to live here too or validation blocks the
+  // Review step with nothing on screen to fix.
+  if (!state.domainsDirty) {
+    state.draft.primary_domains = derivePrimaryDomains({
+      siteScope: state.draft.site_scope,
+      keyUrls: state.keyUrls,
+      attachedUrls: state.attachedUrls
+        .map(sanitizeAttachedUrl)
+        .filter((u): u is string => u !== null),
+    });
+  }
+  form.append(
+    metadataFields(ctx, (key) =>
+      el("p", { class: "field-error", dataset: { field: key } }, state.formErrors[key] ?? "")
     )
   );
 

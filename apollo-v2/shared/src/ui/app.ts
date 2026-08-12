@@ -505,6 +505,23 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
         const identity = state.identity;
         const built = buildPendingTask(ctx);
         if (!identity || !built) return;
+        // Validate here as well as on the way in. Reaching this screen is not
+        // proof of having passed validation: a draft autosaved on the review
+        // screen resumes straight back to it, skipping the authoring screen and
+        // its gate. Without this, a draft saved before a field existed uploads
+        // with that field empty.
+        const check = validateLongTask(built);
+        if (!check.valid) {
+          // Navigate first: transition() clears formErrors on the way into a
+          // screen, so errors set before the goto would be wiped and the author
+          // would land on the editor with nothing marked.
+          goto("guided");
+          state.formErrors = check.errors;
+          notify("A few fields need attention before this can be submitted.", "err");
+          render();
+          document.querySelector(".field-error:not(:empty)")?.scrollIntoView({ block: "center" });
+          return;
+        }
         const { task } = truncateForUpload(built);
         state.busy = "Submitting…";
         render();
