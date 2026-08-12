@@ -70,6 +70,45 @@ describe("serialize → apply round-trip", () => {
     expect(fresh.basket).toEqual([]); // journeys not restored here
   });
 
+  it("round-trips the distribution metadata", () => {
+    const s = initialState();
+    s.mode = "freeform";
+    s.screen = "form";
+    s.draft.agent_request = "Compare warranty terms across three laptop manufacturers.";
+    s.draft.region = "GLOBAL";
+    s.draft.subjects = ["Computers Electronics and Technology > Consumer Electronics"];
+    s.draft.primary_domains = ["dell.com", "lenovo.com"];
+
+    const fresh = initialState();
+    applyDraftState(fresh, serializeDraftState(s, "2026-08-12T00:00:00.000Z"), null);
+    expect(fresh.draft.region).toBe("GLOBAL");
+    expect(fresh.draft.subjects).toEqual([
+      "Computers Electronics and Technology > Consumer Electronics",
+    ]);
+    expect(fresh.draft.primary_domains).toEqual(["dell.com", "lenovo.com"]);
+  });
+
+  it("fills in defaults for a draft saved before the metadata fields existed", () => {
+    // A trainer mid-task when this shipped has an autosave with no metadata
+    // keys at all. Assigning it wholesale would put `undefined` where the form
+    // and validation both expect a string or an array.
+    const s = initialState();
+    s.mode = "freeform";
+    s.screen = "form";
+    s.draft.agent_request = "Finish comparing the three shortlisted programmes.";
+    const saved = serializeDraftState(s, "2026-08-12T00:00:00.000Z");
+    delete (saved.draft as Partial<typeof saved.draft>).region;
+    delete (saved.draft as Partial<typeof saved.draft>).subjects;
+    delete (saved.draft as Partial<typeof saved.draft>).primary_domains;
+
+    const fresh = initialState();
+    applyDraftState(fresh, saved, null);
+    expect(fresh.draft.region).toBe("");
+    expect(fresh.draft.subjects).toEqual([]);
+    expect(fresh.draft.primary_domains).toEqual([]);
+    expect(fresh.draft.agent_request).toContain("shortlisted programmes");
+  });
+
   it("stays on the saved screen when the basket is already present", () => {
     const s = initialState();
     s.mode = "compose";

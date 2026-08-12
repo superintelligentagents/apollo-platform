@@ -28,6 +28,11 @@ export type TaskDraft = {
   success_criteria: string[];
   required_outputs: string[];
   notes: string;
+  // Distribution metadata. Empty region/subjects mean "not answered yet" —
+  // validation blocks the review step until the author picks.
+  region: string;
+  primary_domains: string[];
+  subjects: string[];
 };
 
 export type Notice = { text: string; tone: "info" | "ok" | "err" };
@@ -63,6 +68,8 @@ export type AppState = {
   pendingBasketFingerprints: string[];
   // True once the user edits site chips by hand — stops auto re-derivation.
   scopeDirty: boolean;
+  // Same contract for the derived primary_domains chips.
+  domainsDirty: boolean;
   // True once the user types in the request box — their words are never overwritten.
   requestDirty: boolean;
   // Stable across retries of the same draft so a false-failure retry can't
@@ -144,6 +151,11 @@ export function emptyDraft(): TaskDraft {
     success_criteria: [""],
     required_outputs: [],
     notes: "",
+    // No default region: a pre-filled country would be answered by inattention
+    // and the whole point is to measure where tasks actually land.
+    region: "",
+    primary_domains: [],
+    subjects: [],
   };
 }
 
@@ -171,6 +183,7 @@ export function initialState(): AppState {
     hasResumableDraft: false,
     pendingBasketFingerprints: [],
     scopeDirty: false,
+    domainsDirty: false,
     requestDirty: false,
     pendingTaskId: null,
     pendingCreatedAt: null,

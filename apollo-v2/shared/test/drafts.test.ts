@@ -47,6 +47,11 @@ describe("bracket validation", () => {
         required_outputs: [],
         notes: null,
         time_span: deriveTimeSpan([]),
+        metadata: {
+          region: "US",
+          primary_domains: ["mlb.com"],
+          subjects: ["Travel and Tourism > Air Travel"],
+        },
       },
       sourceJourneys: [],
       themeSuggestion: null,

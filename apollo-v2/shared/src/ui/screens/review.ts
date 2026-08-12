@@ -3,6 +3,7 @@ import { buildPendingTask } from "../pending";
 import { estimatePayloadBytes, truncateForUpload } from "../../schema";
 import { MAX_UPLOAD_BYTES } from "../../config";
 import { chip, el, fmtBytes, stepper } from "../components/helpers";
+import { regionLabel } from "../../taxonomy";
 import { stepperLabels } from "./form";
 import { itinerary } from "../components/itinerary";
 
@@ -68,7 +69,19 @@ export function renderReview(ctx: Ctx): HTMLElement {
           el("ul", { class: "preview-list mono small" }, ...t.must_visit_or_reach.filter(Boolean).map((u) => el("li", null, u)))
         )
       : null,
-    t.notes ? section("Notes", el("p", null, t.notes)) : null
+    t.notes ? section("Notes", el("p", null, t.notes)) : null,
+    t.metadata
+      ? section(
+          "About this task",
+          el(
+            "div",
+            { class: "preview-chips" },
+            chip(regionLabel(t.metadata.region)),
+            ...t.metadata.subjects.map((s) => chip(s)),
+            ...t.metadata.primary_domains.map((s) => chip(s, "tag"))
+          )
+        )
+      : null
   );
 
   const layout = el("div", { class: "review-layout" });

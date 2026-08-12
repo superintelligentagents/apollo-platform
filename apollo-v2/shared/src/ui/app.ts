@@ -217,6 +217,7 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
         state.draftBasketKey = "";
         state.lastDraftTitle = "";
         state.scopeDirty = false;
+        state.domainsDirty = false;
         state.requestDirty = false;
         state.pendingTaskId = null;
         state.pendingCreatedAt = null;
@@ -542,6 +543,8 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
             strength: task.quality_signals?.strength,
             score: task.quality_signals?.score,
             at: task.created_at,
+            region: task.task.metadata?.region,
+            subjects: task.task.metadata?.subjects,
           }),
           usedFps.length ? addProcessedFingerprints(adapter.storage, owner, usedFps) : Promise.resolve(),
         ]);
@@ -612,6 +615,7 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
     state.draftBasketKey = "";
     state.lastDraftTitle = "";
     state.scopeDirty = false;
+    state.domainsDirty = false;
     state.requestDirty = false;
     state.pendingTaskId = null;
     state.pendingCreatedAt = null;

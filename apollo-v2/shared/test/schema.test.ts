@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildLongTask,
   buildTaskId,
+  derivePrimaryDomains,
   deriveSiteScope,
   deriveTimeSpan,
   estimatePayloadBytes,
@@ -9,6 +10,7 @@ import {
   truncateForUpload,
   validateLongTask,
 } from "../src/schema";
+import { MAX_SUBJECTS, REGION_GLOBAL, SUBJECTS } from "../src/taxonomy";
 import { MAX_UPLOAD_BYTES } from "../src/config";
 import { sanitizeAttachedUrl } from "../src/ui/pending";
 import { prepareJourneys } from "../src/clustering";
@@ -46,6 +48,11 @@ function validTask(mode: LongTask["mode"] = "compose"): LongTask {
       required_outputs: [],
       notes: null,
       time_span: deriveTimeSpan(journeys),
+      metadata: {
+        region: "US",
+        primary_domains: ["mlb.com", "expedia.com"],
+        subjects: ["Travel and Tourism > Accommodation and Hotels", "Sports > Baseball"],
+      },
     },
     sourceJourneys: journeys,
     themeSuggestion:
@@ -124,6 +131,91 @@ describe("validateLongTask", () => {
     expect(validateLongTask(task).valid).toBe(true);
   });
 
+  it("requires distribution metadata even though the field is optional on the type", () => {
+    const task = validTask();
+    delete task.task.metadata;
+    const result = validateLongTask(task);
+    expect(result.valid).toBe(false);
+    expect(result.errors.metadata).toBeDefined();
+  });
+
+  it("rejects a region that is not an ISO code or the global sentinel", () => {
+    const task = validTask();
+    task.task.metadata!.region = "Bengaluru";
+    expect(validateLongTask(task).errors.region).toBeDefined();
+
+    task.task.metadata!.region = "IN";
+    expect(validateLongTask(task).valid).toBe(true);
+
+    task.task.metadata!.region = REGION_GLOBAL;
+    expect(validateLongTask(task).valid).toBe(true);
+  });
+
+  it("requires between one and MAX_SUBJECTS known subjects", () => {
+    const task = validTask();
+    task.task.metadata!.subjects = [];
+    expect(validateLongTask(task).errors.subjects).toBeDefined();
+
+    // Unknown leaves are filtered out, so a made-up subject reads as "none".
+    task.task.metadata!.subjects = ["Cricket > IPL"];
+    expect(validateLongTask(task).errors.subjects).toBeDefined();
+
+    task.task.metadata!.subjects = SUBJECTS.slice(0, MAX_SUBJECTS + 1);
+    expect(validateLongTask(task).errors.subjects).toBeDefined();
+
+    task.task.metadata!.subjects = [SUBJECTS[0]];
+    expect(validateLongTask(task).valid).toBe(true);
+  });
+
+  it("requires at least one usable primary domain", () => {
+    const task = validTask();
+    task.task.metadata!.primary_domains = [];
+    expect(validateLongTask(task).errors.primary_domains).toBeDefined();
+
+    // Present but unusable is the same as absent.
+    task.task.metadata!.primary_domains = ["not a domain"];
+    expect(validateLongTask(task).errors.primary_domains).toBeDefined();
+
+    task.task.metadata!.primary_domains = ["https://www.irctc.co.in/nget/train-search"];
+    expect(validateLongTask(task).valid).toBe(true);
+  });
+});
+
+describe("derivePrimaryDomains", () => {
+  it("prefers the author's own scope chips, then key URLs, then attachments", () => {
+    expect(
+      derivePrimaryDomains({
+        siteScope: ["mlb.com"],
+        keyUrls: ["https://www.expedia.com/Hotels-New-York"],
+        attachedUrls: ["https://en.wikipedia.org/wiki/Fenway_Park"],
+      })
+    ).toEqual(["mlb.com", "expedia.com", "wikipedia.org"]);
+  });
+
+  it("drops duplicates across sources and normalizes host forms", () => {
+    expect(
+      derivePrimaryDomains({
+        siteScope: ["WWW.MLB.com"],
+        keyUrls: ["https://www.mlb.com/tickets"],
+        attachedUrls: ["mlb.com/schedule"],
+      })
+    ).toEqual(["mlb.com"]);
+  });
+
+  it("keeps the registrable domain for country-code and hosted suffixes", () => {
+    expect(derivePrimaryDomains({ keyUrls: ["https://www.irctc.co.in/nget"] })).toEqual(["irctc.co.in"]);
+    expect(derivePrimaryDomains({ keyUrls: ["https://someone.github.io/notes"] })).toEqual([
+      "someone.github.io",
+    ]);
+    expect(derivePrimaryDomains({ keyUrls: ["https://boards.greenhouse.io/acme"] })).toEqual([
+      "greenhouse.io",
+    ]);
+  });
+
+  it("returns nothing when there is nothing usable to derive from", () => {
+    expect(derivePrimaryDomains({})).toEqual([]);
+    expect(derivePrimaryDomains({ siteScope: ["", "localhost"], keyUrls: ["not-a-url"] })).toEqual([]);
+  });
 });
 
 describe("deriveSiteScope / deriveTimeSpan", () => {

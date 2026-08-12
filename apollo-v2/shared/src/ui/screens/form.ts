@@ -1,11 +1,27 @@
 import type { Ctx } from "../context";
-import { MIN_REQUEST_LENGTH } from "../../schema";
+import { derivePrimaryDomains, MIN_REQUEST_LENGTH } from "../../schema";
 import { hasUnfilledSlots } from "../../drafts";
+import { sanitizeAttachedUrl } from "../pending";
 import { el, stepper } from "../components/helpers";
+import { metadataFields } from "../components/metadata";
 
 export function renderForm(ctx: Ctx): HTMLElement {
   const { state } = ctx;
   const d = state.draft;
+
+  // Re-derive the site chips on each visit to this screen until the author
+  // edits them by hand: the journey basket and the attached URLs can both
+  // change after the first pass through here.
+  if (!state.domainsDirty) {
+    d.primary_domains = derivePrimaryDomains({
+      siteScope: d.site_scope,
+      keyUrls: state.keyUrls,
+      attachedUrls: state.attachedUrls
+        .map(sanitizeAttachedUrl)
+        .filter((u): u is string => u !== null),
+    });
+  }
+
   const root = el("section", { class: "screen form-screen" });
   const errors: Record<string, string> = { ...state.formErrors };
 
@@ -117,6 +133,8 @@ export function renderForm(ctx: Ctx): HTMLElement {
       request,
       fieldError("agent_request")
     ),
+    metadataFields(ctx, fieldError),
+    fieldError("metadata"),
     el(
       "div",
       { class: "form-actions" },

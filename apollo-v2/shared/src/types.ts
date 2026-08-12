@@ -75,6 +75,19 @@ export type GuidedStep = {
   description: string;
 };
 
+// Distribution metadata. Declared by the author, used to monitor how collection
+// is spread across places, sites, and topics — see taxonomy.ts for the reasoning
+// and the vocabularies.
+export type TaskMetadata = {
+  // ISO 3166-1 alpha-2, or REGION_GLOBAL when the task has no geographic anchor.
+  region: string;
+  // Site families the task actually runs through, derived from the task's own
+  // scope/URLs and editable by the author.
+  primary_domains: string[];
+  // 1–3 "Top > Sub" leaves from the Odysseys category vocabulary.
+  subjects: string[];
+};
+
 export type LongTaskRubric = {
   task_title: string;
   agent_request: string;
@@ -88,6 +101,10 @@ export type LongTaskRubric = {
   time_span: { start: string | null; end: string | null };
   // Present for guided-mode tasks: the structured substeps behind agent_request.
   steps?: GuidedStep[];
+  // Optional on the type because tasks collected before this field existed are
+  // still valid stored records, and readers must handle them. Authoring-time
+  // validation requires it — see validateLongTask.
+  metadata?: TaskMetadata;
 };
 
 export type LongTaskThemeProvenance = {
