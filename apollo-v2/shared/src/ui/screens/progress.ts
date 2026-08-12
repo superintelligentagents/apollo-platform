@@ -263,7 +263,7 @@ function hydrateAdminPanel(panel: HTMLElement, data: AdminDashboard): void {
 // endpoint returns; while that endpoint omits `metadata` this says so plainly
 // rather than drawing an empty chart, which would read as "nobody is filling
 // the fields in" when the truth is "the server is not sending them".
-function teamDistribution(items: readonly AdminSubmission[]): HTMLElement {
+export function teamDistribution(items: readonly AdminSubmission[]): HTMLElement {
   const authored = items.map((item) => item.final?.metadata ?? item.original.metadata ?? {});
   const summary = summarizeDistribution(authored);
   const panel = el(

@@ -1,5 +1,7 @@
+// @vitest-environment jsdom
+
 import { describe, expect, it } from "vitest";
-import { filterAdminSubmissions } from "../src/ui/screens/progress";
+import { filterAdminSubmissions, teamDistribution } from "../src/ui/screens/progress";
 import type { AdminSubmission } from "../src/review-client";
 
 function submission(overrides: Partial<AdminSubmission>): AdminSubmission {
@@ -46,5 +48,57 @@ describe("admin submission filters", () => {
     expect(filterAdminSubmissions(items, { query: "SEOUL", participantId: "", status: "" })).toEqual([items[1]]);
     expect(filterAdminSubmissions(items, { query: "reviewer one", participantId: "", status: "" })).toEqual([items[1]]);
     expect(filterAdminSubmissions(items, { query: "alice@example", participantId: "", status: "" })).toEqual([items[0]]);
+  });
+});
+
+describe("team spread panel", () => {
+  it("charts places and subjects once the server returns metadata", () => {
+    const items = [
+      submission({
+        original: {
+          title: "A", request: "", difficulty: "high", criteria: [], steps: [],
+          metadata: { region: "IN", subjects: ["Travel and Tourism > Air Travel"] },
+        },
+      }),
+      submission({
+        original: {
+          title: "B", request: "", difficulty: "high", criteria: [], steps: [],
+          metadata: { region: "GLOBAL", subjects: ["Health > Medicine"] },
+        },
+      }),
+    ];
+
+    const text = teamDistribution(items).textContent ?? "";
+    expect(text).toContain("India");
+    expect(text).toContain("No specific country");
+    expect(text).toContain("Travel and Tourism");
+    expect(text).toContain("50%");
+  });
+
+  it("prefers final gold over the original submission", () => {
+    // A reviewer may correct the author's pick; final gold is what gets counted.
+    const items = [
+      submission({
+        original: {
+          title: "A", request: "", difficulty: "high", criteria: [], steps: [],
+          metadata: { region: "IN", subjects: [] },
+        },
+        final: {
+          title: "A", request: "", difficulty: "high", criteria: [], steps: [],
+          metadata: { region: "BR", subjects: [] },
+        },
+      }),
+    ];
+
+    const text = teamDistribution(items).textContent ?? "";
+    expect(text).toContain("Brazil");
+    expect(text).not.toContain("India");
+  });
+
+  it("names the server gap instead of drawing an empty chart", () => {
+    // Today's reality: the admin endpoint omits metadata entirely.
+    const text = teamDistribution([submission({})]).textContent ?? "";
+    expect(text).toContain("does not return them yet");
+    expect(text).toContain("reporting Lambda");
   });
 });
