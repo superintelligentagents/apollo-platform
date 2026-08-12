@@ -28,6 +28,10 @@ export type TaskDraft = {
   success_criteria: string[];
   required_outputs: string[];
   notes: string;
+  // Distribution metadata. Empty region/subjects mean "not answered yet" —
+  // validation blocks the review step until the author picks.
+  region: string;
+  subjects: string[];
 };
 
 export type Notice = { text: string; tone: "info" | "ok" | "err" };
@@ -144,6 +148,10 @@ export function emptyDraft(): TaskDraft {
     success_criteria: [""],
     required_outputs: [],
     notes: "",
+    // No default region: a pre-filled country would be answered by inattention
+    // and the whole point is to measure where tasks actually land.
+    region: "",
+    subjects: [],
   };
 }
 

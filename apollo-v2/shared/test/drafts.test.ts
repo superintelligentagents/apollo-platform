@@ -47,6 +47,10 @@ describe("bracket validation", () => {
         required_outputs: [],
         notes: null,
         time_span: deriveTimeSpan([]),
+        metadata: {
+          region: "US",
+          subjects: ["Travel and Tourism > Air Travel"],
+        },
       },
       sourceJourneys: [],
       themeSuggestion: null,

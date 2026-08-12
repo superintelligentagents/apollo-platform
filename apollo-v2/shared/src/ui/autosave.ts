@@ -1,5 +1,6 @@
 import type { AppState, Screen } from "./context";
 import type { TaskMode } from "../types";
+import { emptyDraft } from "./context";
 
 // A serialized in-progress task — enough to restore the author's WRITING after
 // a refresh. Journeys themselves are not persisted (large + privacy); the
@@ -61,7 +62,10 @@ export function serializeDraftState(state: AppState, savedAt: string): SavedDraf
 // matching basketFingerprints. Returns the screen to land on.
 export function applyDraftState(state: AppState, saved: SavedDraft, template: AppState["activeTemplate"]): Screen {
   state.mode = saved.mode;
-  state.draft = saved.draft;
+  // Merge onto a fresh draft rather than replacing it: a draft autosaved before
+  // a field existed has no key for it, and assigning wholesale would put
+  // `undefined` where the UI and validation both expect a string or an array.
+  state.draft = { ...emptyDraft(), ...saved.draft };
   state.guidedSteps = saved.guidedSteps;
   // Older saves predate these fields — fall back to the state defaults so a
   // stale autosave can't inject undefined.

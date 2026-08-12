@@ -1,6 +1,7 @@
 import type { Ctx } from "./context";
 import type { LongTask } from "../types";
 import { buildLongTask, buildTaskId, deriveTimeSpan, sourceJourneyFromCluster } from "../schema";
+import { MAX_SUBJECTS, normalizeSubject } from "../taxonomy";
 import { substantiveSteps } from "../templates";
 import { sanitizeHistoryUrl } from "../clustering";
 import { computeQualitySignals } from "../quality";
@@ -99,6 +100,15 @@ export function buildPendingTask(ctx: Ctx): LongTask | null {
       notes: d.notes.trim() || null,
       time_span: deriveTimeSpan(sourceJourneys),
       ...(guidedSteps ? { steps: guidedSteps } : {}),
+      metadata: {
+        region: d.region,
+        subjects: d.subjects
+          .flatMap((s) => {
+            const canonical = normalizeSubject(s);
+            return canonical ? [canonical] : [];
+          })
+          .slice(0, MAX_SUBJECTS),
+      },
     },
     sourceJourneys,
     template:

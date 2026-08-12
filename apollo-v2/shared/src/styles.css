@@ -568,6 +568,23 @@ html, body {
 .keyurl-url { grid-column: 2; font-size: 11px; color: var(--ink-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .form-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 8px; }
 
+/* ---------- task metadata (region / subjects / sites) ---------- */
+.metadata-fields {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px 4px;
+  margin-bottom: 18px;
+  gap: 0;
+}
+.metadata-fields > legend { padding: 0 6px; }
+.subfield { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+.subfield-label { font-weight: 600; font-size: 13.5px; }
+.subfield-hint { margin: 0; font-size: 13px; color: var(--ink-soft); }
+.subject-chips { min-height: 24px; align-items: center; }
+/* The two-part subject chip reads "Group · Leaf" without a second line. */
+.chip-top { opacity: 0.65; font-weight: 500; }
+.chip-top::after { content: "·"; margin: 0 4px; opacity: 0.5; }
+
 /* ---------- review ---------- */
 
 .review-layout {

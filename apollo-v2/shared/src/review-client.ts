@@ -494,6 +494,12 @@ export function buildReviewedTask(
     must_visit_or_reach: t.task.must_visit_or_reach,
     required_outputs: t.task.required_outputs,
     notes: t.task.notes,
+    // Carried forward, not re-derived. Final gold is the copy the reporting
+    // feed counts, so distribution metadata that survives authoring but not
+    // review would leave approved tasks — exactly the ones worth counting —
+    // invisible. Reviewers cannot edit it yet; when they can, this should take
+    // the edited value the way title and request already do.
+    ...(t.task.metadata ? { metadata: t.task.metadata } : {}),
     ...(((t.task.steps?.length ?? 0) || addedSteps.length) ? { steps: [...finalSteps, ...addedSteps] } : {}),
   };
   const originalTask = {

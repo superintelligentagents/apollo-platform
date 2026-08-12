@@ -8,6 +8,13 @@ import type {
 import { clusterEnd, clusterStart, sanitizeHistoryUrl } from "./clustering";
 import { GENERIC_SITE_FAMILIES, siteFamily } from "./themes";
 import { APP_NAME, APP_VERSION, MAX_UPLOAD_BYTES } from "./config";
+import {
+  dedupeDomains,
+  isRegionCode,
+  MAX_SUBJECTS,
+  MIN_SUBJECTS,
+  normalizeSubject,
+} from "./taxonomy";
 
 // Deliberately minimal gates (v1 parity): counts, not limits. Everything else
 // is advisory — the offline LLM pass refines what annotators leave loose.
@@ -98,6 +105,26 @@ function hostOf(url: string): string {
   }
 }
 
+// The sites a task actually runs through, in the author's own order of
+// emphasis: the scope chips they curated first, then the URLs they singled out,
+// then anything else they attached.
+//
+// Not stored on the task and not asked of the author — every input is already
+// part of the record, so domain distribution can be recomputed from stored
+// tasks at any time by calling this. Kept here so that reporting and the
+// authoring app agree on what "the sites this task uses" means.
+export function derivePrimaryDomains(input: {
+  siteScope?: readonly string[];
+  keyUrls?: readonly string[];
+  attachedUrls?: readonly string[];
+}): string[] {
+  return dedupeDomains([
+    ...(input.siteScope ?? []),
+    ...(input.keyUrls ?? []).map((url) => siteFamily(hostOf(url))),
+    ...(input.attachedUrls ?? []).map((url) => siteFamily(hostOf(url))),
+  ]);
+}
+
 export function deriveTimeSpan(journeys: SourceJourney[]): { start: string | null; end: string | null } {
   const starts = journeys.map((j) => j.start).filter(Boolean) as string[];
   const ends = journeys.map((j) => j.end).filter(Boolean) as string[];
@@ -118,6 +145,33 @@ export function validateLongTask(task: LongTask): ValidationResult {
   }
   // Title, difficulty, key URLs, and success criteria are all optional or
   // defaulted — the offline pipeline refines what annotators leave loose.
+
+  // Distribution metadata is required at authoring time even though the field is
+  // optional on the type: stored tasks predating it stay readable, but nothing
+  // new should land without it, or the distribution counts are built on a
+  // self-selected sample. Two picks, and only two — see derivePrimaryDomains for
+  // the third signal, which is computed rather than asked for.
+  const meta = t.metadata;
+  if (!meta) {
+    errors.metadata = "Add the region, sites, and subjects for this task.";
+  } else {
+    if (!isRegionCode(meta.region)) {
+      errors.region = "Pick the country this task is anchored in, or 'no specific country'.";
+    }
+    // Normalize before counting: two spellings of the same leaf are one
+    // subject, and the duplicate check below has to see them that way.
+    const subjects = (meta.subjects ?? []).flatMap((s) => {
+      const canonical = normalizeSubject(s);
+      return canonical ? [canonical] : [];
+    });
+    if (subjects.length < MIN_SUBJECTS) {
+      errors.subjects = "Pick at least one subject.";
+    } else if (subjects.length > MAX_SUBJECTS) {
+      errors.subjects = `Pick at most ${MAX_SUBJECTS} subjects — choose the ones the task is really about.`;
+    } else if (new Set(subjects).size !== subjects.length) {
+      errors.subjects = "Remove the duplicate subject.";
+    }
+  }
 
   const journeys = task.provenance.source_journeys;
   if (task.mode === "compose" || task.mode === "theme") {

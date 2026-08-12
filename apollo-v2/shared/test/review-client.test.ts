@@ -29,6 +29,10 @@ function task(): LongTask {
       notes: null,
       time_span: { start: null, end: null },
       steps: [{ order: 1, title: "Research", description: "Compare at least three current options." }],
+      metadata: {
+        region: "IN",
+        subjects: ["Ecommerce & Shopping > Price Comparison"],
+      },
     },
     provenance: { source_journeys: [], theme_suggestion: null, template: null, attached_urls: [] },
   };
@@ -116,6 +120,33 @@ describe("review gold audit trail", () => {
     expect(reviewed.review.rubrics).toEqual([
       expect.objectContaining({ kind: "step", original: "Compare at least three current options.", final: "Compare at least five current options.", changed: true }),
     ]);
+  });
+
+  it("carries the author's distribution metadata into final gold", () => {
+    const reviewed = buildReviewedTask(task(), {
+      title: "Final title",
+      request: "Original request with enough detail to run.",
+      difficulty: "high",
+      rubrics: seedRubrics(task()).map((row) => ({ ...row, checked: true })),
+    }) as { task: { metadata?: { region: string; subjects: string[] } } };
+
+    expect(reviewed.task.metadata).toEqual({
+      region: "IN",
+      subjects: ["Ecommerce & Shopping > Price Comparison"],
+    });
+  });
+
+  it("omits metadata in final gold for tasks authored before the field existed", () => {
+    const legacy = task();
+    delete legacy.task.metadata;
+    const reviewed = buildReviewedTask(legacy, {
+      title: "Final title",
+      request: "Original request with enough detail to run.",
+      difficulty: "high",
+      rubrics: seedRubrics(legacy).map((row) => ({ ...row, checked: true })),
+    }) as { task: Record<string, unknown> };
+
+    expect("metadata" in reviewed.task).toBe(false);
   });
 
   it("removes legacy generated criteria from final gold", () => {
