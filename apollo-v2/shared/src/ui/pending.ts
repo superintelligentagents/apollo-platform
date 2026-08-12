@@ -1,13 +1,7 @@
 import type { Ctx } from "./context";
 import type { LongTask } from "../types";
-import {
-  buildLongTask,
-  buildTaskId,
-  derivePrimaryDomains,
-  deriveTimeSpan,
-  sourceJourneyFromCluster,
-} from "../schema";
-import { dedupeDomains, MAX_SUBJECTS, normalizeSubject } from "../taxonomy";
+import { buildLongTask, buildTaskId, deriveTimeSpan, sourceJourneyFromCluster } from "../schema";
+import { MAX_SUBJECTS, normalizeSubject } from "../taxonomy";
 import { substantiveSteps } from "../templates";
 import { sanitizeHistoryUrl } from "../clustering";
 import { computeQualitySignals } from "../quality";
@@ -108,16 +102,6 @@ export function buildPendingTask(ctx: Ctx): LongTask | null {
       ...(guidedSteps ? { steps: guidedSteps } : {}),
       metadata: {
         region: d.region,
-        // Fall back to deriving here as well as in the form: a draft resumed
-        // from before this field existed reaches the review screen without
-        // having passed through the form's derivation.
-        primary_domains: d.primary_domains.length
-          ? dedupeDomains(d.primary_domains)
-          : derivePrimaryDomains({
-              siteScope: d.site_scope,
-              keyUrls: mustVisit,
-              attachedUrls,
-            }),
         subjects: d.subjects
           .flatMap((s) => {
             const canonical = normalizeSubject(s);

@@ -217,7 +217,6 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
         state.draftBasketKey = "";
         state.lastDraftTitle = "";
         state.scopeDirty = false;
-        state.domainsDirty = false;
         state.requestDirty = false;
         state.pendingTaskId = null;
         state.pendingCreatedAt = null;
@@ -632,7 +631,6 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
     state.draftBasketKey = "";
     state.lastDraftTitle = "";
     state.scopeDirty = false;
-    state.domainsDirty = false;
     state.requestDirty = false;
     state.pendingTaskId = null;
     state.pendingCreatedAt = null;

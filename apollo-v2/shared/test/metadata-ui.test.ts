@@ -34,9 +34,10 @@ function guidedCtx(): { ctx: Ctx; state: ReturnType<typeof initialState> } {
 // The distribution fields once lived only on the `form` screen, which
 // reachableScreen rewrites to `guided` — so they rendered nowhere while
 // validation still demanded them, leaving authors blocked with nothing on
-// screen to fix. These assertions pin them to the screen authors actually use.
+// screen to fix. These assertions pin them to the screen authors actually use,
+// and pin the block to exactly two questions.
 describe("distribution fields on the authoring screen", () => {
-  it("renders region, subjects, and sites on the guided screen", () => {
+  it("renders exactly the region and subject questions on the guided screen", () => {
     const { ctx } = guidedCtx();
     const root = renderGuided(ctx);
     const block = root.querySelector(".metadata-fields");
@@ -44,7 +45,9 @@ describe("distribution fields on the authoring screen", () => {
     expect(block).not.toBeNull();
     expect(block!.textContent).toContain("Where is it anchored?");
     expect(block!.textContent).toContain("What is it about?");
-    expect(block!.textContent).toContain("Which sites does it run through?");
+    // The sites a task uses are computed from the record, never asked for.
+    expect(block!.textContent).not.toContain("Which sites");
+    expect(block!.querySelectorAll("input")).toHaveLength(0);
   });
 
   it("offers every region and every subject leaf, grouped", () => {
@@ -64,11 +67,10 @@ describe("distribution fields on the authoring screen", () => {
     state.formErrors = {
       region: "Pick the country this task is anchored in, or 'no specific country'.",
       subjects: "Pick at least one subject.",
-      primary_domains: "Name at least one site this task runs through.",
     };
     const root = renderGuided(ctx);
 
-    for (const field of ["region", "subjects", "primary_domains"]) {
+    for (const field of ["region", "subjects"]) {
       const el = root.querySelector(`.metadata-fields .field-error[data-field="${field}"]`);
       expect(el, field).not.toBeNull();
       expect(el!.textContent, field).toBe(state.formErrors[field]);
@@ -96,51 +98,5 @@ describe("distribution fields on the authoring screen", () => {
 
     expect(subjectSelect.disabled).toBe(true);
     expect(subjectSelect.textContent).toContain(`Maximum ${MAX_SUBJECTS}`);
-  });
-
-  it("normalizes a pasted URL into a domain chip", () => {
-    const { ctx, state } = guidedCtx();
-    const root = renderGuided(ctx);
-    const input = root.querySelector<HTMLInputElement>(".metadata-fields input")!;
-
-    input.value = "https://www.irctc.co.in/nget/train-search";
-    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
-
-    expect(state.draft.primary_domains).toEqual(["irctc.co.in"]);
-    expect(state.domainsDirty).toBe(true);
-    expect(input.value).toBe("");
-  });
-
-  it("does not add a chip for something that is not a domain", () => {
-    const { ctx, state } = guidedCtx();
-    const root = renderGuided(ctx);
-    const input = root.querySelector<HTMLInputElement>(".metadata-fields input")!;
-
-    input.value = "the provider's website";
-    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
-
-    expect(state.draft.primary_domains).toEqual([]);
-    expect(input.value).toBe("");
-  });
-
-  it("seeds the site chips from what the author already supplied", () => {
-    const { ctx, state } = guidedCtx();
-    state.draft.site_scope = ["mlb.com"];
-    state.keyUrls = ["https://www.expedia.com/Hotels-New-York"];
-
-    renderGuided(ctx);
-
-    expect(state.draft.primary_domains).toEqual(["mlb.com", "expedia.com"]);
-  });
-
-  it("leaves hand-edited site chips alone on re-render", () => {
-    const { ctx, state } = guidedCtx();
-    state.draft.site_scope = ["mlb.com"];
-    state.draft.primary_domains = ["wikipedia.org"];
-    state.domainsDirty = true;
-
-    renderGuided(ctx);
-
-    expect(state.draft.primary_domains).toEqual(["wikipedia.org"]);
   });
 });

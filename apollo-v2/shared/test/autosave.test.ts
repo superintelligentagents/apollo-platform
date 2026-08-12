@@ -77,7 +77,6 @@ describe("serialize → apply round-trip", () => {
     s.draft.agent_request = "Compare warranty terms across three laptop manufacturers.";
     s.draft.region = "GLOBAL";
     s.draft.subjects = ["Computers Electronics and Technology > Consumer Electronics"];
-    s.draft.primary_domains = ["dell.com", "lenovo.com"];
 
     const fresh = initialState();
     applyDraftState(fresh, serializeDraftState(s, "2026-08-12T00:00:00.000Z"), null);
@@ -85,7 +84,6 @@ describe("serialize → apply round-trip", () => {
     expect(fresh.draft.subjects).toEqual([
       "Computers Electronics and Technology > Consumer Electronics",
     ]);
-    expect(fresh.draft.primary_domains).toEqual(["dell.com", "lenovo.com"]);
   });
 
   it("fills in defaults for a draft saved before the metadata fields existed", () => {
@@ -99,13 +97,11 @@ describe("serialize → apply round-trip", () => {
     const saved = serializeDraftState(s, "2026-08-12T00:00:00.000Z");
     delete (saved.draft as Partial<typeof saved.draft>).region;
     delete (saved.draft as Partial<typeof saved.draft>).subjects;
-    delete (saved.draft as Partial<typeof saved.draft>).primary_domains;
 
     const fresh = initialState();
     applyDraftState(fresh, saved, null);
     expect(fresh.draft.region).toBe("");
     expect(fresh.draft.subjects).toEqual([]);
-    expect(fresh.draft.primary_domains).toEqual([]);
     expect(fresh.draft.agent_request).toContain("shortlisted programmes");
   });
 

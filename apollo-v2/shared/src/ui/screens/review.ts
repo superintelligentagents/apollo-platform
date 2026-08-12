@@ -73,15 +73,14 @@ export function renderReview(ctx: Ctx): HTMLElement {
     // A resumed pre-metadata draft has the object but nothing in it — an empty
     // "About this task" heading reads as a rendering bug, not a prompt to fill
     // it in. The upload gate is what tells the author what is missing.
-    t.metadata && (t.metadata.region || t.metadata.subjects.length || t.metadata.primary_domains.length)
+    t.metadata && (t.metadata.region || t.metadata.subjects.length)
       ? section(
           "About this task",
           el(
             "div",
             { class: "preview-chips" },
             chip(regionLabel(t.metadata.region)),
-            ...t.metadata.subjects.map((s) => chip(s)),
-            ...t.metadata.primary_domains.map((s) => chip(s, "tag"))
+            ...t.metadata.subjects.map((s) => chip(s))
           )
         )
       : null

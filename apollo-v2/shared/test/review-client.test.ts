@@ -31,7 +31,6 @@ function task(): LongTask {
       steps: [{ order: 1, title: "Research", description: "Compare at least three current options." }],
       metadata: {
         region: "IN",
-        primary_domains: ["example.com"],
         subjects: ["Ecommerce & Shopping > Price Comparison"],
       },
     },
@@ -129,11 +128,10 @@ describe("review gold audit trail", () => {
       request: "Original request with enough detail to run.",
       difficulty: "high",
       rubrics: seedRubrics(task()).map((row) => ({ ...row, checked: true })),
-    }) as { task: { metadata?: { region: string; subjects: string[]; primary_domains: string[] } } };
+    }) as { task: { metadata?: { region: string; subjects: string[] } } };
 
     expect(reviewed.task.metadata).toEqual({
       region: "IN",
-      primary_domains: ["example.com"],
       subjects: ["Ecommerce & Shopping > Price Comparison"],
     });
   });

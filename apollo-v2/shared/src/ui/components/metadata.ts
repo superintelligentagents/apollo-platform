@@ -1,7 +1,6 @@
 import type { Ctx } from "../context";
 import {
   MAX_SUBJECTS,
-  normalizeDomain,
   REGION_GLOBAL,
   regionLabel,
   regionOptions,
@@ -12,11 +11,15 @@ import {
 } from "../../taxonomy";
 import { el } from "./helpers";
 
-// The three distribution fields, rendered as one block at the foot of the
-// authoring form. Deliberately small: region is one pick, subjects are one to
-// three, and the domains arrive pre-filled from the task's own sites. Anything
-// heavier gets answered carelessly, and careless answers are worse than none —
-// they look like data.
+// The distribution fields, rendered as one block at the foot of the authoring
+// screen. Deliberately small: region is one pick and subjects are one to three.
+// Anything heavier gets answered carelessly, and careless answers are worse
+// than none — they look like data.
+//
+// The sites a task runs through are deliberately NOT asked for. Everything they
+// would be computed from is already on the task (site_scope, key URLs, attached
+// URLs), so `derivePrimaryDomains` can recover them offline without spending an
+// author's attention on a question they have effectively already answered.
 
 export function metadataFields(
   ctx: Ctx,
@@ -34,12 +37,12 @@ export function metadataFields(
       el(
         "span",
         { class: "field-hint" },
-        " — so we can keep the collection spread across places, sites, and topics"
+        " — so we can keep the collection spread across places and topics"
       )
     )
   );
 
-  block.append(regionField(ctx, d, fieldError), subjectField(ctx, d, fieldError), domainField(ctx, d, fieldError));
+  block.append(regionField(ctx, d, fieldError), subjectField(ctx, d, fieldError));
   return block;
 }
 
@@ -176,88 +179,5 @@ function subjectField(
     chosen,
     select,
     fieldError("subjects")
-  );
-}
-
-function domainField(
-  ctx: Ctx,
-  d: Ctx["state"]["draft"],
-  fieldError: (key: string) => HTMLElement
-): HTMLElement {
-  const chips = el("div", { class: "preview-chips domain-chips" });
-
-  const draw = () => {
-    chips.replaceChildren();
-    if (!d.primary_domains.length) {
-      chips.append(el("span", { class: "muted small" }, "None yet — add the main sites below."));
-    }
-    for (const domain of d.primary_domains) {
-      chips.append(
-        el(
-          "span",
-          { class: "chip tag" },
-          domain,
-          el(
-            "button",
-            {
-              type: "button",
-              class: "chip-x",
-              "aria-label": `Remove ${domain}`,
-              onclick: () => {
-                d.primary_domains = d.primary_domains.filter((x) => x !== domain);
-                ctx.state.domainsDirty = true;
-                draw();
-                ctx.autosave();
-              },
-            },
-            "×"
-          )
-        )
-      );
-    }
-  };
-
-  const input = el("input", {
-    class: "field-input",
-    placeholder: "Add a site, e.g. wikipedia.org",
-    "aria-label": "Add a site this task runs through",
-    // Enter must not submit the form — it belongs to this chip input.
-    onkeydown: (e: KeyboardEvent) => {
-      if (e.key !== "Enter") return;
-      e.preventDefault();
-      commit();
-    },
-    onblur: () => commit(),
-  }) as HTMLInputElement;
-
-  function commit() {
-    const domain = normalizeDomain(input.value);
-    if (!domain) {
-      input.value = "";
-      return;
-    }
-    if (!d.primary_domains.includes(domain)) {
-      d.primary_domains = [...d.primary_domains, domain];
-      ctx.state.domainsDirty = true;
-      draw();
-      ctx.autosave();
-    }
-    input.value = "";
-  }
-
-  draw();
-
-  return el(
-    "div",
-    { class: "subfield" },
-    el("span", { class: "subfield-label" }, "Which sites does it run through?"),
-    el(
-      "p",
-      { class: "subfield-hint" },
-      "Filled in from the sites and links you already gave. Correct it if it is missing the site that matters most."
-    ),
-    chips,
-    input,
-    fieldError("primary_domains")
   );
 }

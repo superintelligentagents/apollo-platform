@@ -49,7 +49,6 @@ describe("bracket validation", () => {
         time_span: deriveTimeSpan([]),
         metadata: {
           region: "US",
-          primary_domains: ["mlb.com"],
           subjects: ["Travel and Tourism > Air Travel"],
         },
       },

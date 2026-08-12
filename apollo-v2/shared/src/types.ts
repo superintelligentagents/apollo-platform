@@ -81,9 +81,6 @@ export type GuidedStep = {
 export type TaskMetadata = {
   // ISO 3166-1 alpha-2, or REGION_GLOBAL when the task has no geographic anchor.
   region: string;
-  // Site families the task actually runs through, derived from the task's own
-  // scope/URLs and editable by the author.
-  primary_domains: string[];
   // 1–3 "Top > Sub" leaves from the Odysseys category vocabulary.
   subjects: string[];
 };

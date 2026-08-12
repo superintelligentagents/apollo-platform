@@ -50,7 +50,6 @@ function validTask(mode: LongTask["mode"] = "compose"): LongTask {
       time_span: deriveTimeSpan(journeys),
       metadata: {
         region: "US",
-        primary_domains: ["mlb.com", "expedia.com"],
         subjects: ["Travel and Tourism > Accommodation and Hotels", "Sports > Baseball"],
       },
     },
@@ -167,17 +166,18 @@ describe("validateLongTask", () => {
     expect(validateLongTask(task).valid).toBe(true);
   });
 
-  it("requires at least one usable primary domain", () => {
+  it("does not ask the author for the sites — they are computed from the task", () => {
     const task = validTask();
-    task.task.metadata!.primary_domains = [];
-    expect(validateLongTask(task).errors.primary_domains).toBeDefined();
-
-    // Present but unusable is the same as absent.
-    task.task.metadata!.primary_domains = ["not a domain"];
-    expect(validateLongTask(task).errors.primary_domains).toBeDefined();
-
-    task.task.metadata!.primary_domains = ["https://www.irctc.co.in/nget/train-search"];
     expect(validateLongTask(task).valid).toBe(true);
+    expect("primary_domains" in task.task.metadata!).toBe(false);
+    // The signal is still recoverable from what the task already stores.
+    expect(
+      derivePrimaryDomains({
+        siteScope: task.task.site_scope,
+        keyUrls: task.task.must_visit_or_reach,
+        attachedUrls: task.provenance.attached_urls,
+      }).length
+    ).toBeGreaterThan(0);
   });
 });
 

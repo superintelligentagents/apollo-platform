@@ -107,9 +107,12 @@ function hostOf(url: string): string {
 
 // The sites a task actually runs through, in the author's own order of
 // emphasis: the scope chips they curated first, then the URLs they singled out,
-// then anything else they attached. Derived rather than asked for — the author
-// has already told us this three times over, and a fourth prompt gets worse
-// answers than the data we hold.
+// then anything else they attached.
+//
+// Not stored on the task and not asked of the author — every input is already
+// part of the record, so domain distribution can be recomputed from stored
+// tasks at any time by calling this. Kept here so that reporting and the
+// authoring app agree on what "the sites this task uses" means.
 export function derivePrimaryDomains(input: {
   siteScope?: readonly string[];
   keyUrls?: readonly string[];
@@ -146,7 +149,8 @@ export function validateLongTask(task: LongTask): ValidationResult {
   // Distribution metadata is required at authoring time even though the field is
   // optional on the type: stored tasks predating it stay readable, but nothing
   // new should land without it, or the distribution counts are built on a
-  // self-selected sample. Two picks — the derived domains are already filled in.
+  // self-selected sample. Two picks, and only two — see derivePrimaryDomains for
+  // the third signal, which is computed rather than asked for.
   const meta = t.metadata;
   if (!meta) {
     errors.metadata = "Add the region, sites, and subjects for this task.";
@@ -166,9 +170,6 @@ export function validateLongTask(task: LongTask): ValidationResult {
       errors.subjects = `Pick at most ${MAX_SUBJECTS} subjects — choose the ones the task is really about.`;
     } else if (new Set(subjects).size !== subjects.length) {
       errors.subjects = "Remove the duplicate subject.";
-    }
-    if (!dedupeDomains(meta.primary_domains ?? []).length) {
-      errors.primary_domains = "Name at least one site this task runs through.";
     }
   }
 

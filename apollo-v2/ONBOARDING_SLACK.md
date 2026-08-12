@@ -18,7 +18,7 @@
 
 ## About this task
 
-Below the request box, pick the country the task is anchored in (or **no specific country**), one to three subjects, and confirm the sites it runs through. This is how we keep the collection spread rather than concentrated in one region's web.
+Below the request box, pick the country the task is anchored in (or **no specific country**) and one to three subjects. Two picks, a few seconds. This is how we keep the collection spread rather than concentrated in one region's web.
 
 Across your own tasks, aim for at most ~⅓ anchored in your home country, at least ~⅓ with no specific country, and no more than two tasks through any one site. Tasks about your own country are welcome — just not most of them.
 
