@@ -157,3 +157,57 @@ describe("review rubric editor", () => {
     expect(approve.disabled).toBe(false);
   });
 });
+
+describe("return to author", () => {
+  beforeEach(() => {
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
+      cb(0);
+      return 1;
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("reveals a reason row and sends the task back to the author on confirm", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: true, json: async () => ({ ok: true, returned_key: "rk" }) })));
+    const state = initialState();
+    state.reviewKey = "test-key";
+    state.reviewClaim = {
+      subKey: "s1",
+      token: "tok",
+      task: claimedTask(),
+      lockTtlMs: 30 * 60 * 1000,
+      claimedAtMs: Date.now(),
+    };
+    const endReview = vi.fn();
+    const notifyError = vi.fn();
+    const ctx = {
+      state,
+      adapter: { storage: { set: vi.fn(async () => {}), get: vi.fn(async () => null) } },
+      actions: { reviewerName: () => "Reviewer", endReview, notifyError },
+    } as unknown as Ctx;
+
+    const root = renderReviewEdit(ctx);
+    const returnBtn = Array.from(root.querySelectorAll<HTMLButtonElement>("button")).find(
+      (b) => b.textContent?.includes("Return to author")
+    )!;
+    expect(returnBtn).toBeTruthy();
+    returnBtn.click();
+    const rows = root.querySelectorAll<HTMLElement>(".reject-row");
+    const returnRow = rows[rows.length - 1];
+    expect(returnRow.style.display).not.toBe("none");
+
+    const reason = returnRow.querySelector<HTMLInputElement>("input.reject-reason")!;
+    reason.value = "Step 1 needs a verifiable source.";
+    reason.dispatchEvent(new Event("input"));
+    const confirm = returnRow.querySelector<HTMLButtonElement>("button.btn.primary")!;
+    expect(confirm.disabled).toBe(false);
+    confirm.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(endReview).toHaveBeenCalledWith("Sent back to the author for revision.");
+    expect(notifyError).not.toHaveBeenCalled();
+  });
+});

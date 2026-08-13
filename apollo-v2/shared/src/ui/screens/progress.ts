@@ -8,6 +8,7 @@ import {
   type AdminSubmission,
   type AdminSubmissionStatus,
   type AdminTaskSnapshot,
+  type AdminUserSummary,
 } from "../../review-client";
 import { participantKey } from "../identity";
 import { isAdminEmail } from "../../admin-access";
@@ -110,7 +111,62 @@ export function filterAdminSubmissions(
   });
 }
 
-function taskSnapshot(label: string, snapshot: AdminTaskSnapshot, extraClass = ""): HTMLElement {
+export interface RejectionReasonCluster {
+  reason: string;
+  count: number;
+}
+
+export interface AuthorRejectionRate {
+  participant_id: string;
+  name: string;
+  email: string;
+  approved: number;
+  rejected: number;
+  rate: number;
+}
+
+export function rejectionReasonClusters(items: readonly AdminSubmission[]): RejectionReasonCluster[] {
+  const counts = new Map<string, number>();
+  const display = new Map<string, string>();
+  for (const item of items) {
+    if (item.status !== "rejected") continue;
+    const raw = (item.rejection_reason ?? "").trim();
+    const label = raw || "(no reason given)";
+    const key = label.toLowerCase();
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    if (!display.has(key)) display.set(key, label);
+  }
+  return [...counts.entries()]
+    .map(([key, count]) => ({ reason: display.get(key)!, count }))
+    .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason, "en"));
+}
+
+export function authorRejectionRates(users: readonly AdminUserSummary[]): AuthorRejectionRate[] {
+  return users
+    .filter((user) => user.approved + user.rejected > 0)
+    .map((user) => {
+      const finished = user.approved + user.rejected;
+      return {
+        participant_id: user.participant_id,
+        name: user.name,
+        email: user.email,
+        approved: user.approved,
+        rejected: user.rejected,
+        rate: user.rejected / finished,
+      };
+    })
+    .sort((a, b) => b.rate - a.rate || a.name.localeCompare(b.name, "en"));
+}
+
+// `meta` is passed in rather than read off the snapshot: the server keeps
+// distribution metadata beside the snapshots so the reporting content hash
+// stays stable, and both snapshots of a row share the one resolved value.
+function taskSnapshot(
+  label: string,
+  snapshot: AdminTaskSnapshot,
+  meta: { region?: string; subjects?: string[] } | null | undefined,
+  extraClass = ""
+): HTMLElement {
   const criteria = snapshot.criteria.length
     ? el("ol", { class: "admin-rubric-list" }, ...snapshot.criteria.map((criterion) => el("li", null, criterion)))
     : el("p", { class: "muted" }, "No success criteria.");
@@ -123,7 +179,6 @@ function taskSnapshot(label: string, snapshot: AdminTaskSnapshot, extraClass = "
         )
       )
     : el("p", { class: "muted" }, "No authored steps.");
-  const meta = snapshot.metadata;
   return el(
     "section",
     { class: `admin-snapshot ${extraClass}`.trim() },
@@ -179,8 +234,8 @@ function submissionRow(item: AdminSubmission): HTMLElement {
       el(
         "div",
         { class: `admin-snapshots ${item.final ? "has-final" : ""}` },
-        taskSnapshot(item.final ? "Original submission" : "Submitted task", item.original),
-        ...(item.final ? [taskSnapshot(item.changed ? "Final gold · changed" : "Final gold · unchanged", item.final, "final")] : [])
+        taskSnapshot(item.final ? "Original submission" : "Submitted task", item.original, item.task_metadata),
+        ...(item.final ? [taskSnapshot(item.changed ? "Final gold · changed" : "Final gold · unchanged", item.final, item.task_metadata, "final")] : [])
       )
     )
   );
@@ -252,6 +307,7 @@ function hydrateAdminPanel(panel: HTMLElement, data: AdminDashboard): void {
   panel.append(
     stats,
     teamDistribution(data.items),
+    cohortSteering(data.items, data.users),
     el("div", { class: "admin-filters" }, query, userSelect, statusSelect),
     resultCount,
     list
@@ -259,12 +315,12 @@ function hydrateAdminPanel(panel: HTMLElement, data: AdminDashboard): void {
   draw();
 }
 
-// Team-wide spread across places and subjects. Renders from whatever the admin
-// endpoint returns; while that endpoint omits `metadata` this says so plainly
+// Team-wide spread across places and subjects. Tasks authored before the
+// metadata fields shipped carry none, so an empty result still says so plainly
 // rather than drawing an empty chart, which would read as "nobody is filling
-// the fields in" when the truth is "the server is not sending them".
+// the fields in" when the truth is "these tasks predate the fields".
 export function teamDistribution(items: readonly AdminSubmission[]): HTMLElement {
-  const authored = items.map((item) => item.final?.metadata ?? item.original.metadata ?? {});
+  const authored = items.map((item) => item.task_metadata ?? {});
   const summary = summarizeDistribution(authored);
   const panel = el(
     "section",
@@ -277,7 +333,7 @@ export function teamDistribution(items: readonly AdminSubmission[]): HTMLElement
       el(
         "p",
         { class: "muted" },
-        "Region and subject are collected on every new task but the admin feed does not return them yet — they need adding to the submission snapshot in the reporting Lambda. Until then, use the per-task view or the reporting API with include=content."
+        "No task carries region or subject yet. Both are collected and required on every new task, so this fills in as tasks authored since those fields shipped come through."
       )
     );
     return panel;
@@ -294,6 +350,82 @@ export function teamDistribution(items: readonly AdminSubmission[]): HTMLElement
       ? [el("p", { class: "muted small" }, `Based on ${summary.labelled} of ${items.length} submissions; the rest predate these fields.`)]
       : [])
   );
+  return panel;
+}
+
+const REASON_CLUSTER_LIMIT = 8;
+const REASON_DISPLAY_LIMIT = 80;
+const COACHING_RATE_THRESHOLD = 0.3;
+
+export function cohortSteering(items: readonly AdminSubmission[], users: readonly AdminUserSummary[]): HTMLElement {
+  const panel = el(
+    "section",
+    { class: "stat-group cohort-steering" },
+    el("h3", null, "Cohort steering")
+  );
+
+  const clusters = rejectionReasonClusters(items);
+  const reasons = el("div", { class: "stat-group cohort-reasons" }, el("h3", null, "Rejection reason clusters"));
+  if (!clusters.length) {
+    reasons.append(el("p", { class: "muted" }, "No rejected tasks — nothing to steer on yet."));
+  } else {
+    const top = clusters.slice(0, REASON_CLUSTER_LIMIT);
+    const max = Math.max(1, ...top.map((cluster) => cluster.count));
+    for (const cluster of top) {
+      const label =
+        cluster.reason.length > REASON_DISPLAY_LIMIT
+          ? `${cluster.reason.slice(0, REASON_DISPLAY_LIMIT - 1)}…`
+          : cluster.reason;
+      const fill = el("span", { class: "stat-fill" });
+      fill.style.width = `${(cluster.count / max) * 100}%`;
+      reasons.append(
+        el(
+          "div",
+          { class: "cohort-reason-row" },
+          el("div", { class: "cohort-reason-label", title: cluster.reason }, label),
+          el(
+            "div",
+            { class: "stat-row" },
+            el("span", { class: "stat-track" }, fill),
+            el("span", { class: "stat-val mono" }, String(cluster.count))
+          )
+        )
+      );
+    }
+    if (clusters.length > REASON_CLUSTER_LIMIT) {
+      reasons.append(el("p", { class: "muted small" }, `Top ${REASON_CLUSTER_LIMIT} of ${clusters.length} distinct reasons.`));
+    }
+  }
+
+  const flagged = authorRejectionRates(users).filter((row) => row.rate > COACHING_RATE_THRESHOLD);
+  const authors = el(
+    "div",
+    { class: "stat-group cohort-authors" },
+    el("h3", null, "Authors to coach"),
+    el("p", { class: "field-hint" }, "Flagged when more than 30% of finished reviews are rejections.")
+  );
+  if (!flagged.length) {
+    authors.append(el("p", { class: "muted" }, "No authors currently need coaching flagging."));
+  } else {
+    for (const row of flagged) {
+      const identity = row.email ? `${row.name} · ${row.email}` : row.name;
+      authors.append(
+        el(
+          "div",
+          { class: "cohort-author-row" },
+          el(
+            "div",
+            { class: "cohort-author-head" },
+            el("span", { class: "chip tag review-chip" }, "review"),
+            el("span", { class: "cohort-author-name", title: identity }, identity)
+          ),
+          el("p", { class: "muted small mono" }, `${row.approved} approved · ${row.rejected} rejected · ${pct(row.rate)}`)
+        )
+      );
+    }
+  }
+
+  panel.append(el("div", { class: "stat-cols" }, reasons, authors));
   return panel;
 }
 

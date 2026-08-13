@@ -43,13 +43,6 @@ export interface AdminTaskSnapshot {
   difficulty: string;
   criteria: string[];
   steps: { order: number; title: string; description: string }[];
-  // Distribution metadata, when the server sends it. Optional because the admin
-  // endpoint lives in the reporting Lambda rather than this repo and does not
-  // include it yet: it builds this snapshot field by field from the stored task,
-  // the same way buildReviewedTask does, so `metadata` has to be added there
-  // before the team-wide spread can be charted. The dashboard already renders it
-  // wherever it is present, so no client change is needed once it lands.
-  metadata?: { region?: string; subjects?: string[] };
 }
 
 export interface AdminSubmission {
@@ -68,6 +61,11 @@ export interface AdminSubmission {
   changed: boolean;
   original: AdminTaskSnapshot;
   final: AdminTaskSnapshot | null;
+  // Distribution metadata sits beside the snapshots rather than inside them:
+  // the server hashes each snapshot wholesale for the reporting content hash,
+  // so a field added there would restate every task's hash. Optional because
+  // tasks authored before the metadata fields shipped carry none.
+  task_metadata?: { region?: string; subjects?: string[] } | null;
 }
 
 export interface AdminUserSummary {
@@ -605,4 +603,145 @@ export function upgradeRubrics(task: LongTask, rows: RubricRow[]): RubricRow[] {
     seedVersion: 3 as const,
   }));
   return upgraded;
+}
+
+// ---- Author-facing "my tasks" + self-edit + return-to-author ----
+
+export type MyTaskStatus = "awaiting_codex" | "pending" | "in_review" | "approved" | "rejected" | "returned";
+
+export interface MyTaskItem {
+  task_id: string;
+  sub_key: string;
+  title: string;
+  request: string;
+  status: MyTaskStatus;
+  submitted_at: string | null;
+  rejection_reason?: string;
+  returned_reason?: string;
+  returned_by?: string;
+  content_hash: string | null;
+}
+
+export interface MyTaskContentSnapshot {
+  title: string;
+  request: string;
+  criteria: string[];
+  steps: { order: number; title: string; description: string }[];
+}
+
+export interface MyTaskHumanReviewRubric {
+  rubric_id: string;
+  kind: string;
+  title: string | null;
+  original: string | null;
+  final: string;
+  changed: boolean;
+  checked: boolean;
+}
+
+export interface MyTaskHumanReview {
+  original: MyTaskContentSnapshot;
+  final: MyTaskContentSnapshot;
+  rubrics: MyTaskHumanReviewRubric[];
+  title_edited: boolean;
+  request_edited: boolean;
+  evergreen_verified: boolean;
+}
+
+// The full current task content. NOT in the written my-task-feedback contract:
+// human_review is only present for approved tasks, but the author needs the
+// full title/request/difficulty/steps to render the read-only view and pre-fill
+// the self-edit form for awaiting_codex/pending/returned states. Flagged for
+// reconciliation with the backend agent — this optional field is a forward-
+// compatible extension so the screen degrades gracefully until it ships.
+export interface MyTaskCurrentContent {
+  title: string;
+  request: string;
+  difficulty: string;
+  criteria: string[];
+  steps: { order: number; title: string; description: string }[];
+  must_visit_or_reach: string[];
+  required_outputs: string[];
+  notes: string | null;
+  metadata?: { region?: string; subjects?: string[] };
+}
+
+export interface MyTaskFeedback {
+  status: "not_reviewed" | "pre_qc_passed" | "pre_qc_attention" | "stale" | "approved" | "rejected" | "returned";
+  stale: boolean;
+  task_content_hash: string | null;
+  review: LlmReviewForHuman | null;
+  human_review?: MyTaskHumanReview;
+  rejection_reason?: string;
+  returned_reason?: string;
+  returned_by?: string;
+  task?: MyTaskCurrentContent;
+}
+
+export interface AuthorEditPayload {
+  task_title: string;
+  agent_request: string;
+  difficulty: string;
+  success_criteria: string[];
+  steps: { order: number; title: string; description: string }[];
+  must_visit_or_reach: string[];
+  required_outputs: string[];
+  notes: string | null;
+  metadata?: { region?: string; subjects?: string[] };
+}
+
+export interface AuthorEditResult {
+  ok: true;
+  new_sub_key: string;
+  new_content_hash: string;
+  status: "awaiting_codex";
+}
+
+export async function myTasks(reviewKey: string, participantId: string): Promise<MyTaskItem[]> {
+  const res = await post("/review/my-tasks", { reviewKey, participant_id: participantId });
+  return (res.items as MyTaskItem[] | undefined) ?? [];
+}
+
+export async function myTaskFeedback(
+  reviewKey: string,
+  participantId: string,
+  subKey: string
+): Promise<MyTaskFeedback> {
+  return (await post("/review/my-task-feedback", {
+    reviewKey,
+    participant_id: participantId,
+    sub_key: subKey,
+  })) as unknown as MyTaskFeedback;
+}
+
+export async function authorEdit(
+  reviewKey: string,
+  participantId: string,
+  subKey: string,
+  edited: AuthorEditPayload
+): Promise<AuthorEditResult> {
+  return (await post("/review/author-edit", {
+    reviewKey,
+    participant_id: participantId,
+    sub_key: subKey,
+    edited,
+  })) as unknown as AuthorEditResult;
+}
+
+// Mirrors reviewReject: the reviewer holds the claim lock and sends the task
+// back to the author with a reason. The author can then self-edit and resubmit.
+export async function reviewReturn(
+  reviewKey: string,
+  reviewer: string,
+  claim: ReviewClaim,
+  reason: string
+): Promise<void> {
+  await post("/review/return-to-author", {
+    reviewKey,
+    reviewer,
+    sub_key: claim.subKey,
+    token: claim.token,
+    task_id: claim.task.task_id,
+    reason,
+  });
 }

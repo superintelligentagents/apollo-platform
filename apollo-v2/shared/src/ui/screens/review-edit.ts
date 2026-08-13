@@ -4,6 +4,7 @@ import {
   reviewLlmFeedback,
   reviewReject,
   reviewRelease,
+  reviewReturn,
   reviewSubmit,
   type LlmReviewForHuman,
   type RubricRow,
@@ -13,72 +14,14 @@ import {
 import { appendUploadLog, STORAGE_KEYS } from "../../platform";
 import { participantKey } from "../identity";
 import { saveClaimSnapshot } from "../../review-client";
+import {
+  conciseReviewText,
+  distinctReviewText,
+  plainReviewText,
+  renderLlmPanel,
+} from "../components/llm-panel";
 
-/** Keep the reporting API exact while translating older pipeline prose for reviewers. */
-export function plainReviewText(value: string | null | undefined): string | null {
-  if (!value) return null;
-  return value
-    .replace(/\bthe feasibility manager marked this rubric IMPOSSIBLE because\b/gi, "This step needs attention because")
-    .replace(/\brequires NOT_FEASIBLE\b/g, "means the task cannot be completed as written")
-    .replace(/\bis not presently feasible\b/gi, "cannot currently be completed")
-    .replace(/\bnot presently feasible\b/gi, "cannot currently be completed")
-    .replace(/\bunresolved verification shortfalls\b/gi, "items the automated check could not fully verify")
-    .replace(/\bessential step[\s‐‑‒–—-]?(\d+) impossibility\b/gi, "problem in step $1")
-    .replace(/\bstep[‐‑‒–—-](\d+)\b/gi, "step $1")
-    .replace(/\bcompatibility failed\b/gi, "the step does not fit the task")
-    .replace(/\brubric compatibility\b/gi, "how the step fits the task")
-    .replace(/\bfeasibility manager\b/gi, "overall check")
-    .replace(/\bcoherence manager\b/gi, "task check")
-    .replace(/\bPlaywright navigation to (?:all three )?(?:the )?supplied targets\b/gi, "opening the referenced websites")
-    .replace(/\bbrowser escalation\b/gi, "website check")
-    .replace(/\bPlaywright navigation\b/gi, "automated website check")
-    .replace(/\bverifier[- ]access limitation\b/gi, "limitation of the automated check")
-    .replace(/\bsupplied targets\b/gi, "websites")
-    .replace(/\btarget pages\b/gi, "websites")
-    .replace(/\bpage rendered\b/gi, "website loaded")
-    .replace(/\bpre[- ]purchase path\b/gi, "booking path")
-    .replace(/\blive[- ]web\b/gi, "website")
-    .replace(/\brubrics\b/gi, "steps")
-    .replace(/\brubric\b/gi, "step")
-    .replace(/\bcompatibility\b/gi, "fit with the task")
-    .replace(/\bcompatible with\b/gi, "consistent with")
-    .replace(/\bcompatible\b/gi, "consistent")
-    .replace(/\bdeterministically bounded\b/gi, "clearly limited")
-    .replace(/\benumerable\b/gi, "possible to list completely")
-    .replace(/\bNEEDS_HUMAN_REVIEW\b/g, "needs a person to check")
-    .replace(/\bNOT_FEASIBLE\b/g, "cannot be completed as written")
-    .replace(/\bFEASIBLE\b/g, "can be completed")
-    .replace(/\bWORKER_ERROR\b/g, "could not be checked")
-    .replace(/\bSHORTFALL\b/g, "could not be fully checked")
-    .replace(/\bIMPOSSIBLE\b/g, "cannot be completed as written")
-    .replace(/\bPOSSIBLE\b/g, "can be completed")
-    .replace(/\bworker\b/gi, "check")
-    .replace(/\bmanager\b/gi, "overall check")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-}
-
-export function conciseReviewText(value: string | null | undefined, maxChars = 240): string | null {
-  const plain = plainReviewText(value);
-  if (!plain) return null;
-  const sentences = plain.match(/[^.!?]+[.!?]+|[^.!?]+$/g) ?? [plain];
-  let concise = sentences.slice(0, 2).join(" ").replace(/\s+/g, " ").trim();
-  if (concise.length <= maxChars) return concise;
-  concise = concise.slice(0, maxChars - 1).replace(/\s+\S*$/, "").trimEnd();
-  return `${concise}…`;
-}
-
-function distinctReviewText(values: Array<string | null | undefined>): string[] {
-  const seen = new Set<string>();
-  return values.flatMap((value) => {
-    const text = conciseReviewText(value);
-    if (!text) return [];
-    const key = text.toLocaleLowerCase();
-    if (seen.has(key)) return [];
-    seen.add(key);
-    return [text];
-  });
-}
+export { conciseReviewText, plainReviewText } from "../components/llm-panel";
 
 export function renderReviewEdit(ctx: Ctx): HTMLElement {
   const { state } = ctx;
@@ -169,99 +112,20 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
   let llmStatus: "loading" | "not_reviewed" | "pre_qc_passed" | "pre_qc_attention" | "stale" | "error" = "loading";
   const llmPanel = el("div", { class: "llm-preqc-slot" });
   const drawLlmPanel = () => {
-    if (llmStatus === "loading") {
-      llmPanel.replaceChildren(el("div", { class: "llm-preqc-loading" }, el("span", { class: "spinner-dot" }), "Loading the Codex live check…"));
-      return;
-    }
-    if (!llmReview) {
-      const copy = llmStatus === "stale"
-        ? "This task changed after its last Codex check. Review this version yourself."
-        : llmStatus === "error"
-          ? "The Codex check could not be loaded. You can still review the task."
-          : "Codex has not checked this version yet. No automated result is being hidden.";
-      llmPanel.replaceChildren(el("div", { class: "llm-preqc-empty" }, el("strong", null, "Codex live check"), el("span", null, copy)));
-      return;
-    }
-    const flagged = llmReview.rubrics.filter((rubric) =>
-      rubric.verdict !== "POSSIBLE" || (rubric.quality_verdict !== null && rubric.quality_verdict !== "PASS")
-    ).length;
-    const overallPass = llmReview.status === "LLM_PASS";
-    const coherence = llmReview.quality?.task_coherence ?? llmReview.quality?.prompt_quality ?? null;
-    const taskClear = coherence?.verdict === "PASS";
-    const websitesWork = llmReview.manager_disposition === "FEASIBLE";
-    const taskNote = conciseReviewText(coherence?.summary ?? llmReview.quality?.summary);
-    const websiteNote = conciseReviewText(llmReview.manager_summary);
-    const extraNotes = websiteNote ? [] : distinctReviewText([llmReview.task_feedback]).filter((note) =>
-      taskNote?.toLocaleLowerCase() !== note.toLocaleLowerCase()
+    llmPanel.replaceChildren(
+      renderLlmPanel({
+        review: llmReview,
+        status: llmStatus,
+        onApplyTaskSuggestion: (text) => {
+          if (!requestEditor) return;
+          edits.request = text;
+          requestEditor.value = edits.request;
+          requestEditor.style.height = "auto";
+          requestEditor.style.height = `${Math.max(220, requestEditor.scrollHeight + 2)}px`;
+          persist();
+        },
+      })
     );
-    const details = el(
-      "details",
-      { class: `llm-preqc-panel ${overallPass ? "pass" : "attention"}`, open: true },
-      el(
-        "summary",
-        null,
-        el(
-          "span",
-          { class: "llm-preqc-title" },
-          el("strong", null, "Codex live check"),
-          el("small", null, "Task quality, alignment, and feasibility")
-        ),
-        el(
-          "span",
-          { class: `badge ${overallPass ? "ok" : "warn"}` },
-          overallPass ? "Looks good" : flagged > 0 ? `${flagged} step${flagged === 1 ? "" : "s"} need a look` : "Task needs a look"
-        )
-      ),
-      el(
-        "div",
-        { class: "llm-preqc-body" },
-        el(
-          "div",
-          { class: "codex-check-list" },
-          el(
-            "div",
-            { class: `codex-check-item ${taskClear ? "pass" : "attention"}` },
-            el("span", { class: "codex-check-mark", "aria-hidden": "true" }, taskClear ? "✓" : "!"),
-            el("span", { class: "codex-check-copy" }, el("strong", null, "Coherent and high quality"), taskNote ? el("small", null, taskNote) : null),
-            el("span", { class: "codex-check-result" }, taskClear ? "Yes" : "Needs a look")
-          ),
-          el(
-            "div",
-            { class: `codex-check-item ${websitesWork ? "pass" : "attention"}` },
-            el("span", { class: "codex-check-mark", "aria-hidden": "true" }, websitesWork ? "✓" : "!"),
-            el("span", { class: "codex-check-copy" }, el("strong", null, "Feasible overall"), websiteNote ? el("small", null, websiteNote) : null),
-            el("span", { class: "codex-check-result" }, websitesWork ? "Yes" : "Needs a look")
-          )
-        ),
-        ...extraNotes.slice(0, 1).map((note) => el("p", { class: "llm-task-feedback" }, note)),
-        llmReview.task_repair
-          ? el(
-              "details",
-              { class: "llm-repair task-repair" },
-              el("summary", null, "Suggested task edit"),
-              el("p", { class: "suggested-copy" }, llmReview.task_repair.suggested_task_prompt),
-              el(
-                "button",
-                {
-                  class: "btn ghost small",
-                  type: "button",
-                  onclick: () => {
-                    if (!requestEditor || !llmReview?.task_repair) return;
-                    edits.request = llmReview.task_repair.suggested_task_prompt;
-                    requestEditor.value = edits.request;
-                    requestEditor.style.height = "auto";
-                    requestEditor.style.height = `${Math.max(220, requestEditor.scrollHeight + 2)}px`;
-                    persist();
-                  },
-                },
-                "Use this suggestion"
-              )
-            )
-          : null,
-        el("p", { class: "muted small codex-check-foot" }, "Use this as evidence, not the final decision. Nothing changes unless you apply a suggestion.")
-      )
-    );
-    llmPanel.replaceChildren(details);
   };
   drawLlmPanel();
 
@@ -675,6 +539,55 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
     "Reject task"
   ) as HTMLButtonElement;
 
+  // Return to author: mirrors reject's two-step reveal so a misclick can't
+  // bounce someone's task back. The reviewer keeps the claim lock (same as
+  // reject) and the reason is what the author sees on their my-tasks screen.
+  const returnReason = el("input", {
+    class: "input reject-reason",
+    type: "text",
+    placeholder: "Tell the author what to fix. This note goes back to them.",
+    oninput: () => {
+      returnConfirm.disabled = returnReason.value.trim().length < 3;
+    },
+  }) as HTMLInputElement;
+  const returnConfirm = el(
+    "button",
+    {
+      class: "btn primary",
+      type: "button",
+      onclick: async () => {
+        returnConfirm.disabled = true;
+        returnConfirm.textContent = "Sending back…";
+        try {
+          await reviewReturn(state.reviewKey!, ctx.actions.reviewerName(), claim, returnReason.value.trim());
+          ctx.actions.endReview("Sent back to the author for revision.");
+        } catch (err) {
+          ctx.actions.notifyError(err instanceof Error ? err.message : String(err));
+          returnConfirm.disabled = false;
+          returnConfirm.textContent = "Send back to author";
+        }
+      },
+    },
+    "Send back to author"
+  ) as HTMLButtonElement;
+  returnConfirm.disabled = true;
+  const returnRow = el("div", { class: "reject-row" }, returnReason, returnConfirm);
+  returnRow.style.display = "none";
+  const returnBtn = el(
+    "button",
+    {
+      class: "btn ghost return-to-author",
+      type: "button",
+      onclick: () => {
+        const showing = returnRow.style.display !== "none";
+        returnRow.style.display = showing ? "none" : "";
+        returnBtn.textContent = showing ? "Return to author" : "Cancel";
+        if (!showing) returnReason.focus();
+      },
+    },
+    "Return to author"
+  ) as HTMLButtonElement;
+
   // Actions
   const skipBtn = el(
     "button",
@@ -730,7 +643,7 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
     }
   };
 
-  form.append(el("div", { class: "form-actions review-actions" }, rejectBtn, skipBtn, approveBtn), rejectRow);
+  form.append(el("div", { class: "form-actions review-actions" }, rejectBtn, returnBtn, skipBtn, approveBtn), rejectRow, returnRow);
   root.append(form);
   void reviewLlmFeedback(state.reviewKey!, claim)
     .then((result) => {

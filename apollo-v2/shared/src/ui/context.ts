@@ -14,6 +14,7 @@ export type Screen =
   | "review"
   | "examples"
   | "progress"
+  | "my-tasks"
   | "review-queue"
   | "review-edit"
   | "trajectory-queue"

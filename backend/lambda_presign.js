@@ -222,14 +222,22 @@ export function isCompletedReviewerPreQcArtifact(artifact) {
   );
 }
 
-let reviewAuditGateCache = { signature: "", checkedAt: 0, ready: new Set() };
+// Keyed by the exact key list rather than a single slot: the reviewer queue
+// asks about every pending unit while the author-facing my-tasks page asks
+// about one participant's, so one shared slot made each caller evict the
+// other's entry and turned every page load into a fresh scan of both pre-QC
+// prefixes.
+const reviewAuditGateCache = new Map(); // signature -> { checkedAt, ready }
+const REVIEW_AUDIT_GATE_TTL_MS = 10_000;
+const REVIEW_AUDIT_GATE_CACHE_MAX = 8;
 
 async function completedPreQcSubmissionKeys(submissionKeys) {
   const keys = Array.isArray(submissionKeys) ? submissionKeys : [];
   const signature = keys.join("\n");
   const now = Date.now();
-  if (reviewAuditGateCache.signature === signature && now - reviewAuditGateCache.checkedAt < 10_000) {
-    return new Set(reviewAuditGateCache.ready);
+  const cached = reviewAuditGateCache.get(signature);
+  if (cached && now - cached.checkedAt < REVIEW_AUDIT_GATE_TTL_MS) {
+    return new Set(cached.ready);
   }
 
   const [passed, attention] = await Promise.all([
@@ -267,7 +275,16 @@ async function completedPreQcSubmissionKeys(submissionKeys) {
       // A task that cannot be read or fingerprinted is not ready for review.
     }
   }));
-  reviewAuditGateCache = { signature, checkedAt: now, ready };
+  // Re-insert so map order tracks recency, then bound the map: drop expired
+  // entries first, and only then the least recently written.
+  reviewAuditGateCache.delete(signature);
+  reviewAuditGateCache.set(signature, { checkedAt: now, ready });
+  for (const [key, entry] of reviewAuditGateCache) {
+    if (now - entry.checkedAt >= REVIEW_AUDIT_GATE_TTL_MS) reviewAuditGateCache.delete(key);
+  }
+  while (reviewAuditGateCache.size > REVIEW_AUDIT_GATE_CACHE_MAX) {
+    reviewAuditGateCache.delete(reviewAuditGateCache.keys().next().value);
+  }
   return new Set(ready);
 }
 
@@ -415,6 +432,16 @@ function cleanSteps(value) {
         description: String(step?.description ?? ""),
       })).filter((step) => step.description.trim())
     : [];
+}
+
+// Distribution metadata for a dashboard row. Deliberately NOT part of
+// cleanTaskSnapshot: reportingTaskContentHash hashes the snapshot object
+// wholesale, so a field added there would restate the content hash of every
+// task in the bucket and drop them all out of the pre-QC audit gate as stale.
+// A reviewer may correct the author's pick during QC, so final gold wins where
+// it exists. Exported so the precedence rule is unit-testable without S3.
+export function taskMetadataForReporting(sourceTask, finalTask) {
+  return cleanTaskMetadata(finalTask?.metadata) ?? cleanTaskMetadata(sourceTask?.metadata);
 }
 
 export function cleanTaskSnapshot(task) {
@@ -1411,6 +1438,7 @@ export async function adminDashboard() {
         : cleanText(source.participant?.participant_id || participantIdFromSubKey(newest) || "unknown", 80);
       const original = cleanTaskSnapshot(sourceTask);
       const final = cleanTaskSnapshot(finalTask);
+      const taskMetadata = taskMetadataForReporting(sourceTask, finalTask);
       const humanReview = done?.outcome === "approved" && outcome?.review && typeof outcome.review === "object"
         ? {
             evergreen_verified: Boolean(outcome.review.evergreen_verified),
@@ -1445,6 +1473,7 @@ export async function adminDashboard() {
         original,
         final,
         rubrics,
+        task_metadata: taskMetadata,
         human_review: humanReview,
         task_content_hash: taskContentHash,
         llm_review_status: llmReviewStale ? "stale" : llmMeta?.status ?? "not_reviewed",
@@ -1572,20 +1601,17 @@ export function sortPendingReviewUnits(units) {
     .map((unit) => unit.newest);
 }
 
-// The queue state: task submissions minus finished ones minus freshly locked ones.
-// Upload retries of the SAME task land in the same directory (the client keeps
-// a stable task id) with different timestamped filenames — so the reviewable
-// unit is the task DIRECTORY, represented by its newest file. Without this,
-// one retried upload would be claimable twice and the second approval would
-// clobber the first reviewer's finished record.
-async function queueState() {
-  // The inbox index (one tiny marker per review-safe task upload, written at
-  // presign time)
-  // keeps this O(review traffic) instead of O(every object ever uploaded) —
-  // at 11k+ bucket objects the full-prefix list already cost 5-8s per call.
-  const [inbox, done, lockObjects] = await Promise.all([
+// The review index: inbox markers, done records, and fresh locks, grouped
+// into task-directory units (the reviewable entity). Shared by the reviewer
+// queue and the author-facing endpoints so they see the same grouping. Done
+// records are only read when a caller needs outcomes (my-tasks, author-edit);
+// the reviewer queue just needs membership, so it skips the extra reads.
+// `doneRecordFilter(subKey)` narrows those reads to the records the caller
+// will look at — without it an author-facing call reads the whole bucket.
+async function loadReviewIndex({ readDoneRecords = false, doneRecordFilter = null } = {}) {
+  const [inbox, doneObjects, lockObjects] = await Promise.all([
     listAllObjects(`${REVIEW_PREFIX}inbox/`),
-    listAll(`${REVIEW_PREFIX}done/`),
+    listAllObjects(`${REVIEW_PREFIX}done/`),
     listAllObjects(`${REVIEW_PREFIX}locks/`),
   ]);
   const inboxAge = new Map(); // submission key -> marker LastModified ms
@@ -1602,7 +1628,34 @@ async function queueState() {
     }
   }
   submissions.sort(); // deterministic grouping; queue order is assigned below from marker time
-  const doneSet = new Set(done.map((k) => k.slice(`${REVIEW_PREFIX}done/`.length)));
+  const doneSet = new Set(doneObjects.map((o) => o.Key.slice(`${REVIEW_PREFIX}done/`.length)));
+  let doneByEncodedKey = null;
+  if (readDoneRecords) {
+    doneByEncodedKey = new Map();
+    // Only the records the caller will actually read. Reading every done
+    // record costs one GET per completed review platform-wide — O(all
+    // history) on an author-facing page load — so callers pass a filter that
+    // narrows this to their own tasks. Batched like the admin dashboard:
+    // one unbounded Promise.all creates avoidable throttling spikes.
+    const wanted = [];
+    for (const object of doneObjects) {
+      const encoded = object.Key.slice(`${REVIEW_PREFIX}done/`.length);
+      let subKey;
+      try {
+        subKey = fromB64url(encoded);
+      } catch {
+        continue; // malformed done key — not addressable by any caller
+      }
+      if (doneRecordFilter && !doneRecordFilter(subKey)) continue;
+      wanted.push({ encoded, subKey });
+    }
+    for (let offset = 0; offset < wanted.length; offset += 25) {
+      await Promise.all(wanted.slice(offset, offset + 25).map(async ({ encoded, subKey }) => {
+        const record = await readDoneRecord(subKey);
+        if (record) doneByEncodedKey.set(encoded, record);
+      }));
+    }
+  }
   // Only fresh locks suppress the claim button. Stale or malformed locks are
   // deliberately treated as claimable; tryLock() atomically takes them over.
   const lockReads = await Promise.all(
@@ -1619,7 +1672,7 @@ async function queueState() {
     )
   );
   const lockSet = new Set(lockReads.filter(Boolean));
-  const byTaskDir = new Map(); // dir -> { newest, files, oldestAt }
+  const byTaskDir = new Map(); // unit -> { newest, files, oldestAt }
   for (const k of submissions) {
     const unit = reviewUnitForKey(k);
     const markerAt = inboxAge.get(k) ?? 0;
@@ -1629,21 +1682,39 @@ async function queueState() {
     entry.oldestAt = Math.min(entry.oldestAt, markerAt);
     byTaskDir.set(unit, entry);
   }
-  // A task is done if ANY of its files was reviewed; it is represented in the
-  // queue only by its newest file.
-  const pendingUnits = [];
-  for (const { newest, files, oldestAt } of byTaskDir.values()) {
-    if (!files.some((f) => doneSet.has(b64url(f)))) pendingUnits.push({ newest, oldestAt });
-  }
-  // Real FIFO across participants. Sorting full S3 keys put participant names
-  // before timestamps, which could starve later-alphabet users as volume grew.
-  const pending = sortPendingReviewUnits(pendingUnits);
   return {
-    pending,
+    byTaskDir,
     lockSet,
+    doneSet,
+    doneByEncodedKey,
     inboxAge,
     counts: { submitted: byTaskDir.size, finished: doneSet.size, locked: lockSet.size },
   };
+}
+
+// A unit is pending iff its NEWEST file is not done. The previous rule (pending
+// unless ANY file was done) kept a returned task out of the queue forever once
+// the author revised it: the old returned file stayed done, so the fresh
+// revision never re-entered review. Backward compatible for single-file units,
+// where newest === the only file. Exported so the rule is unit-testable sans S3.
+export function pendingReviewUnits(units, doneSet) {
+  const pendingUnits = [];
+  for (const { newest, oldestAt } of units) {
+    if (!doneSet.has(b64url(newest))) pendingUnits.push({ newest, oldestAt });
+  }
+  return pendingUnits;
+}
+
+// The queue state: task submissions minus finished ones minus freshly locked ones.
+// Upload retries of the SAME task land in the same directory (the client keeps
+// a stable task id) with different timestamped filenames — so the reviewable
+// unit is the task DIRECTORY, represented by its newest file. Without this,
+// one retried upload would be claimable twice and the second approval would
+// clobber the first reviewer's finished record.
+async function queueState() {
+  const { byTaskDir, lockSet, doneSet, inboxAge, counts } = await loadReviewIndex();
+  const pending = sortPendingReviewUnits(pendingReviewUnits([...byTaskDir.values()], doneSet));
+  return { pending, lockSet, inboxAge, counts };
 }
 
 // Atomically claim: create the lock with If-None-Match (first writer wins).
@@ -2219,6 +2290,93 @@ async function handleTrajectoryReporting(event) {
   }), { "Cache-Control": "no-store" });
 }
 
+// Done records carry an explicit outcome, but legacy markers predate that
+// field — infer from the target so historical approvals still surface to the
+// author instead of vanishing into awaiting_codex.
+function doneOutcome(done) {
+  if (!done) return null;
+  if (done.outcome) return done.outcome;
+  const target = String(done.target || "");
+  if (target.startsWith(`${REVIEW_PREFIX}finished/`)) return "approved";
+  if (target.startsWith(`${REVIEW_PREFIX}rejected/`)) return "rejected";
+  if (target.startsWith(`${REVIEW_PREFIX}returned/`)) return "returned";
+  return null;
+}
+
+// The author's current task content in the shape the my-tasks screen renders:
+// cleaned snapshot field names (title/request/criteria), with the distribution
+// metadata echoed back so the edit form can pre-fill it. Distinct from
+// cleanTaskSnapshot, which renames must_visit_or_reach to key_urls and drops
+// metadata — that shape is for reporting fingerprints, not the author UI.
+function authoredTaskContentForResponse(task) {
+  if (!task || typeof task !== "object") return null;
+  const out = {
+    title: cleanText(task.task_title ?? task.title, 300),
+    request: String(task.agent_request ?? task.request ?? ""),
+    difficulty: cleanText(task.difficulty || "high", 30),
+    criteria: cleanCriteria(task.success_criteria ?? task.criteria),
+    steps: cleanSteps(task.steps),
+    must_visit_or_reach: Array.isArray(task.must_visit_or_reach)
+      ? task.must_visit_or_reach.slice(0, 50).map((item) => cleanText(item, 2_000))
+      : [],
+    required_outputs: Array.isArray(task.required_outputs)
+      ? task.required_outputs.slice(0, 30).map((item) => cleanText(item, 2_000))
+      : [],
+    notes: task.notes == null ? null : String(task.notes),
+  };
+  if (task.metadata != null) {
+    const metadata = cleanTaskMetadata(task.metadata);
+    if (metadata) out.metadata = metadata;
+  }
+  return out;
+}
+
+function cleanTaskMetadata(metadata) {
+  if (!metadata || typeof metadata !== "object") return null;
+  const out = {};
+  if (metadata.region != null) out.region = cleanText(metadata.region, 8);
+  if (Array.isArray(metadata.subjects)) {
+    out.subjects = metadata.subjects.slice(0, 10).map((s) => cleanText(s, 120)).filter(Boolean);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function snapshotForHumanReview(snapshot) {
+  return {
+    title: snapshot?.title ?? "",
+    request: snapshot?.request ?? "",
+    criteria: snapshot?.criteria ?? [],
+    steps: snapshot?.steps ?? [],
+  };
+}
+
+// The diff the author sees for an approved task: their original versus the
+// reviewer's final gold version, plus the rubric edits. reviewed_by is omitted
+// — authors see the review outcome, not who performed it.
+function buildHumanReviewForAuthor(finished, source) {
+  if (!finished || typeof finished !== "object") return null;
+  const original = cleanTaskSnapshot(source?.task ?? source);
+  const final = cleanTaskSnapshot(finished?.task ?? null);
+  if (!original || !final) return null;
+  const rubrics = cleanRubrics(finished?.review, original, final);
+  return {
+    original: snapshotForHumanReview(original),
+    final: snapshotForHumanReview(final),
+    rubrics: rubrics.map((rubric) => ({
+      rubric_id: rubric.rubric_id,
+      kind: rubric.kind,
+      title: rubric.title,
+      original: rubric.original,
+      final: rubric.final,
+      changed: rubric.changed,
+      checked: rubric.checked,
+    })),
+    title_edited: Boolean(finished?.review?.title_edited),
+    request_edited: Boolean(finished?.review?.request_edited),
+    evergreen_verified: Boolean(finished?.review?.evergreen_verified),
+  };
+}
+
 async function handleReview(path, body) {
   if (!keyMatches(body.reviewKey)) {
     return respond(401, { error: "Bad or missing review key" });
@@ -2555,6 +2713,295 @@ async function handleReview(path, body) {
     await recordReviewerCredit(String(done.reviewer || reviewer), "rejected", sub_key, rejId, String(done.completed_at || completedAt));
     await deleteLockIfUnchanged(sub_key, etag);
     return respond(200, { ok: true, rejected_key: rejectedKey });
+  }
+
+  // Author-facing: list this participant's own tasks with their live status.
+  // Read-only — no model calls, no mutations. Ownership is enforced server-side
+  // (the participant_id must match the submitter embedded in each sub_key).
+  if (path === "/review/my-tasks") {
+    const participantId = String(body.participant_id || "").trim().toLowerCase();
+    if (!VALID_PID.test(participantId)) {
+      return respond(400, { error: "Invalid participant_id" }, { "Cache-Control": "no-store" });
+    }
+    const { byTaskDir, lockSet, doneByEncodedKey, inboxAge } = await loadReviewIndex({
+      readDoneRecords: true,
+      doneRecordFilter: (key) => participantIdFromSubKey(key) === participantId,
+    });
+    const ownUnits = [];
+    for (const { newest, oldestAt } of byTaskDir.values()) {
+      if (participantIdFromSubKey(newest) === participantId) ownUnits.push({ newest, oldestAt });
+    }
+    // pending = passed the PRE_QC audit gate (a current completed artifact),
+    // the same definition the reviewer queue uses for claimability.
+    const audited = await completedPreQcSubmissionKeys(ownUnits.map((unit) => unit.newest));
+    const items = await Promise.all(ownUnits.map(async ({ newest }) => {
+      const done = doneByEncodedKey.get(b64url(newest)) ?? null;
+      const outcome = doneOutcome(done);
+      let status;
+      if (outcome === "approved") status = "approved";
+      else if (outcome === "rejected") status = "rejected";
+      else if (outcome === "returned") status = "returned";
+      else if (lockSet.has(b64url(newest))) status = "in_review";
+      else if (audited.has(newest)) status = "pending";
+      else status = "awaiting_codex";
+      const source = await readJson(newest).then(({ json }) => json).catch(() => null);
+      const task = source?.task ?? source;
+      const original = cleanTaskSnapshot(task);
+      const rubrics = cleanRubrics(null, original, null);
+      const contentHash = original ? reportingTaskContentHash(original, null, rubrics) : null;
+      const submittedAt =
+        source?.created_at ||
+        (inboxAge.has(newest) ? new Date(inboxAge.get(newest)).toISOString() : null);
+      const item = {
+        task_id: cleanText(source?.task_id, 300),
+        sub_key: newest,
+        title: cleanText(task?.task_title ?? task?.title, 300),
+        request: String(task?.agent_request ?? task?.request ?? "").slice(0, 300),
+        status,
+        submitted_at: submittedAt || null,
+        content_hash: contentHash,
+      };
+      if (status === "rejected" && done?.target) {
+        const rejected = await readJson(done.target).then(({ json }) => json).catch(() => null);
+        item.rejection_reason = cleanText(rejected?.reason, 500) || "";
+      }
+      if (status === "returned" && done?.target) {
+        const returned = await readJson(done.target).then(({ json }) => json).catch(() => null);
+        item.returned_reason = cleanText(returned?.reason, 500) || "";
+        item.returned_by = cleanText(returned?.returned_by, 160) || "";
+      }
+      return item;
+    }));
+    return respond(200, { items }, { "Cache-Control": "no-store" });
+  }
+
+  // Author-facing: the Codex feedback for one of the author's own submissions.
+  // Reuses the claimed-task LLM-review path but skips the reviewer lock (the
+  // author holds no lock), and overlays the finished status so an approved/
+  // rejected/returned task surfaces its reason and (for approvals) the diff.
+  if (path === "/review/my-task-feedback") {
+    const { sub_key } = body;
+    const participantId = String(body.participant_id || "").trim().toLowerCase();
+    if (!sub_key) return respond(400, { error: "sub_key required" }, { "Cache-Control": "no-store" });
+    if (!VALID_PID.test(participantId)) {
+      return respond(400, { error: "Invalid participant_id" }, { "Cache-Control": "no-store" });
+    }
+    if (participantIdFromSubKey(sub_key) !== participantId) {
+      return respond(403, { error: "You can only view your own tasks" }, { "Cache-Control": "no-store" });
+    }
+    const preQc = await preQcReviewForClaimedTask(sub_key);
+    const source = await readJson(sub_key).then(({ json }) => json).catch(() => null);
+    const taskField = authoredTaskContentForResponse(source?.task ?? source);
+    const done = await readDoneRecord(sub_key);
+    const outcome = doneOutcome(done);
+    const response = {
+      status: preQc.status,
+      stale: preQc.stale,
+      task_content_hash: preQc.task_content_hash,
+      review: preQc.review,
+      task: taskField,
+    };
+    if (outcome === "approved" && done?.target) {
+      response.status = "approved";
+      const finished = await readJson(done.target).then(({ json }) => json).catch(() => null);
+      const humanReview = buildHumanReviewForAuthor(finished, source);
+      if (humanReview) response.human_review = humanReview;
+    } else if (outcome === "rejected" && done?.target) {
+      response.status = "rejected";
+      const rejected = await readJson(done.target).then(({ json }) => json).catch(() => null);
+      response.rejection_reason = cleanText(rejected?.reason, 500) || "";
+    } else if (outcome === "returned" && done?.target) {
+      response.status = "returned";
+      const returned = await readJson(done.target).then(({ json }) => json).catch(() => null);
+      response.returned_reason = cleanText(returned?.reason, 500) || "";
+      response.returned_by = cleanText(returned?.returned_by, 160) || "";
+    }
+    return respond(200, response, { "Cache-Control": "no-store" });
+  }
+
+  // Author self-edit: write a new submission object in the SAME task directory
+  // (so reviewUnitForKey keeps grouping it as the same unit), re-entering the
+  // reviewer queue for a fresh Codex audit. Never finalizes; originals stay
+  // immutable. Allowed only when the newest revision is open (awaiting_codex,
+  // pending) or returned — locked or finished tasks cannot be edited.
+  if (path === "/review/author-edit") {
+    const { sub_key, edited } = body;
+    const participantId = String(body.participant_id || "").trim().toLowerCase();
+    if (!sub_key) return respond(400, { error: "sub_key required" }, { "Cache-Control": "no-store" });
+    if (!VALID_PID.test(participantId)) {
+      return respond(400, { error: "Invalid participant_id" }, { "Cache-Control": "no-store" });
+    }
+    if (participantIdFromSubKey(sub_key) !== participantId) {
+      return respond(403, { error: "You can only edit your own tasks" }, { "Cache-Control": "no-store" });
+    }
+    if (!edited || typeof edited !== "object" || Array.isArray(edited)) {
+      return respond(400, { error: "edited payload required" }, { "Cache-Control": "no-store" });
+    }
+    const safeTask = {
+      task_title: String(edited.task_title || "").slice(0, 300),
+      agent_request: String(edited.agent_request ?? ""),
+      difficulty: cleanText(edited.difficulty || "high", 30),
+      success_criteria: cleanCriteria(edited.success_criteria),
+      must_visit_or_reach: Array.isArray(edited.must_visit_or_reach)
+        ? edited.must_visit_or_reach.slice(0, 50).map((item) => cleanText(item, 2_000))
+        : [],
+      required_outputs: Array.isArray(edited.required_outputs)
+        ? edited.required_outputs.slice(0, 30).map((item) => cleanText(item, 2_000))
+        : [],
+      notes: edited.notes == null ? null : String(edited.notes),
+      steps: cleanSteps(edited.steps),
+    };
+    if (edited.metadata != null) {
+      const metadata = cleanTaskMetadata(edited.metadata);
+      if (metadata) safeTask.metadata = metadata;
+    }
+    if (!String(safeTask.agent_request).trim()) {
+      return respond(400, { error: "agent_request is required" }, { "Cache-Control": "no-store" });
+    }
+    const newOriginal = cleanTaskSnapshot(safeTask);
+    const newRubrics = cleanRubrics(null, newOriginal, null);
+    const newContentHash = reportingTaskContentHash(newOriginal, null, newRubrics);
+    const unit = reviewUnitForKey(sub_key);
+    const { byTaskDir, lockSet, doneByEncodedKey } = await loadReviewIndex({
+      readDoneRecords: true,
+      doneRecordFilter: (key) => reviewUnitForKey(key) === unit,
+    });
+    const entry = byTaskDir.get(unit);
+    if (!entry) return respond(404, { error: "Task not found" }, { "Cache-Control": "no-store" });
+    const newest = entry.newest;
+    const outcome = doneOutcome(doneByEncodedKey.get(b64url(newest)) ?? null);
+    if (lockSet.has(b64url(newest))) {
+      return respond(409, { error: "A reviewer has claimed this task — it's locked for review." }, { "Cache-Control": "no-store" });
+    }
+    if (outcome === "approved" || outcome === "rejected") {
+      return respond(409, { error: "This task is finished and can no longer be edited." }, { "Cache-Control": "no-store" });
+    }
+    // returned or null (pending/awaiting_codex) — editable.
+    const original = await readJson(sub_key).then(({ json }) => json).catch(() => null);
+    if (!original) {
+      return respond(404, { error: "Original submission not found" }, { "Cache-Control": "no-store" });
+    }
+    // Idempotency: if this exact edited content already exists as a not-done
+    // file in the unit, return it instead of writing a duplicate.
+    for (const fileKey of entry.files) {
+      if (doneByEncodedKey.has(b64url(fileKey))) continue; // done files are immutable
+      const existing = await readJson(fileKey).then(({ json }) => json).catch(() => null);
+      if (!existing) continue;
+      const existingOriginal = cleanTaskSnapshot(existing.task ?? existing);
+      const existingRubrics = cleanRubrics(null, existingOriginal, null);
+      if (reportingTaskContentHash(existingOriginal, null, existingRubrics) === newContentHash) {
+        return respond(200, { ok: true, new_sub_key: fileKey, new_content_hash: newContentHash, status: "awaiting_codex" }, { "Cache-Control": "no-store" });
+      }
+    }
+    const newSubmission = { ...original, task: safeTask, created_at: new Date().toISOString() };
+    delete newSubmission.quality_signals; // advisory — a revised task re-enters audit
+    if (JSON.stringify(newSubmission).length > 512 * 1024) {
+      return respond(400, { error: "edited payload too large (512KB max)" }, { "Cache-Control": "no-store" });
+    }
+    // Same task directory via the shared key-builder: the directory MUST match
+    // the original so reviewUnitForKey keeps the revision in the same unit.
+    const dir = sub_key.slice(0, sub_key.lastIndexOf("/"));
+    const baseFilename = sub_key
+      .slice(sub_key.lastIndexOf("/") + 1)
+      .replace(/^\d+(?:-[A-Za-z0-9]+)?_/, "");
+    const participantIdFromKey = participantIdFromSubKey(sub_key);
+    const taskId = dir.slice(`${UPLOAD_PREFIX}${participantIdFromKey}/`.length);
+    const newSubKey = uploadObjectKey(participantIdFromKey, taskId, baseFilename);
+    await s3.send(new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: newSubKey,
+      Body: JSON.stringify(newSubmission, null, 2),
+      ContentType: "application/json",
+      IfNoneMatch: "*",
+    }));
+    // Inbox marker so the new revision enters the review queue. The old marker
+    // is removed for cleanliness; the old submission object is never deleted
+    // (immutability/audit).
+    await s3
+      .send(new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: inboxKeyFor(newSubKey),
+        Body: newSubKey,
+        ContentType: "text/plain",
+        IfNoneMatch: "*",
+      }))
+      .catch(() => {});
+    await s3
+      .send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: inboxKeyFor(sub_key) }))
+      .catch(() => {});
+    return respond(200, { ok: true, new_sub_key: newSubKey, new_content_hash: newContentHash, status: "awaiting_codex" }, { "Cache-Control": "no-store" });
+  }
+
+  // Reviewer "return to author": mirrors /review/reject's lock handling and
+  // idempotent retry, but writes a returned record and a done-record with
+  // outcome "returned". No reviewer credit — a return isn't a finished review.
+  if (path === "/review/return-to-author") {
+    const { sub_key, token, task_id, reason } = body;
+    if (!sub_key || !token) return respond(400, { error: "sub_key and token required" }, { "Cache-Control": "no-store" });
+    const returnReason = String(reason || "").trim();
+    if (returnReason.length < 3) {
+      return respond(400, { error: "A return reason is required" }, { "Cache-Control": "no-store" });
+    }
+    const taskId = String(task_id || "task-unknown").replace(/[^A-Za-z0-9_-]/g, "_");
+    const returnedKey = `${REVIEW_PREFIX}returned/${b64url(sub_key)}.json`;
+    const contentHash = reviewContentHash({ task_id: taskId, reason: returnReason.slice(0, 500) });
+    // As with reject, a byte-identical retry must succeed after the first
+    // request committed and removed its lock but lost the HTTP response.
+    const existingDone = await readDoneRecord(sub_key);
+    if (existingDone) {
+      if (existingDone.target !== returnedKey || (existingDone.outcome && existingDone.outcome !== "returned")) {
+        return respond(409, { error: "This task was already finished by another reviewer" }, { "Cache-Control": "no-store" });
+      }
+      if (existingDone.content_hash && existingDone.content_hash !== contentHash) {
+        return respond(409, { error: "A different return was already submitted" }, { "Cache-Control": "no-store" });
+      }
+      const retryEtag = await verifyLock(sub_key, token);
+      if (retryEtag) await deleteLockIfUnchanged(sub_key, retryEtag);
+      return respond(200, { ok: true, returned_key: returnedKey, idempotent: true }, { "Cache-Control": "no-store" });
+    }
+    let etag = await verifyLock(sub_key, token);
+    if (!etag) return respond(409, { error: "Lock not held by you (it may have expired)" }, { "Cache-Control": "no-store" });
+    etag = await beginFinalization(sub_key, token, reviewer, "returned", contentHash);
+    if (!etag) return respond(409, { error: "Another edit or outcome is already being submitted" }, { "Cache-Control": "no-store" });
+    let completedAt = new Date().toISOString();
+    const returnedDoc = {
+      sub_key,
+      task_id: taskId,
+      reason: returnReason.slice(0, 500),
+      returned_by: reviewer,
+      content_hash: contentHash,
+      returned_at: completedAt,
+    };
+    const createdReturned = await tryConditionalWrite(() => s3.send(
+      new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: returnedKey,
+        Body: JSON.stringify(returnedDoc, null, 2),
+        ContentType: "application/json",
+        IfNoneMatch: "*",
+      })
+    ));
+    if (!createdReturned) {
+      const existingReturned = await readJson(returnedKey).then(({ json }) => json).catch(() => null);
+      if (!existingReturned || existingReturned.content_hash !== contentHash) {
+        return respond(409, { error: "A different return or task with this ID was already submitted" }, { "Cache-Control": "no-store" });
+      }
+      completedAt = String(existingReturned.returned_at || completedAt);
+    }
+    const done = await writeDoneRecord(sub_key, {
+      target: returnedKey,
+      outcome: "returned",
+      reviewer,
+      task_id: taskId,
+      completed_at: completedAt,
+      content_hash: contentHash,
+    });
+    if (done.target !== returnedKey || done.outcome !== "returned" || (done.content_hash && done.content_hash !== contentHash)) {
+      return respond(409, { error: "This task was already finished by another reviewer" }, { "Cache-Control": "no-store" });
+    }
+    // Returns are not finished reviews — do not inflate reviewerTotals.
+    await deleteLockIfUnchanged(sub_key, etag);
+    return respond(200, { ok: true, returned_key: returnedKey }, { "Cache-Control": "no-store" });
   }
 
   return respond(404, { error: `Unknown review route ${path}` });
