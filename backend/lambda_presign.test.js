@@ -33,7 +33,9 @@ import {
   hydrateReportingLlmReviews,
   cleanTaskSnapshot,
   cleanRubrics,
+  taskMetadataForReporting,
   sortPendingReviewUnits,
+  pendingReviewUnits,
   reportingKeyMatches,
   taskIdFromTrajectoryManifestKey,
   participantIdFromTrajectoryManifestKey,
@@ -66,6 +68,48 @@ test("orders review units by submission time instead of participant slug", () =>
     "prolific/journeys/alice/newer.json",
     "prolific/journeys/bob/newer.json",
   ]);
+});
+
+test("distribution metadata prefers final gold and stays out of the content hash", () => {
+  const authored = { metadata: { region: "IN", subjects: ["Travel and Tourism > Air Travel"] } };
+  const gold = { metadata: { region: "BR", subjects: ["Health > Medicine"] } };
+
+  // A reviewer may correct the author's pick during QC; final gold is counted.
+  assert.deepEqual(taskMetadataForReporting(authored, gold), {
+    region: "BR",
+    subjects: ["Health > Medicine"],
+  });
+  assert.deepEqual(taskMetadataForReporting(authored, null), {
+    region: "IN",
+    subjects: ["Travel and Tourism > Air Travel"],
+  });
+  // Tasks predating the fields carry none, and an empty object is not metadata.
+  assert.equal(taskMetadataForReporting({}, null), null);
+  assert.equal(taskMetadataForReporting({ metadata: {} }, null), null);
+
+  // The dashboard reads this beside the snapshots, never inside them: adding a
+  // field to cleanTaskSnapshot would restate every stored task's content hash
+  // and drop it out of the pre-QC audit gate as stale.
+  const task = { task_title: "T", agent_request: "R", steps: [], ...authored };
+  assert.equal("metadata" in cleanTaskSnapshot(task), false);
+});
+
+test("a returned task re-enters the queue after the author revises it", () => {
+  const enc = (key) => Buffer.from(key, "utf8").toString("base64url");
+  const dir = "prolific/journeys/alice/v2/alice/internal/task-1";
+  const returned = `${dir}/1700000000000-aaaaaaaa_long_task.json`;
+  const revised = `${dir}/1700000001000-bbbbbbbb_long_task.json`;
+  // Both revisions land in the same task directory (same unit); the newer
+  // revision is the unit's newest file.
+  const units = [{ newest: revised, files: [returned, revised], oldestAt: 1700000000000 }];
+  const doneSet = new Set([enc(returned)]); // the returned revision is done; the new one isn't
+  assert.deepEqual(pendingReviewUnits(units, doneSet).map((u) => u.newest), [revised]);
+  // The OLD rule (pending unless ANY file was done) would have dropped this
+  // unit entirely, stranding the author's revision outside the review queue.
+  // Backward compatible: a single-file unit that's done stays out of the queue.
+  assert.deepEqual(pendingReviewUnits([{ newest: returned, files: [returned], oldestAt: 1700000000000 }], doneSet), []);
+  // ... and a single not-done file still surfaces, exactly as before.
+  assert.deepEqual(pendingReviewUnits([{ newest: revised, files: [revised], oldestAt: 1700000000000 }], doneSet).map((u) => u.newest), [revised]);
 });
 
 test("accepts individually revocable reporting credentials", () => {
