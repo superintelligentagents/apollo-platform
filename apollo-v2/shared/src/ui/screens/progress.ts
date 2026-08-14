@@ -281,12 +281,17 @@ export function teamDistribution(items: readonly AdminSubmission[]): HTMLElement
     return panel;
   }
 
+  const maxRows = 5;
+  const regionRows = summary.regions.slice(0, maxRows);
+  const subjectRows = summary.subjects.slice(0, maxRows);
+  const regionHint = `${pct(summary.globalShare)} with no specific country${summary.regions.length > maxRows ? ` · top ${maxRows} of ${summary.regions.length}` : ""}`;
+  const subjectHint = `${summary.subjects.length} of 21 groups covered${summary.subjects.length > maxRows ? ` · top ${maxRows} shown` : ""}`;
   panel.append(
     el(
       "div",
       { class: "stat-cols" },
-      shareGroup("By place", summary.regions, `${pct(summary.globalShare)} with no specific country`, "None recorded."),
-      shareGroup("By subject", summary.subjects, `${summary.subjects.length} of 21 groups covered`, "None recorded.")
+      shareGroup("By place", regionRows, regionHint, "None recorded."),
+      shareGroup("By subject", subjectRows, subjectHint, "None recorded.")
     ),
     ...(summary.unlabelled
       ? [el("p", { class: "muted small" }, `Based on ${summary.labelled} of ${items.length} submissions; the rest predate these fields.`)]
