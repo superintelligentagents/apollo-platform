@@ -99,4 +99,20 @@ describe("team spread panel", () => {
     const text = teamDistribution([submission({})]).textContent ?? "";
     expect(text).toContain("No region or subject data has been recorded yet.");
   });
+
+  it("keeps a large team spread compact", () => {
+    const items = ["US", "IN", "GB", "BR", "CA", "AU"].map((region, index) =>
+      submission({
+        task_id: `task-${index}`,
+        original: {
+          title: `Task ${index}`, request: "", difficulty: "high", criteria: [], steps: [],
+          metadata: { region, subjects: [] },
+        },
+      })
+    );
+    const root = teamDistribution(items);
+    expect(root.querySelectorAll(".share-row")).toHaveLength(5);
+    expect(root.textContent).toContain("top 5 of 6");
+    expect(root.textContent).not.toContain("United States");
+  });
 });
