@@ -259,10 +259,8 @@ function hydrateAdminPanel(panel: HTMLElement, data: AdminDashboard): void {
   draw();
 }
 
-// Team-wide spread across places and subjects. Renders from whatever the admin
-// endpoint returns; while that endpoint omits `metadata` this says so plainly
-// rather than drawing an empty chart, which would read as "nobody is filling
-// the fields in" when the truth is "the server is not sending them".
+// Team-wide spread across places and subjects. The backend sends metadata only,
+// never browsing history or attachments, alongside the existing admin rows.
 export function teamDistribution(items: readonly AdminSubmission[]): HTMLElement {
   const authored = items.map((item) => item.final?.metadata ?? item.original.metadata ?? {});
   const summary = summarizeDistribution(authored);
@@ -277,7 +275,7 @@ export function teamDistribution(items: readonly AdminSubmission[]): HTMLElement
       el(
         "p",
         { class: "muted" },
-        "Region and subject are collected on every new task but the admin feed does not return them yet — they need adding to the submission snapshot in the reporting Lambda. Until then, use the per-task view or the reporting API with include=content."
+        "No region or subject data has been recorded yet."
       )
     );
     return panel;

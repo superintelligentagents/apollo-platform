@@ -417,6 +417,16 @@ function cleanSteps(value) {
     : [];
 }
 
+export function taskMetadataForReporting(task) {
+  const raw = task?.metadata;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const region = cleanText(raw.region, 20).trim();
+  const subjects = Array.isArray(raw.subjects)
+    ? raw.subjects.slice(0, 3).map((subject) => cleanText(subject, 200).trim()).filter(Boolean)
+    : [];
+  return region || subjects.length ? { region, subjects } : null;
+}
+
 export function cleanTaskSnapshot(task) {
   if (!task || typeof task !== "object") return null;
   return {
@@ -1411,6 +1421,8 @@ export async function adminDashboard() {
         : cleanText(source.participant?.participant_id || participantIdFromSubKey(newest) || "unknown", 80);
       const original = cleanTaskSnapshot(sourceTask);
       const final = cleanTaskSnapshot(finalTask);
+      const originalMetadata = taskMetadataForReporting(sourceTask);
+      const finalMetadata = taskMetadataForReporting(finalTask) ?? (final ? originalMetadata : null);
       const humanReview = done?.outcome === "approved" && outcome?.review && typeof outcome.review === "object"
         ? {
             evergreen_verified: Boolean(outcome.review.evergreen_verified),
@@ -1442,8 +1454,8 @@ export async function adminDashboard() {
         trajectory_count: sourceJourneys.length,
         visit_count: visitCount,
         changed,
-        original,
-        final,
+        original: original && originalMetadata ? { ...original, metadata: originalMetadata } : original,
+        final: final && finalMetadata ? { ...final, metadata: finalMetadata } : final,
         rubrics,
         human_review: humanReview,
         task_content_hash: taskContentHash,
@@ -2371,6 +2383,7 @@ async function handleReview(path, body) {
     if (typeof reviewed.task !== "object" || typeof reviewed.task?.agent_request !== "string") {
       return respond(400, { error: "reviewed.task.agent_request required" });
     }
+    const reviewedMetadata = taskMetadataForReporting(reviewed.task);
     const safeReviewed = {
       schema_version: "odyssey_long_task_v2_reviewed",
       task_id: taskIdRaw,
@@ -2384,6 +2397,7 @@ async function handleReview(path, body) {
         must_visit_or_reach: Array.isArray(reviewed.task.must_visit_or_reach) ? reviewed.task.must_visit_or_reach.slice(0, 50) : [],
         required_outputs: Array.isArray(reviewed.task.required_outputs) ? reviewed.task.required_outputs.slice(0, 30) : [],
         notes: reviewed.task.notes ?? null,
+        ...(reviewedMetadata ? { metadata: reviewedMetadata } : {}),
         steps: Array.isArray(reviewed.task.steps)
           ? reviewed.task.steps.slice(0, 50).map((step, index) => ({
               order: Number.isFinite(Number(step?.order)) ? Number(step.order) : index + 1,
