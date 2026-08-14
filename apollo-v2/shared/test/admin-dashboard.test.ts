@@ -95,10 +95,8 @@ describe("team spread panel", () => {
     expect(text).not.toContain("India");
   });
 
-  it("names the server gap instead of drawing an empty chart", () => {
-    // Today's reality: the admin endpoint omits metadata entirely.
+  it("shows a true empty state when no metadata has been recorded", () => {
     const text = teamDistribution([submission({})]).textContent ?? "";
-    expect(text).toContain("does not return them yet");
-    expect(text).toContain("reporting Lambda");
+    expect(text).toContain("No region or subject data has been recorded yet.");
   });
 });

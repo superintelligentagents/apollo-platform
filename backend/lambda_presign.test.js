@@ -32,6 +32,7 @@ import {
   llmEvergreenReviewFromReview,
   hydrateReportingLlmReviews,
   cleanTaskSnapshot,
+  taskMetadataForReporting,
   cleanRubrics,
   sortPendingReviewUnits,
   reportingKeyMatches,
@@ -550,6 +551,19 @@ test("reporting snapshots and rubric audits do not truncate authored text", () =
   const legacyAuditFallback = cleanRubrics({ rubrics: [{ kind: "step", checked: true }] }, original, final);
   assert.equal(legacyAuditFallback.length, 1);
   assert.equal(legacyAuditFallback[0].final, `${longText} edited`);
+});
+
+test("sanitizes distribution metadata without adding it to content snapshots", () => {
+  const task = {
+    task_title: "Compare routes",
+    agent_request: "Compare current routes.",
+    metadata: { region: "IN", subjects: ["Travel and Tourism > Air Travel"] },
+  };
+  assert.deepEqual(taskMetadataForReporting(task), {
+    region: "IN",
+    subjects: ["Travel and Tourism > Air Travel"],
+  });
+  assert.equal(cleanTaskSnapshot(task).metadata, undefined);
 });
 
 test("excludes a reviewer's own v2 and PC tasks while retaining another user's", () => {
