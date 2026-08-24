@@ -2,6 +2,11 @@ import { reviewLlmFeedback, reviewReject, reviewRelease, reviewSubmit, saveClaim
 import { el } from "../components/helpers";
 import type { Ctx } from "../context";
 
+// Matches MIN_REJECTION_REASON_LENGTH in the review backend. An author can
+// appeal a rejection, and an appeal against a four-word verdict wastes two
+// people's time.
+const MIN_REJECT_REASON = 40;
+
 export function plainReviewText(value: string | null | undefined): string | null {
   if (!value) return null;
   return value
@@ -141,13 +146,15 @@ export function renderTaskReviewEdit(ctx: Ctx): HTMLElement {
     el("section", { class: "pc-task-rubric-column", "aria-label": "Rubric review" }, el("span", { class: "field-label" }, "Rubrics"), el("p", { class: "field-hint" }, "Open each rubric, check feasibility and task fit, edit if needed, then check it off."), rubricList)
   ));
 
-  const rejectReason = el("input", { class: "field-input", placeholder: "Why is this task unusable?" }) as HTMLInputElement;
+  const rejectReason = el("input", { class: "field-input", placeholder: "Say what is wrong and what the author would have to change — they see this." }) as HTMLInputElement;
   const reject = el("button", { class: "btn ghost danger-ghost", type: "button", onclick: async () => {
     if (rejectReason.hidden) { rejectReason.hidden = false; reject.textContent = "Confirm reject"; rejectReason.focus(); return; }
-    if (rejectReason.value.trim().length < 3) return;
+    // Matches the server floor. A shorter reason is refused with a 400 the
+    // reviewer would otherwise see as an unexplained failure.
+    if (rejectReason.value.trim().length < MIN_REJECT_REASON) return;
     (reject as HTMLButtonElement).disabled = true;
     try {
-      await reviewReject(state.reviewKey!, ctx.actions.reviewerName(), claim, rejectReason.value.trim());
+      await reviewReject(state.reviewKey!, ctx.actions.reviewerName(), claim, rejectReason.value.trim(), ctx.actions.reviewerPid());
       ctx.actions.endReview("Task rejected with the reason saved.");
     } catch (error) {
       (reject as HTMLButtonElement).disabled = false;

@@ -1501,7 +1501,11 @@ export async function adminDashboard() {
     const batch = await Promise.all(units.slice(offset, offset + 25).map(async ({ newest, files }) => {
       const source = await readJson(newest).then(({ json }) => json).catch(() => null);
       if (!source) return null;
-      const done = files.map((file) => doneByEncodedKey.get(b64url(file))).find(Boolean) ?? null;
+      // The unit's NEWEST file, matching pendingReviewUnits. Taking the first
+      // done record from any file made a revised task keep its old outcome, so
+      // an appeal read as "rejected" to the PRE_QC exporter and never got the
+      // artifact its new content hash needs to become claimable.
+      const done = doneByEncodedKey.get(b64url(newest)) ?? null;
       const lock = !done ? locks.get(b64url(newest)) ?? null : null;
       let outcome = null;
       if (done?.target) outcome = await readJson(done.target).then(({ json }) => json).catch(() => null);
@@ -1528,7 +1532,12 @@ export async function adminDashboard() {
         : null;
       const rubrics = cleanRubrics(outcome?.review, original, final);
       const taskContentHash = reportingTaskContentHash(original, final, rubrics);
+      // "Gold differs from the submission" — true whoever made the difference.
       const changed = Boolean(final && JSON.stringify(original) !== JSON.stringify(final));
+      // "The reviewer changed it during QC" — reviewer-only, so an author
+      // amendment cannot inflate it. These were one value until amendments
+      // existed, and changed_in_qc is the metric the cohort is steered on.
+      const changedInQc = outcome ? reviewerChangedTask(outcome) : false;
       const sourceJourneys = Array.isArray(source.provenance?.source_journeys) ? source.provenance.source_journeys : [];
       const visitCount = sourceJourneys.reduce((sum, journey) => sum + (Array.isArray(journey?.visits) ? journey.visits.length : 0), 0);
       const status = done?.outcome === "approved" ? "approved" : done?.outcome === "rejected" ? "rejected" : lock ? "in_review" : "pending";
@@ -1554,6 +1563,7 @@ export async function adminDashboard() {
         trajectory_count: sourceJourneys.length,
         visit_count: visitCount,
         changed,
+        changed_in_qc: changedInQc,
         original: original && originalMetadata ? { ...original, metadata: originalMetadata } : original,
         final: final && finalMetadata ? { ...final, metadata: finalMetadata } : final,
         rubrics,
@@ -1571,6 +1581,8 @@ export async function adminDashboard() {
         appeal_started_at: cleanText(source.appeal_started_at, 60),
         appeal_number: Number(source.appeal_number) || 0,
         final_gold_revision: status === "approved" ? finalGoldRevision(outcome) : 0,
+        amended_by: cleanText(outcome?.amended_by, 80),
+        amended_at: cleanText(outcome?.amended_at, 60),
         signoff_at: "",
         signoff_action: "",
         signoff_opened_at: "",
@@ -1664,7 +1676,12 @@ export function buildReportingReport(dashboard, generatedAt = new Date().toISOSt
     qc_completed: item.status === "approved" || item.status === "rejected",
     reviewer: item.reviewer,
     reviewed_at: item.reviewed_at,
-    changed_in_qc: Boolean(item.changed),
+    changed_in_qc: Boolean(item.changed_in_qc),
+    // Kept separate: gold can now differ from the submission because the AUTHOR
+    // amended it after approval, which is not a QC edit.
+    changed_after_approval: Boolean(item.changed && !item.changed_in_qc),
+    amended_by: item.amended_by ?? "",
+    amended_at: item.amended_at ?? "",
     // Author-side stage durations, derived from stored timestamp pairs the same
     // way the deployed route derives authoring_minutes and review_minutes.
     // Added as new keys: the existing row shape is not touched.
@@ -1910,7 +1927,7 @@ async function ownAwaitingSignoff(finishedKeys, reviewerPid) {
 // Order a task's events for the author. Pure so the ordering and the identity
 // rules are testable without S3: `by` is carried on approvals and returns and
 // on the author's own actions, and is never set for a rejection.
-export function buildAuthorHistory({ revisions, doneRecords, finalGoldHistory, currentAmendment }) {
+export function buildAuthorHistory({ revisions, doneRecords, finalGoldHistory, currentAmendment, signoff }) {
   const entries = [];
   for (const revision of revisions ?? []) {
     const appeal = Boolean(revision.appeal_submission);
@@ -1929,9 +1946,11 @@ export function buildAuthorHistory({ revisions, doneRecords, finalGoldHistory, c
     entries.push({
       at: done.completed_at ?? "",
       event: outcome,
-      // A rejection or a return reaches the author without a name on it; an
-      // approval is attributed so they can follow up with the reviewer.
-      by: outcome === "approved" ? done.reviewer ?? "" : "",
+      // Only a rejection is anonymous. An approval and a return both leave the
+      // author with someone to talk to — a return especially, since it is a
+      // request to change something and they may need to ask what was meant.
+      // The API already returned returned_by; the history said otherwise.
+      by: outcome === "rejected" ? "" : done.reviewer ?? "",
       minutes: null,
       note: "",
     });
@@ -1945,6 +1964,9 @@ export function buildAuthorHistory({ revisions, doneRecords, finalGoldHistory, c
   // The amendment currently standing as final gold. It is not in the history
   // array — that array holds what has been replaced — so without this the
   // author's most recent edit is the one thing missing from their timeline.
+  if (signoff?.signed_off_at && signoff.action === "accepted") {
+    entries.push({ at: signoff.signed_off_at, event: "accepted", by: "", minutes: stageMinutes(signoff.opened_at, signoff.signed_off_at), note: "" });
+  }
   if (currentAmendment?.amended_at) {
     entries.push({
       at: currentAmendment.amended_at,
@@ -2002,7 +2024,48 @@ async function authorTaskHistory(subKey) {
     doneRecords,
     finalGoldHistory: Array.isArray(finished?.history) ? finished.history : [],
     currentAmendment: finished?.amended_at ? finished : null,
+    signoff: await readJson(authorSignoffKeyFor(subKey)).then(({ json }) => json).catch(() => null),
   });
+}
+
+// The author's acknowledgement of an approved task. Records their LATEST
+// disposition rather than only their first: an author may accept a task and
+// later amend it, and a receipt still saying "accepted" would describe a
+// version that no longer exists. The durable per-event trail is elsewhere —
+// finished-history/ holds every superseded version and the gold doc's history
+// holds who wrote each one — so this object is free to move forward.
+async function writeAuthorSignoff({ subKey, taskId, participantId, action, contentHash, openedAt, at }) {
+  const receipt = {
+    sub_key: subKey,
+    task_id: taskId,
+    participant_id: participantId,
+    action,
+    acknowledged_content_hash: contentHash,
+    opened_at: openedAt,
+    signed_off_at: at,
+  };
+  const key = authorSignoffKeyFor(subKey);
+  const created = await tryConditionalWrite(() => s3.send(new PutObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: key,
+    Body: JSON.stringify(receipt, null, 2),
+    ContentType: "application/json",
+    IfNoneMatch: "*",
+  })));
+  if (created) return { receipt, created: true };
+  const existing = await readJson(key).then((r) => r).catch(() => null);
+  if (!existing) return { receipt: null, created: false };
+  // An accept is not allowed to overwrite anything: re-clicking it must be
+  // idempotent. An amendment supersedes whatever came before it.
+  if (action !== "amended") return { receipt: existing.json, created: false };
+  await tryConditionalWrite(() => s3.send(new PutObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: key,
+    Body: JSON.stringify(receipt, null, 2),
+    ContentType: "application/json",
+    IfMatch: existing.etag,
+  })));
+  return { receipt, created: false };
 }
 
 // Submission key -> pid of the reviewer whose rejection that submission is
@@ -2665,7 +2728,10 @@ function sanitizeAuthoredTask(edited) {
       ? edited.required_outputs.slice(0, 30).map((item) => cleanText(item, 2_000))
       : [],
     notes: edited.notes == null ? null : String(edited.notes),
-    steps: cleanSteps(edited.steps),
+    // Same per-step cap /review/submit applies. Not pushed into cleanSteps:
+    // that also builds the reporting snapshots, which deliberately carry the
+    // complete authored text and have a test pinning that.
+    steps: cleanSteps(edited.steps).map((step) => ({ ...step, description: step.description.slice(0, 20_000) })),
   };
   if (edited.metadata != null) {
     const metadata = cleanTaskMetadata(edited.metadata);
@@ -2691,6 +2757,23 @@ function snapshotForHumanReview(snapshot) {
     criteria: snapshot?.criteria ?? [],
     steps: snapshot?.steps ?? [],
   };
+}
+
+// Did the REVIEWER alter the author's submission? Read only from the frozen
+// `review` block, never by re-diffing the submission against current final
+// gold: once an author amends, that diff describes their own edit. Getting this
+// from the diff made an untouched approval read as "reviewed by Dana — reach
+// out if you disagree with an edit" after the author edited it themselves, and
+// inflated changed_in_qc, which is the statistic the sign-off queue was sized
+// against in the first place.
+export function reviewerChangedTask(finished) {
+  const review = finished?.review;
+  if (!review || typeof review !== "object") return false;
+  return Boolean(
+    review.title_edited ||
+      review.request_edited ||
+      (Array.isArray(review.rubrics) && review.rubrics.some((rubric) => rubric?.changed))
+  );
 }
 
 // The revision number a finished doc is on. 1 for the reviewer's own approval,
@@ -2802,13 +2885,9 @@ function buildHumanReviewForAuthor(finished, source) {
     // The display name only. reviewer_pid is a slugified email address, and the
     // author needs a person to talk to, not another user's contact details.
     reviewed_by: cleanText(finished?.reviewed_by, 160) || "",
-    // Whether the reviewer actually altered anything. Drives the author
-    // sign-off queue: an untouched approval has nothing to sign off on.
-    changed: Boolean(
-      finished?.review?.title_edited ||
-        finished?.review?.request_edited ||
-        rubrics.some((rubric) => rubric.changed)
-    ),
+    // Whether the REVIEWER altered anything, for the "nothing changed" copy.
+    // Every approval is queued for sign-off regardless; this only labels it.
+    changed: reviewerChangedTask(finished),
     revision_count: finalGoldRevision(finished),
     amended_by: cleanText(finished?.amended_by, 80) || "",
     amended_at: cleanText(finished?.amended_at, 60) || "",
@@ -2881,7 +2960,13 @@ async function handleReview(path, body) {
     const approved = finishedKeys.length;
     // One object per task lands under rejected/, but a task can now be rejected
     // twice: once before its appeal and once after. Count tasks, not records.
-    const rejected = distinctRejectedTaskIds(rejectedKeys).size;
+    // ...and a task rejected before its appeal was approved is no longer a
+    // rejection: its round-one record stays in S3 forever, so without this it
+    // counts in both tiles and `finished` can exceed `submitted`.
+    const approvedTaskIds = new Set(
+      finishedKeys.map((key) => String(key).slice(String(key).lastIndexOf("/") + 1).replace(/\.json$/, ""))
+    );
+    const rejected = [...distinctRejectedTaskIds(rejectedKeys)].filter((id) => !approvedTaskIds.has(id)).length;
     return respond(200, {
       ...counts,
       locked: eligible.filter((key) => lockSet.has(b64url(key))).length,
@@ -3116,9 +3201,12 @@ async function handleReview(path, body) {
   // only — these records were provenance-stripped at submit time).
   if (path === "/review/finished") {
     const all = await listAllObjects(`${REVIEW_PREFIX}finished/`);
+    // Take a wider candidate window than the page: an author amendment rewrites
+    // finished/{task_id}.json in place, so LastModified is when it was last
+    // touched, not when it was approved. Ordering below is by finished_at.
     const newest = all
       .sort((a, b) => (b.LastModified?.getTime() ?? 0) - (a.LastModified?.getTime() ?? 0))
-      .slice(0, 30);
+      .slice(0, 60);
     const reads = await Promise.all(
       newest.map((o) =>
         readJson(o.Key)
@@ -3134,7 +3222,11 @@ async function handleReview(path, body) {
           .catch(() => null)
       )
     );
-    return respond(200, { items: reads.filter(Boolean) });
+    const items = reads
+      .filter(Boolean)
+      .sort((a, b) => String(b.finished_at).localeCompare(String(a.finished_at)))
+      .slice(0, 30);
+    return respond(200, { items });
   }
 
   // Reject: the task is unusable (spam, gibberish, no salvageable intent).
@@ -3330,13 +3422,7 @@ async function handleReview(path, body) {
         // Approvals are attributed: the author should be able to go and talk to
         // whoever edited their task.
         item.reviewed_by = cleanText(finished?.reviewed_by, 160) || "";
-        const finalSnapshot = cleanTaskSnapshot(finished?.task ?? null);
-        const finalRubrics = cleanRubrics(finished?.review, original, finalSnapshot);
-        item.reviewer_changed = Boolean(
-          finished?.review?.title_edited ||
-            finished?.review?.request_edited ||
-            finalRubrics.some((rubric) => rubric.changed)
-        );
+        item.reviewer_changed = reviewerChangedTask(finished);
         item.revision_count = finalGoldRevision(finished);
         item.signed_off_at = "";
         item.signoff_action = "";
@@ -3493,7 +3579,12 @@ async function handleReview(path, body) {
     if (!eligibility.allowed) {
       return respond(409, { error: eligibility.reason }, { "Cache-Control": "no-store" });
     }
-    const original = await readJson(sub_key).then(({ json }) => json).catch(() => null);
+    // Read from `newest`, the same object eligibility was decided against —
+    // not from the client's sub_key. A second tab still showing the pre-appeal
+    // row would otherwise hand us the superseded submission, and the appeal
+    // lineage read off it would come back empty: the revision would be written
+    // with no appeals/ marker and the rejecting reviewer could claim it again.
+    const original = await readJson(newest).then(({ json }) => json).catch(() => null);
     if (!original) {
       return respond(404, { error: "Original submission not found" }, { "Cache-Control": "no-store" });
     }
@@ -3507,6 +3598,24 @@ async function handleReview(path, body) {
       const existingRubrics = cleanRubrics(null, existingOriginal, null);
       if (reportingTaskContentHash(existingOriginal, null, existingRubrics) === newContentHash) {
         return respond(200, { ok: true, new_sub_key: fileKey, new_content_hash: newContentHash, status: "awaiting_codex" }, { "Cache-Control": "no-store" });
+      }
+    }
+    // An appeal is spent whether or not the author changed anything, and the
+    // idempotency scan below cannot catch this case: it skips files with a done
+    // record, which the rejected revision always has.
+    if (eligibility.appeal) {
+      const rejectedSnapshot = cleanTaskSnapshot(original.task ?? original);
+      const rejectedHash = reportingTaskContentHash(
+        rejectedSnapshot,
+        null,
+        cleanRubrics(null, rejectedSnapshot, null)
+      );
+      if (rejectedHash === newContentHash) {
+        return respond(
+          409,
+          { error: "This is the same task that was rejected. Change what the reviewer flagged before appealing — you only get one." },
+          { "Cache-Control": "no-store" }
+        );
       }
     }
     const revisedAt = new Date().toISOString();
@@ -3573,7 +3682,7 @@ async function handleReview(path, body) {
     // Inbox marker so the new revision enters the review queue. The old marker
     // is removed for cleanliness; the old submission object is never deleted
     // (immutability/audit).
-    await s3
+    const markerWritten = await s3
       .send(new PutObjectCommand({
         Bucket: S3_BUCKET,
         Key: inboxKeyFor(newSubKey),
@@ -3581,15 +3690,24 @@ async function handleReview(path, body) {
         ContentType: "text/plain",
         IfNoneMatch: "*",
       }))
-      .catch(() => {});
-    await s3
-      .send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: inboxKeyFor(sub_key) }))
-      .catch(() => {});
+      .then(() => true)
+      .catch((err) => isConditionalConflict(err));
+    // Only once the new marker exists. The reviewable unit is assembled from
+    // inbox markers alone, so dropping the old one after a failed write would
+    // remove the task from the author's list, the reviewer queue and the admin
+    // dashboard in one go, with no way back to it. A stale extra marker is
+    // harmless by comparison — the unit resolves on its newest file.
+    if (markerWritten) {
+      await s3
+        .send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: inboxKeyFor(newest) }))
+        .catch(() => {});
+    }
     // A small side marker the claim path reads, so an appeal is never offered
     // back to the reviewer who rejected it. Kept out of the submission body:
     // /review/claim would otherwise have to read every candidate task to route.
+    let appealRouted = false;
     if (newSubmission.appeal_of_sub_key) {
-      await s3
+      appealRouted = await s3
         .send(new PutObjectCommand({
           Bucket: S3_BUCKET,
           Key: appealKeyFor(newSubKey),
@@ -3602,7 +3720,8 @@ async function handleReview(path, body) {
           ContentType: "application/json",
           IfNoneMatch: "*",
         }))
-        .catch(() => {});
+        .then(() => true)
+        .catch(() => false);
     }
     return respond(
       200,
@@ -3612,6 +3731,9 @@ async function handleReview(path, body) {
         new_content_hash: newContentHash,
         status: "awaiting_codex",
         appeal: Boolean(newSubmission.appeal_of_sub_key),
+        // False when the marker did not land: the revision is in the queue, but
+        // nothing is keeping the original rejecter from claiming it.
+        appeal_routed: appealRouted,
       },
       { "Cache-Control": "no-store" }
     );
@@ -3645,37 +3767,27 @@ async function handleReview(path, body) {
       ? await readJson(done.target).then(({ json }) => json).catch(() => null)
       : null;
     const signedOffAt = new Date().toISOString();
-    const receipt = {
-      sub_key: newest,
-      task_id: cleanText(done?.task_id, 300),
-      participant_id: participantId,
+    const { receipt, created } = await writeAuthorSignoff({
+      subKey: newest,
+      taskId: cleanText(done?.task_id, 300),
+      participantId,
       action: "accepted",
-      acknowledged_content_hash: cleanText(finished?.review_content_hash, 80) || "",
+      contentHash: cleanText(finished?.review_content_hash, 80) || "",
       // The pair the reporting layer derives signoff_minutes from. Client-sent
       // durations are never trusted; stageMinutes drops an implausible span.
-      opened_at: cleanText(body.opened_at, 60) || null,
-      signed_off_at: signedOffAt,
-    };
-    const created = await tryConditionalWrite(() => s3.send(new PutObjectCommand({
-      Bucket: S3_BUCKET,
-      Key: authorSignoffKeyFor(newest),
-      Body: JSON.stringify(receipt, null, 2),
-      ContentType: "application/json",
-      IfNoneMatch: "*",
-    })));
-    if (!created) {
-      // Already signed off. A repeat click, or a retry that lost its response —
-      // either way the existing receipt stands rather than being overwritten.
-      const existing = await readJson(authorSignoffKeyFor(newest))
-        .then(({ json }) => json)
-        .catch(() => null);
-      return respond(
-        200,
-        { ok: true, idempotent: true, action: existing?.action ?? "accepted", signed_off_at: existing?.signed_off_at ?? signedOffAt },
-        { "Cache-Control": "no-store" }
-      );
-    }
-    return respond(200, { ok: true, action: "accepted", signed_off_at: signedOffAt }, { "Cache-Control": "no-store" });
+      openedAt: cleanText(body.opened_at, 60) || null,
+      at: signedOffAt,
+    });
+    return respond(
+      200,
+      {
+        ok: true,
+        ...(created ? {} : { idempotent: true }),
+        action: receipt?.action ?? "accepted",
+        signed_off_at: receipt?.signed_off_at ?? signedOffAt,
+      },
+      { "Cache-Control": "no-store" }
+    );
   }
 
   // Author amendment: the author's correction of their own approved task
@@ -3731,15 +3843,27 @@ async function handleReview(path, body) {
       task: amendedTask,
       review: existing.review ?? {},
     });
-    // Nothing actually changed: report success without burning a revision.
+    const amendedAt = new Date().toISOString();
+    // The author opened the form, read the reviewer's version and saved it back
+    // unchanged. That is an acceptance, not a no-op: skip the revision, but
+    // still record the sign-off, or the task sits in their queue forever while
+    // the screen tells them it was saved.
     if (existing.review_content_hash === contentHash) {
+      await writeAuthorSignoff({
+        subKey: newest,
+        taskId: cleanText(done?.task_id, 300),
+        participantId,
+        action: "accepted",
+        contentHash,
+        openedAt: cleanText(body.opened_at, 60) || null,
+        at: amendedAt,
+      });
       return respond(
         200,
-        { ok: true, idempotent: true, revision_count: finalGoldRevision(existing), new_content_hash: contentHash },
+        { ok: true, idempotent: true, action: "accepted", revision_count: finalGoldRevision(existing), new_content_hash: contentHash },
         { "Cache-Control": "no-store" }
       );
     }
-    const amendedAt = new Date().toISOString();
     const doc = buildAmendedFinalGold({
       existing,
       amendedTask,
@@ -3783,26 +3907,19 @@ async function handleReview(path, body) {
     if (!replaced) {
       return respond(409, { error: "This task changed while you were editing. Reload and try again." }, { "Cache-Control": "no-store" });
     }
-    // An amendment is itself a sign-off: the author has read the reviewer's
-    // version and responded to it. Best-effort — the amendment is what matters,
-    // and a missing receipt only leaves the row in the queue.
-    await s3
-      .send(new PutObjectCommand({
-        Bucket: S3_BUCKET,
-        Key: authorSignoffKeyFor(newest),
-        Body: JSON.stringify({
-          sub_key: newest,
-          task_id: cleanText(done?.task_id, 300),
-          participant_id: participantId,
-          action: "amended",
-          acknowledged_content_hash: cleanText(existing.review_content_hash, 80) || "",
-          opened_at: cleanText(body.opened_at, 60) || null,
-          signed_off_at: amendedAt,
-        }, null, 2),
-        ContentType: "application/json",
-        IfNoneMatch: "*",
-      }))
-      .catch(() => {});
+    // An amendment is itself a sign-off: the author read the reviewer's version
+    // and responded to it. It supersedes an earlier "accepted" receipt — an
+    // author may accept a task and amend it later, and a receipt still claiming
+    // they accepted would describe a version that no longer exists.
+    await writeAuthorSignoff({
+      subKey: newest,
+      taskId: cleanText(done?.task_id, 300),
+      participantId,
+      action: "amended",
+      contentHash,
+      openedAt: cleanText(body.opened_at, 60) || null,
+      at: amendedAt,
+    });
     return respond(
       200,
       { ok: true, revision_count: doc.revision_count, new_content_hash: contentHash, amended_at: amendedAt },

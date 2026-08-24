@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Ctx } from "../src/ui/context";
 import { initialState } from "../src/ui/context";
-import { editModeFor, editSeed, renderMyTasks, signoffProgress } from "../src/ui/screens/my-tasks";
+import { editModeFor, editSeed, renderMyTasks, signoffProgress, signoffSuffix } from "../src/ui/screens/my-tasks";
 import {
   authorAmend,
   authorEdit,
@@ -557,6 +557,34 @@ describe("my tasks pure helpers", () => {
     expect(editSeed(fb, "appeal")?.request).toBe("author");
     // An approved task with no final gold falls back rather than rendering blank.
     expect(editSeed(feedback({ task: currentTask() }), "amend")?.request).toBe(currentTask().request);
+  });
+
+  it("says what the author did about the review, once they have done it", () => {
+    // Before signing off, the row must not claim anything happened.
+    expect(signoffSuffix(item({ status: "approved" }))).toBe("");
+    expect(signoffSuffix(item({ status: "approved", signed_off_at: "2026-08-24T00:00:00.000Z", signoff_action: "accepted" })))
+      .toMatch(/you accepted it on/);
+    expect(signoffSuffix(item({ status: "approved", signed_off_at: "2026-08-24T00:00:00.000Z", signoff_action: "amended" })))
+      .toMatch(/you made your own version final on/);
+  });
+
+  it("counts All submissions as what it lists, not every task", async () => {
+    // The sign-off queue is not repeated below, so the header must not include
+    // it or the number never matches the rows.
+    mockMyTaskPage.mockResolvedValue({
+      items: [item({ status: "approved", needs_signoff: true }), item({ task_id: "t2", sub_key: "s2", status: "pending" })],
+      offset: 0,
+      limit: 50,
+      source_total: 10,
+      approved_total: 4,
+      awaiting_signoff_total: 3,
+    });
+    const root = renderMyTasks(ctx());
+    await flush();
+    const head = [...root.querySelectorAll(".my-tasks-section-head")].find((h) =>
+      h.textContent?.includes("All submissions")
+    )!;
+    expect(head.textContent).toContain("7");
   });
 
   it("reports sign-off progress over every task, not the page on screen", () => {

@@ -696,19 +696,27 @@ test("summarizes admin submissions by participant and workflow status", () => {
 
 test("builds a content-free reporting feed for created and QC'd tasks", () => {
   const report = buildReportingReport({
-    total: 3,
+    total: 4,
     truncated: false,
     users: [{ participant_id: "alice", submitted: 2 }],
     items: [
       { task_id: "task-1", participant_id: "alice", participant_name: "Alice", participant_email: "alice@example.com", mode: "guided", submitted_at: "2026-08-01T00:00:00Z", status: "pending", reviewer: "", reviewed_at: "", changed: false, rejection_reason: "", trajectory_count: 0, visit_count: 0, original: { request: "private task text" } },
-      { task_id: "task-2", participant_id: "alice", participant_name: "Alice", participant_email: "alice@example.com", mode: "theme", submitted_at: "2026-08-02T00:00:00Z", status: "approved", reviewer: "Reviewer", reviewed_at: "2026-08-03T00:00:00Z", changed: true, rejection_reason: "", trajectory_count: 2, visit_count: 14 },
+      { task_id: "task-2", participant_id: "alice", participant_name: "Alice", participant_email: "alice@example.com", mode: "theme", submitted_at: "2026-08-02T00:00:00Z", status: "approved", reviewer: "Reviewer", reviewed_at: "2026-08-03T00:00:00Z", changed: true, changed_in_qc: true, rejection_reason: "", trajectory_count: 2, visit_count: 14 },
+      // Approved untouched, then amended by its author. Gold differs from the
+      // submission, but no QC edit happened — the two must not be conflated.
+      { task_id: "task-4", participant_id: "alice", participant_name: "Alice", participant_email: "alice@example.com", mode: "guided", submitted_at: "2026-08-02T00:00:00Z", status: "approved", reviewer: "Reviewer", reviewed_at: "2026-08-03T00:00:00Z", changed: true, changed_in_qc: false, amended_by: "alice", rejection_reason: "", trajectory_count: 0, visit_count: 0 },
       { task_id: "task-3", participant_id: "bob", participant_name: "Bob", participant_email: "bob@example.com", mode: "compose", submitted_at: "2026-08-02T00:00:00Z", status: "rejected", reviewer: "Reviewer", reviewed_at: "2026-08-03T00:00:00Z", changed: false, rejection_reason: "Not actionable", trajectory_count: 1, visit_count: 4 },
     ],
   }, "2026-08-06T00:00:00Z");
-  assert.deepEqual(report.totals, { submitted: 3, pending: 1, in_review: 0, approved: 1, rejected: 1, qc_completed: 2 });
+  assert.deepEqual(report.totals, { submitted: 4, pending: 1, in_review: 0, approved: 2, rejected: 1, qc_completed: 3 });
   assert.equal(report.generated_at, "2026-08-06T00:00:00Z");
   assert.equal(report.tasks[1].qc_completed, true);
   assert.equal(report.tasks[1].changed_in_qc, true);
+  assert.equal(report.tasks[1].changed_after_approval, false);
+  // The author-amended row: not a QC edit, and attributed to the author.
+  assert.equal(report.tasks[2].changed_in_qc, false);
+  assert.equal(report.tasks[2].changed_after_approval, true);
+  assert.equal(report.tasks[2].amended_by, "alice");
   assert.equal("original" in report.tasks[0], false);
   assert.equal("llm_review_result" in report.tasks[0], false);
   assert.equal("llm_rubric_results" in report.tasks[0], false);
@@ -1268,6 +1276,14 @@ test("the author history is ordered, and names a reviewer only on an approval", 
   );
   // The rejection reaches the author with no name on it; the approval does not.
   assert.equal(history[1].by, "");
+  // A return is not anonymous — it asks the author to change something, so they
+  // need someone to ask about it.
+  assert.equal(
+    buildAuthorHistory({
+      doneRecords: [{ outcome: "returned", reviewer: "Dana", completed_at: "2026-08-21T09:00:00Z" }],
+    })[0].by,
+    "Dana"
+  );
   assert.equal(history[4].by, "Eli");
   // The appeal carries how long the author spent revising.
   assert.equal(history[2].minutes, 10);

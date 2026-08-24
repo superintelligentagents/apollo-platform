@@ -595,6 +595,16 @@ function renderFeedback(
   return wrap;
 }
 
+// What the author did about the review, once they have done it. Without this
+// the row looks identical before and after signing off.
+export function signoffSuffix(item: MyTaskItem): string {
+  if (!item.signed_off_at) return "";
+  const when = new Date(item.signed_off_at).toLocaleDateString();
+  return item.signoff_action === "amended"
+    ? ` · you made your own version final on ${when}`
+    : ` · you accepted it on ${when}`;
+}
+
 function taskRow(ctx: Ctx, item: MyTaskItem, reloadList: () => void): HTMLElement {
   const when = item.submitted_at ? new Date(item.submitted_at).toLocaleDateString() : "—";
   const reasonLine =
@@ -603,7 +613,7 @@ function taskRow(ctx: Ctx, item: MyTaskItem, reloadList: () => void): HTMLElemen
       : item.status === "returned" && item.returned_reason
         ? item.returned_reason
         : item.status === "approved" && item.reviewed_by
-          ? `Reviewed by ${item.reviewed_by}${item.reviewer_changed === false ? " · unchanged" : ""}`
+          ? `Reviewed by ${item.reviewed_by}${item.reviewer_changed === false ? " · unchanged" : ""}${signoffSuffix(item)}`
           : null;
   const detail = el("details", { class: "admin-submission my-task-row" });
   detail.append(
@@ -743,7 +753,11 @@ export function renderMyTasks(ctx: Ctx): HTMLElement {
           section.append(...awaiting.map((item) => taskRow(ctx, item, reloadList)));
         } else {
           section.append(
-            el("p", { class: "muted" }, "None on this page — the rest are further down your list.")
+            el(
+              "p",
+              { class: "muted" },
+              `None on this page. Your ${page.awaiting_signoff_total} outstanding ${page.awaiting_signoff_total === 1 ? "task is" : "tasks are"} on another page — use Newer and Older below to reach them.`
+            )
           );
         }
         body.append(section);
@@ -753,7 +767,10 @@ export function renderMyTasks(ctx: Ctx): HTMLElement {
       restSection.append(
         sectionHead(
           "All submissions",
-          page.source_total,
+          // Counts what this section actually lists across every page: the
+          // sign-off queue above is not repeated here, so source_total would
+          // never match the rows underneath it.
+          page.source_total - page.awaiting_signoff_total,
           page.awaiting_signoff_total
             ? "Everything else you've submitted, newest first — the ones waiting on you are listed above."
             : "Everything you've submitted, newest first."

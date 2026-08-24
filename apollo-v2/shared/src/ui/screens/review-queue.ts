@@ -181,7 +181,9 @@ export function renderReviewQueue(ctx: Ctx): HTMLElement {
                 el(
                   "p",
                   { class: "muted", style: "margin:4px 0 10px" },
-                  `${counts.own_awaiting_signoff} of your approved task${counts.own_awaiting_signoff === 1 ? " has" : "s have"} been through review and ${counts.own_awaiting_signoff === 1 ? "is" : "are"} waiting for you to sign off. You can accept the reviewer's version or make your own final.`
+                  // "1 of your approved tasks" — the noun stays plural in this
+                  // partitive form however many there are; only the verb moves.
+                  `${counts.own_awaiting_signoff} of your approved tasks ${counts.own_awaiting_signoff === 1 ? "is" : "are"} waiting for you to sign off after review. You can accept the reviewer's version or make your own final.`
                 ),
                 el(
                   "button",
