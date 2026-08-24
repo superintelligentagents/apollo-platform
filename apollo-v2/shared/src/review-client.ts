@@ -27,6 +27,10 @@ export interface ReviewCounts {
   // claimable (you can't review your own task) but surfaced so the queue can
   // say why the numbers don't add up.
   own_pending?: number;
+  // The caller's own approved tasks still waiting for them to sign off. Rides
+  // on the queue response so the Review tab can point at My tasks without a
+  // second request.
+  own_awaiting_signoff?: number;
   reviewers?: ReviewerTotals[];
 }
 
@@ -57,12 +61,21 @@ export interface AdminSubmission {
   status: AdminSubmissionStatus;
   reviewer: string;
   reviewed_at: string;
+  // Recorded from the release that added author sign-off onward; older rows
+  // have neither, because the lock they came from was already deleted.
+  claimed_at?: string;
+  review_minutes?: number | null;
   rejection_reason: string;
   trajectory_count: number;
   visit_count: number;
   changed: boolean;
   original: AdminTaskSnapshot;
   final: AdminTaskSnapshot | null;
+  // Distribution metadata sits beside the snapshots rather than inside them:
+  // the server hashes each snapshot wholesale for the reporting content hash,
+  // so a field added there would restate every task's hash. Optional because
+  // tasks authored before the metadata fields shipped carry none.
+  task_metadata?: { region?: string; subjects?: string[] } | null;
 }
 
 export interface AdminUserSummary {
@@ -361,20 +374,46 @@ export async function reviewFinishedList(reviewKey: string): Promise<FinishedIte
   return (res.items as FinishedItem[]) ?? [];
 }
 
+// `rubrics` are the reviewer's working rows at the moment they rejected. They
+// reach the author as step-level feedback with no attribution, so a rejection
+// says which steps failed rather than only a summary sentence.
 export async function reviewReject(
   reviewKey: string,
   reviewer: string,
   claim: ReviewClaim,
-  reason: string
+  reason: string,
+  rubrics?: RubricRow[],
+  reviewerPid?: string
 ): Promise<void> {
   await post("/review/reject", {
     reviewKey,
     reviewer,
+    reviewer_pid: reviewerPid,
     sub_key: claim.subKey,
     token: claim.token,
     task_id: claim.task.task_id,
     reason,
+    ...(rubrics?.length ? { review: rejectionReviewBlock(rubrics) } : {}),
   });
+}
+
+// The same per-rubric audit shape buildReviewedTask writes into final gold, so
+// the server sanitizes both through cleanRubrics and the author's screen
+// renders them with one component.
+export function rejectionReviewBlock(rubrics: RubricRow[]): Record<string, unknown> {
+  return {
+    rubrics: rubrics
+      .filter((row) => row.text.trim())
+      .map((row) => ({
+        kind: row.kind,
+        source_index: row.sourceIndex,
+        title: row.title,
+        original: row.original,
+        final: row.text.trim(),
+        changed: row.original === null || row.text.trim() !== row.original.trim(),
+        checked: row.checked,
+      })),
+  };
 }
 
 // ---- refresh-resume for an in-flight claim (stored per device) ----
@@ -459,10 +498,20 @@ export async function reviewSubmit(
   reviewKey: string,
   reviewer: string,
   claim: ReviewClaim,
-  edited: { title: string; request: string; difficulty: string; rubrics: RubricRow[]; evergreenVerified?: boolean }
+  edited: { title: string; request: string; difficulty: string; rubrics: RubricRow[]; evergreenVerified?: boolean },
+  reviewerPid?: string
 ): Promise<void> {
   const reviewed = buildReviewedTask(claim.task, edited);
-  await post("/review/submit", { reviewKey, reviewer, sub_key: claim.subKey, token: claim.token, reviewed });
+  await post("/review/submit", {
+    reviewKey,
+    reviewer,
+    // Stored beside the display name: the name is free text, the pid is the
+    // stable handle any later attribution joins on.
+    reviewer_pid: reviewerPid,
+    sub_key: claim.subKey,
+    token: claim.token,
+    reviewed,
+  });
 }
 
 export function buildReviewedTask(
@@ -600,4 +649,274 @@ export function upgradeRubrics(task: LongTask, rows: RubricRow[]): RubricRow[] {
     seedVersion: 3 as const,
   }));
   return upgraded;
+}
+
+// ---- Author-facing "my tasks" + self-edit + return-to-author ----
+
+export type MyTaskStatus = "awaiting_codex" | "pending" | "in_review" | "approved" | "rejected" | "returned";
+
+export interface MyTaskItem {
+  task_id: string;
+  sub_key: string;
+  title: string;
+  request: string;
+  status: MyTaskStatus;
+  submitted_at: string | null;
+  rejection_reason?: string;
+  returned_reason?: string;
+  returned_by?: string;
+  content_hash: string | null;
+  // Approved tasks only. The reviewer is named so the author can follow up with
+  // whoever edited their work; rejections stay anonymous.
+  reviewed_by?: string;
+  reviewer_changed?: boolean;
+  revision_count?: number;
+  // Approved and not yet acknowledged — this is what the sign-off queue lists.
+  needs_signoff?: boolean;
+  signed_off_at?: string;
+  signoff_action?: string;
+  // Rejected tasks: how many times, and whether the one appeal is still open.
+  rejection_count?: number;
+  can_appeal?: boolean;
+}
+
+export interface MyTaskPage {
+  items: MyTaskItem[];
+  offset: number;
+  limit: number;
+  source_total: number;
+  // Counted across every one of the author's tasks, not just this page, so the
+  // sign-off progress stays honest while they page through.
+  approved_total: number;
+  awaiting_signoff_total: number;
+}
+
+// One thing that happened to a task, oldest first. `by` is present on an
+// approval and on the author's own actions, and deliberately absent on a
+// rejection or a return.
+export interface MyTaskHistoryEntry {
+  at: string;
+  event: "submitted" | "revised" | "appealed" | "returned" | "rejected" | "approved" | "accepted" | "amended";
+  by: string;
+  minutes: number | null;
+  note: string;
+}
+
+export interface MyTaskContentSnapshot {
+  title: string;
+  request: string;
+  criteria: string[];
+  steps: { order: number; title: string; description: string }[];
+}
+
+export interface MyTaskHumanReviewRubric {
+  rubric_id: string;
+  kind: string;
+  title: string | null;
+  original: string | null;
+  final: string;
+  changed: boolean;
+  checked: boolean;
+}
+
+export interface MyTaskHumanReview {
+  original: MyTaskContentSnapshot;
+  final: MyTaskContentSnapshot;
+  rubrics: MyTaskHumanReviewRubric[];
+  title_edited: boolean;
+  request_edited: boolean;
+  evergreen_verified: boolean;
+  reviewed_by?: string;
+  // Whether the reviewer altered anything at all.
+  changed?: boolean;
+  revision_count?: number;
+  amended_by?: string;
+  amended_at?: string;
+}
+
+// The reviewer's step-level notes on a rejection. Same rubric shape as the
+// approved diff, and carries no identity.
+export interface MyTaskRejectionFeedback {
+  rubrics: MyTaskHumanReviewRubric[];
+}
+
+// The full current task content. NOT in the written my-task-feedback contract:
+// human_review is only present for approved tasks, but the author needs the
+// full title/request/difficulty/steps to render the read-only view and pre-fill
+// the self-edit form for awaiting_codex/pending/returned states. Flagged for
+// reconciliation with the backend agent — this optional field is a forward-
+// compatible extension so the screen degrades gracefully until it ships.
+export interface MyTaskCurrentContent {
+  title: string;
+  request: string;
+  difficulty: string;
+  criteria: string[];
+  steps: { order: number; title: string; description: string }[];
+  must_visit_or_reach: string[];
+  required_outputs: string[];
+  notes: string | null;
+  metadata?: { region?: string; subjects?: string[] };
+}
+
+export interface MyTaskFeedback {
+  status: "not_reviewed" | "pre_qc_passed" | "pre_qc_attention" | "stale" | "approved" | "rejected" | "returned";
+  stale: boolean;
+  task_content_hash: string | null;
+  review: LlmReviewForHuman | null;
+  human_review?: MyTaskHumanReview;
+  rejection_reason?: string;
+  returned_reason?: string;
+  returned_by?: string;
+  task?: MyTaskCurrentContent;
+  // The full final gold, for approved tasks. The amend form seeds from this:
+  // an author correcting an approved task starts from the reviewer's version.
+  // human_review.final is a display snapshot with no difficulty or metadata.
+  final_task?: MyTaskCurrentContent | null;
+  rejection_feedback?: MyTaskRejectionFeedback;
+  needs_signoff?: boolean;
+  signed_off_at?: string;
+  signoff_action?: string;
+  history?: MyTaskHistoryEntry[];
+}
+
+export interface AuthorEditPayload {
+  task_title: string;
+  agent_request: string;
+  difficulty: string;
+  success_criteria: string[];
+  steps: { order: number; title: string; description: string }[];
+  must_visit_or_reach: string[];
+  required_outputs: string[];
+  notes: string | null;
+  metadata?: { region?: string; subjects?: string[] };
+}
+
+export interface AuthorEditResult {
+  ok: true;
+  new_sub_key: string;
+  new_content_hash: string;
+  status: "awaiting_codex";
+  // True when the revision answers a rejection. The server routes an appeal
+  // away from the reviewer who rejected it.
+  appeal?: boolean;
+}
+
+export interface AuthorAmendResult {
+  ok: true;
+  revision_count: number;
+  new_content_hash: string;
+  amended_at?: string;
+  idempotent?: boolean;
+}
+
+export async function myTasks(reviewKey: string, participantId: string): Promise<MyTaskItem[]> {
+  return (await myTaskPage(reviewKey, participantId)).items;
+}
+
+// Paged: an active trainer's sign-off backlog runs to well over a hundred
+// tasks, and every row costs the server at least one object read.
+export async function myTaskPage(
+  reviewKey: string,
+  participantId: string,
+  offset = 0,
+  limit = 50
+): Promise<MyTaskPage> {
+  const res = await post("/review/my-tasks", {
+    reviewKey,
+    participant_id: participantId,
+    offset,
+    limit,
+  });
+  const items = (res.items as MyTaskItem[] | undefined) ?? [];
+  return {
+    items,
+    offset: Number(res.offset) || 0,
+    limit: Number(res.limit) || limit,
+    source_total: Number(res.source_total ?? items.length),
+    approved_total: Number(res.approved_total) || 0,
+    awaiting_signoff_total: Number(res.awaiting_signoff_total) || 0,
+  };
+}
+
+// "I have read what the reviewer did and I accept it." Writes an immutable
+// receipt; final gold is untouched. `openedAt` is when the author opened the
+// task — the server pairs it with its own completion stamp, and never trusts a
+// duration sent by a client.
+export async function authorSignoff(
+  reviewKey: string,
+  participantId: string,
+  subKey: string,
+  openedAt?: string | null
+): Promise<{ ok: true; action: string; signed_off_at: string }> {
+  return (await post("/review/author-signoff", {
+    reviewKey,
+    participant_id: participantId,
+    sub_key: subKey,
+    opened_at: openedAt ?? null,
+  })) as unknown as { ok: true; action: string; signed_off_at: string };
+}
+
+// The author's correction of their own approved task becomes the new final
+// gold, with no second reviewer pass. Distinct from authorEdit, which puts a
+// revision back into the reviewer queue.
+export async function authorAmend(
+  reviewKey: string,
+  participantId: string,
+  subKey: string,
+  edited: AuthorEditPayload,
+  openedAt?: string | null
+): Promise<AuthorAmendResult> {
+  return (await post("/review/author-amend", {
+    reviewKey,
+    participant_id: participantId,
+    sub_key: subKey,
+    edited,
+    opened_at: openedAt ?? null,
+  })) as unknown as AuthorAmendResult;
+}
+
+export async function myTaskFeedback(
+  reviewKey: string,
+  participantId: string,
+  subKey: string
+): Promise<MyTaskFeedback> {
+  return (await post("/review/my-task-feedback", {
+    reviewKey,
+    participant_id: participantId,
+    sub_key: subKey,
+  })) as unknown as MyTaskFeedback;
+}
+
+export async function authorEdit(
+  reviewKey: string,
+  participantId: string,
+  subKey: string,
+  edited: AuthorEditPayload,
+  editStartedAt?: string | null
+): Promise<AuthorEditResult> {
+  return (await post("/review/author-edit", {
+    reviewKey,
+    participant_id: participantId,
+    sub_key: subKey,
+    edited,
+    edit_started_at: editStartedAt ?? null,
+  })) as unknown as AuthorEditResult;
+}
+
+// Mirrors reviewReject: the reviewer holds the claim lock and sends the task
+// back to the author with a reason. The author can then self-edit and resubmit.
+export async function reviewReturn(
+  reviewKey: string,
+  reviewer: string,
+  claim: ReviewClaim,
+  reason: string
+): Promise<void> {
+  await post("/review/return-to-author", {
+    reviewKey,
+    reviewer,
+    sub_key: claim.subKey,
+    token: claim.token,
+    task_id: claim.task.task_id,
+    reason,
+  });
 }

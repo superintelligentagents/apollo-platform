@@ -1447,6 +1447,29 @@ kbd.hotkey {
 .llm-preqc-title small { color: var(--ink-faint); font-size: 11.5px; font-weight: 450; }
 .advisory-tag { color: var(--ink-faint); font: 10px/1.2 var(--mono); letter-spacing: .07em; text-transform: uppercase; }
 .badge.warn { border-color: #d9cba7; color: #725c25; background: #f5f0e2; }
+.badge.danger { border-color: #ecc8c4; color: #8a4139; background: #f6e8e6; }
+.review-actions .return-to-author { margin-right: auto; }
+.my-task-feedback { display: flex; flex-direction: column; gap: 14px; }
+.my-task-edit { display: flex; flex-direction: column; gap: 12px; margin-top: 4px; padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.my-task-rubric-feedback { display: flex; flex-direction: column; gap: 10px; }
+/* My tasks: the sign-off worklist above the full submission list. */
+.my-tasks-section { margin-bottom: 26px; }
+.my-tasks-section-head { margin: 0 0 10px; }
+.my-tasks-section-head h3 { margin: 0; }
+.my-tasks-section-head .field-hint { margin: 4px 0 0; }
+.my-tasks-section.needs-signoff { padding: 16px; border: 1px solid var(--line); border-left: 3px solid var(--accent, #2f5fd0); border-radius: 10px; background: var(--surface-2); }
+.my-tasks-progress { margin: 0 0 10px; font-size: 13px; opacity: 0.75; }
+.my-tasks-pager { justify-content: space-between; align-items: center; }
+.my-task-reviewer { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0; font-size: 14px; }
+.my-task-reject-notes { padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-2); }
+.my-task-reject-notes h4 { margin: 0; }
+.my-task-reject-notes .field-hint { margin: 4px 0 10px; }
+.my-task-history summary { cursor: pointer; font-size: 14px; }
+.my-task-history-list { margin: 10px 0 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px; font-size: 14px; }
+.my-task-history-list .admin-date { margin-right: 8px; }
+.signoff-callout { margin-bottom: 16px; }
+.cohort-reviewers { margin-top: 18px; }
+.cohort-author-row.flagged { border-left: 3px solid #a04c42; padding-left: 9px; }
 .llm-preqc-body { padding: 0 16px 15px; border-top: 1px solid var(--line); }
 .llm-preqc-body > p { margin: 10px 0 0; line-height: 1.55; }
 .codex-check-list { display: flex; flex-direction: column; }

@@ -172,6 +172,31 @@ export function renderReviewQueue(ctx: Ctx): HTMLElement {
           el("div", { class: "queue-tile" }, el("strong", null, String(counts.approved ?? counts.finished - (counts.rejected ?? 0))), el("span", null, "approved")),
           el("div", { class: "queue-tile" }, el("strong", null, String(counts.rejected ?? 0)), el("span", null, "rejected"))
         ),
+        ...(counts.own_awaiting_signoff
+          ? [
+              el(
+                "div",
+                { class: "card signoff-callout" },
+                el("h3", null, "Your tasks are waiting on you"),
+                el(
+                  "p",
+                  { class: "muted", style: "margin:4px 0 10px" },
+                  // "1 of your approved tasks" — the noun stays plural in this
+                  // partitive form however many there are; only the verb moves.
+                  `${counts.own_awaiting_signoff} of your approved tasks ${counts.own_awaiting_signoff === 1 ? "is" : "are"} waiting for you to sign off after review. You can accept the reviewer's version or make your own final.`
+                ),
+                el(
+                  "button",
+                  {
+                    class: "btn primary",
+                    type: "button",
+                    onclick: () => ctx.actions.goto("my-tasks"),
+                  },
+                  "Go to My tasks"
+                )
+              ),
+            ]
+          : []),
         ...(counts.own_pending
           ? [
               el(

@@ -45,6 +45,7 @@ import { renderForm } from "./screens/form";
 import { renderReview } from "./screens/review";
 import { renderExamples } from "./screens/examples";
 import { renderProgress } from "./screens/progress";
+import { renderMyTasks } from "./screens/my-tasks";
 import { renderReviewQueue } from "./screens/review-queue";
 import { renderReviewEdit } from "./screens/review-edit";
 import { renderTrajectoryQueue } from "./screens/trajectory-queue";
@@ -65,6 +66,7 @@ const SCREEN_PATH: Record<Screen, string> = {
   home: "/home",
   submit: "/submit",
   progress: "/progress",
+  "my-tasks": "/my-tasks",
   "review-queue": "/review-queue",
   "review-edit": "/review-task",
   "trajectory-queue": "/trajectory-review",
@@ -693,6 +695,7 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
     );
     const NAV: Array<{ label: string; target: Screen; owns: Screen[] }> = [
       { label: "Submit", target: "submit", owns: ["submit", "history", "compose", "themes", "guided", "form", "review"] },
+      { label: "My tasks", target: "my-tasks", owns: ["my-tasks"] },
       { label: "Review", target: "review-queue", owns: ["review-queue", "review-edit"] },
       { label: "Grade", target: "trajectory-queue", owns: ["trajectory-queue", "trajectory-edit"] },
       { label: "Examples", target: "examples", owns: ["examples"] },
@@ -757,6 +760,7 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
       review: renderReview,
       examples: renderExamples,
       progress: renderProgress,
+      "my-tasks": renderMyTasks,
       "review-queue": renderReviewQueue,
       "review-edit": renderReviewEdit,
       "trajectory-queue": renderTrajectoryQueue,

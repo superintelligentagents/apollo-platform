@@ -157,8 +157,12 @@ export async function reviewRelease(reviewKey: string, claim: ReviewClaim): Prom
   await post("/review/release", { reviewKey, sub_key: claim.subKey, token: claim.token });
 }
 
-export async function reviewReject(reviewKey: string, reviewer: string, claim: ReviewClaim, reason: string): Promise<void> {
-  await post("/review/reject", { reviewKey, reviewer, sub_key: claim.subKey, token: claim.token, task_id: claim.task.task_id, reason });
+// reviewerPid matters beyond attribution: the queue is shared with Apollo v2,
+// and an author appealing a rejection is routed away from the reviewer who
+// rejected it by matching this pid. Omitting it silently hands the appeal
+// straight back to them.
+export async function reviewReject(reviewKey: string, reviewer: string, claim: ReviewClaim, reason: string, reviewerPid?: string): Promise<void> {
+  await post("/review/reject", { reviewKey, reviewer, ...(reviewerPid ? { reviewer_pid: reviewerPid } : {}), sub_key: claim.subKey, token: claim.token, task_id: claim.task.task_id, reason });
 }
 
 export function seedRubrics(task: ReviewLongTask): RubricRow[] {
