@@ -539,6 +539,10 @@ describe("my tasks screen", () => {
 describe("my tasks pure helpers", () => {
   it("picks the action a task's state allows", () => {
     expect(editModeFor(item({ status: "pending" }))).toBe("revise");
+    // Amend is offered for every approved task, whether or not the reviewer
+    // changed anything and whether or not it has already been signed off.
+    expect(editModeFor(item({ status: "approved", reviewer_changed: false }))).toBe("amend");
+    expect(editModeFor(item({ status: "approved", needs_signoff: false, signed_off_at: "2026-08-24T00:00:00.000Z" }))).toBe("amend");
     expect(editModeFor(item({ status: "returned" }))).toBe("revise");
     expect(editModeFor(item({ status: "approved" }))).toBe("amend");
     expect(editModeFor(item({ status: "rejected", can_appeal: true }))).toBe("appeal");
@@ -557,6 +561,29 @@ describe("my tasks pure helpers", () => {
     expect(editSeed(fb, "appeal")?.request).toBe("author");
     // An approved task with no final gold falls back rather than rendering blank.
     expect(editSeed(feedback({ task: currentTask() }), "amend")?.request).toBe(currentTask().request);
+  });
+
+  it("lets the author edit an approval the reviewer did not touch", async () => {
+    // Nothing changed in QC is not a reason to take the pen away: the author
+    // may still want to improve their own task before it ships.
+    mockMyTaskPage.mockResolvedValue(
+      page([item({ status: "approved", needs_signoff: true, reviewed_by: "Dana", reviewer_changed: false })])
+    );
+    mockMyTaskFeedback.mockResolvedValue(
+      feedback({
+        status: "approved",
+        needs_signoff: true,
+        human_review: humanReview({ reviewed_by: "Dana", changed: false, request_edited: false, title_edited: false }),
+        final_task: currentTask(),
+      })
+    );
+    const root = renderMyTasks(ctx());
+    await flush();
+    await openRow(root);
+
+    expect(root.textContent).toMatch(/nothing changed/i);
+    expect(btn(root, "Looks good — accept")).toBeTruthy();
+    expect(btn(root, "Edit and make final")).toBeTruthy();
   });
 
   it("says what the author did about the review, once they have done it", () => {
