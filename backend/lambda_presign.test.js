@@ -2,6 +2,14 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   excludeOwnSubmissions,
+  excludeIneligible,
+  authorEditEligibility,
+  buildAmendedFinalGold,
+  finalGoldRevision,
+  stageMinutes,
+  distinctRejectedTaskIds,
+  participantIdFromFinishedKey,
+  buildAuthorHistory,
   isReviewSubmissionKey,
   participantIdFromSubKey,
   reviewUnitForKey,
@@ -32,9 +40,10 @@ import {
   llmEvergreenReviewFromReview,
   hydrateReportingLlmReviews,
   cleanTaskSnapshot,
-  taskMetadataForReporting,
   cleanRubrics,
+  taskMetadataForReporting,
   sortPendingReviewUnits,
+  pendingReviewUnits,
   reportingKeyMatches,
   taskIdFromTrajectoryManifestKey,
   participantIdFromTrajectoryManifestKey,
@@ -67,6 +76,48 @@ test("orders review units by submission time instead of participant slug", () =>
     "prolific/journeys/alice/newer.json",
     "prolific/journeys/bob/newer.json",
   ]);
+});
+
+test("distribution metadata prefers final gold and stays out of the content hash", () => {
+  const authored = { metadata: { region: "IN", subjects: ["Travel and Tourism > Air Travel"] } };
+  const gold = { metadata: { region: "BR", subjects: ["Health > Medicine"] } };
+  // The precedence the admin row builder applies: a reviewer may correct the
+  // author's pick during QC, so final gold is what the team-spread panel counts.
+  const resolve = (source, final) =>
+    taskMetadataForReporting(final) ?? taskMetadataForReporting(source);
+
+  assert.deepEqual(resolve(authored, gold), { region: "BR", subjects: ["Health > Medicine"] });
+  assert.deepEqual(resolve(authored, null), {
+    region: "IN",
+    subjects: ["Travel and Tourism > Air Travel"],
+  });
+  // Tasks predating the fields carry none, and an empty object is not metadata.
+  assert.equal(resolve({}, null), null);
+  assert.equal(resolve({ metadata: {} }, null), null);
+
+  // The dashboard reads this beside the snapshots, never inside them: adding a
+  // field to cleanTaskSnapshot would restate every stored task's content hash
+  // and drop it out of the pre-QC audit gate as stale.
+  const task = { task_title: "T", agent_request: "R", steps: [], ...authored };
+  assert.equal("metadata" in cleanTaskSnapshot(task), false);
+});
+
+test("a returned task re-enters the queue after the author revises it", () => {
+  const enc = (key) => Buffer.from(key, "utf8").toString("base64url");
+  const dir = "prolific/journeys/alice/v2/alice/internal/task-1";
+  const returned = `${dir}/1700000000000-aaaaaaaa_long_task.json`;
+  const revised = `${dir}/1700000001000-bbbbbbbb_long_task.json`;
+  // Both revisions land in the same task directory (same unit); the newer
+  // revision is the unit's newest file.
+  const units = [{ newest: revised, files: [returned, revised], oldestAt: 1700000000000 }];
+  const doneSet = new Set([enc(returned)]); // the returned revision is done; the new one isn't
+  assert.deepEqual(pendingReviewUnits(units, doneSet).map((u) => u.newest), [revised]);
+  // The OLD rule (pending unless ANY file was done) would have dropped this
+  // unit entirely, stranding the author's revision outside the review queue.
+  // Backward compatible: a single-file unit that's done stays out of the queue.
+  assert.deepEqual(pendingReviewUnits([{ newest: returned, files: [returned], oldestAt: 1700000000000 }], doneSet), []);
+  // ... and a single not-done file still surfaces, exactly as before.
+  assert.deepEqual(pendingReviewUnits([{ newest: revised, files: [revised], oldestAt: 1700000000000 }], doneSet).map((u) => u.newest), [revised]);
 });
 
 test("accepts individually revocable reporting credentials", () => {
@@ -1059,4 +1110,184 @@ test("calendar admin edits allow only summary and description", () => {
   const current = { id: "cal-2", summary: "A", description: "B", attendees: [{ email: "person@example.test" }], dtstart: "2026-08-01", location: "Locked" };
   const safe = restrictPCAdminRecord("calendar", current, { ...current, id: "changed", summary: "Edited", description: "Updated", attendees: [], dtstart: "changed", location: "Changed" });
   assert.deepEqual(safe, { ...current, summary: "Edited", description: "Updated" });
+});
+
+// ---- author sign-off, amendment, and appeals ----
+
+const finalGold = (over = {}) => ({
+  schema_version: "odyssey_long_task_v2_reviewed",
+  task_id: "v2/alice/internal/task-1",
+  task: { task_title: "Reviewer version", agent_request: "Reviewer wrote this.", steps: [] },
+  review: { original: { task_title: "Author version" }, rubrics: [{ final: "a", changed: true }], request_edited: true },
+  review_content_hash: "hash-reviewer",
+  reviewed_by: "Dana",
+  finished_at: "2026-08-20T10:00:00Z",
+  ...over,
+});
+
+test("an author amendment supersedes final gold without erasing the reviewer's audit", () => {
+  const doc = buildAmendedFinalGold({
+    existing: finalGold(),
+    amendedTask: { task_title: "Author's correction", agent_request: "Author rewrote this.", steps: [] },
+    contentHash: "hash-author",
+    authorPid: "alice",
+    amendedAt: "2026-08-24T12:00:00Z",
+  });
+
+  assert.equal(doc.task.task_title, "Author's correction");
+  assert.equal(doc.review_content_hash, "hash-author");
+  assert.equal(doc.amended_by, "alice");
+  assert.equal(doc.revision_count, 2);
+  // The record of what the human reviewer did survives the author's edit.
+  assert.deepEqual(doc.review, finalGold().review);
+  assert.equal(doc.reviewed_by, "Dana");
+  // ...and the version it replaced is kept, attributed to the reviewer.
+  assert.equal(doc.history.length, 1);
+  assert.deepEqual(doc.history[0], {
+    task: finalGold().task,
+    review_content_hash: "hash-reviewer",
+    source: "reviewer",
+    by: "Dana",
+    at: "2026-08-20T10:00:00Z",
+  });
+});
+
+test("a second amendment is attributed to the author, and history stays bounded", () => {
+  let doc = finalGold();
+  for (let i = 0; i < 14; i += 1) {
+    doc = buildAmendedFinalGold({
+      existing: doc,
+      amendedTask: { task_title: `v${i}`, agent_request: "x", steps: [] },
+      contentHash: `hash-${i}`,
+      authorPid: "alice",
+      amendedAt: `2026-08-24T12:${String(i).padStart(2, "0")}:00Z`,
+    });
+  }
+  assert.equal(doc.revision_count, 15);
+  assert.equal(doc.history.length, 10);
+  // Only the very first superseded version came from the reviewer; it has since
+  // aged out of the bounded window, leaving author revisions.
+  assert.deepEqual([...new Set(doc.history.map((h) => h.source))], ["author"]);
+  assert.equal(doc.history.at(-1).by, "alice");
+});
+
+test("a finished doc written before the counter existed resolves its revision from history", () => {
+  assert.equal(finalGoldRevision(null), 0);
+  assert.equal(finalGoldRevision({ task: {} }), 1);
+  assert.equal(finalGoldRevision({ history: [{}, {}] }), 3);
+  assert.equal(finalGoldRevision({ revision_count: 7, history: [{}] }), 7);
+});
+
+test("authors may revise an open or returned task, and appeal a rejection exactly once", () => {
+  assert.equal(authorEditEligibility(null, false, 0).allowed, true);
+  assert.equal(authorEditEligibility("returned", false, 0).allowed, true);
+
+  const firstAppeal = authorEditEligibility("rejected", false, 1);
+  assert.equal(firstAppeal.allowed, true);
+  assert.equal(firstAppeal.appeal, true);
+
+  // Rejected a second time: the appeal has been used.
+  assert.equal(authorEditEligibility("rejected", false, 2).allowed, false);
+  assert.match(authorEditEligibility("rejected", false, 2).reason, /already appealed/i);
+
+  // An approved task goes through the amend path, and a locked one waits.
+  assert.equal(authorEditEligibility("approved", false, 0).allowed, false);
+  assert.match(authorEditEligibility("approved", false, 0).reason, /sign-off queue/i);
+  assert.equal(authorEditEligibility(null, true, 0).allowed, false);
+  assert.match(authorEditEligibility(null, true, 0).reason, /claimed/i);
+});
+
+test("a reviewer is offered neither their own tasks nor an appeal of a task they rejected", () => {
+  const appeal = "prolific/journeys/carol/v2/carol/internal/task-9/2_long_task.json";
+  const rejecters = new Map([[appeal, "alice"]]);
+
+  // Alice rejected the first version of Carol's task, so she does not get the
+  // appeal — and she never gets her own submission.
+  assert.deepEqual(excludeIneligible([v2, pcBob, appeal], "alice", rejecters), [pcBob]);
+  // Bob was not involved, so the appeal is his to take.
+  assert.deepEqual(excludeIneligible([v2, pcBob, appeal], "bob", rejecters), [v2, appeal]);
+  // No participant id (an older client) means no filtering, as before.
+  assert.deepEqual(excludeIneligible([v2, appeal], "", rejecters), [v2, appeal]);
+});
+
+test("stage minutes come from stored stamps and refuse an implausible span", () => {
+  assert.equal(stageMinutes("2026-08-24T12:00:00Z", "2026-08-24T12:06:30Z"), 6.5);
+  assert.equal(stageMinutes(null, "2026-08-24T12:00:00Z"), null);
+  assert.equal(stageMinutes("2026-08-24T12:00:00Z", "not-a-date"), null);
+  // A tab left open overnight, or a clock running backwards, is not a duration.
+  assert.equal(stageMinutes("2026-08-22T12:00:00Z", "2026-08-24T12:00:00Z"), null);
+  assert.equal(stageMinutes("2026-08-24T12:10:00Z", "2026-08-24T12:00:00Z"), null);
+});
+
+test("a task rejected twice counts once, even though it has two rejection records", () => {
+  const ids = distinctRejectedTaskIds([
+    "v2-review/rejected/v2_alice_internal_task-1_aaaaaaaaaaaaaaaa.json",
+    "v2-review/rejected/v2_alice_internal_task-1_bbbbbbbbbbbbbbbb.json",
+    "v2-review/rejected/v2_bob_internal_task-2_cccccccccccccccc.json",
+  ]);
+  assert.deepEqual([...ids].sort(), ["v2_alice_internal_task-1", "v2_bob_internal_task-2"]);
+});
+
+test("the author of an approved task is recoverable from its final-gold key", () => {
+  assert.equal(
+    participantIdFromFinishedKey("v2-review/finished/v2_alice_internal_task-abc-123.json"),
+    "alice"
+  );
+  assert.equal(participantIdFromFinishedKey("v2-review/finished/pc_bundle_thing.json"), null);
+});
+
+test("the author history is ordered, and names a reviewer only on an approval", () => {
+  const history = buildAuthorHistory({
+    revisions: [
+      { first: true, created_at: "2026-08-20T09:00:00Z" },
+      {
+        created_at: "2026-08-22T09:10:00Z",
+        appeal_of_sub_key: "older",
+        appeal_started_at: "2026-08-22T09:00:00Z",
+      },
+    ],
+    doneRecords: [
+      { outcome: "rejected", reviewer: "Dana", completed_at: "2026-08-21T09:00:00Z" },
+      { outcome: "approved", reviewer: "Eli", completed_at: "2026-08-23T09:00:00Z" },
+    ],
+    finalGoldHistory: [
+      { source: "reviewer", by: "Eli", at: "2026-08-23T09:00:00Z" },
+      { source: "author", by: "alice", at: "2026-08-24T09:00:00Z" },
+    ],
+  });
+
+  assert.deepEqual(
+    history.map((entry) => entry.event),
+    ["submitted", "rejected", "appealed", "approved", "amended"]
+  );
+  // The rejection reaches the author with no name on it; the approval does not.
+  assert.equal(history[1].by, "");
+  assert.equal(history[3].by, "Eli");
+  // The appeal carries how long the author spent revising.
+  assert.equal(history[2].minutes, 10);
+});
+
+test("an amendment that changes nothing produces the same content hash as the approval", () => {
+  // /review/submit hashes final gold this way; the amend route must derive the
+  // same value from the same fields or the no-op check never fires and every
+  // save burns a revision.
+  const existing = finalGold();
+  const asSubmitted = {
+    schema_version: existing.schema_version,
+    task_id: existing.task_id,
+    mode: existing.mode,
+    task: existing.task,
+    review: existing.review,
+  };
+  const unchanged = {
+    schema_version: existing.schema_version,
+    task_id: existing.task_id,
+    mode: existing.mode,
+    task: { ...existing.task },
+    review: existing.review,
+  };
+  assert.equal(reviewContentHash(unchanged), reviewContentHash(asSubmitted));
+
+  const edited = { ...unchanged, task: { ...existing.task, agent_request: "Author rewrote this." } };
+  assert.notEqual(reviewContentHash(edited), reviewContentHash(asSubmitted));
 });

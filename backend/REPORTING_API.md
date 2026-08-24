@@ -202,6 +202,27 @@ Steps are the canonical rubric items. Legacy success criteria are used only when
 
 `llm_evergreen_review` remains available for legacy artifacts. Pipeline v18 returns `NOT_ASSESSED`: the Codex gate no longer runs or uses a separate evergreen axis. Older artifacts may contain `EVERGREEN`, `NOT_EVERGREEN`, or `NEEDS_HUMAN_REVIEW`.
 
+## Review and author-stage timing
+
+Every row carries the stamps each stage is measured from, and the minutes derived from
+them. Durations are always computed server-side from two stored timestamps — a duration
+sent by a client is never stored.
+
+| Field | Derived from | Meaning |
+|---|---|---|
+| `review_minutes` | `reviewed_at` − `claimed_at` | How long the human review took. Recorded from the release that added author sign-off onward; rows finished before it report `null`. |
+| `signoff_minutes` | `signoff_at` − the author's open stamp | How long the author spent reading the review before accepting or amending. |
+| `author_edit_minutes` | `submitted_at` − `edit_started_at` | How long a self-edit of an open task took. |
+| `appeal_minutes` | `submitted_at` − `appeal_started_at` | How long a revision after a rejection took. |
+
+`signoff_action` is `accepted` or `amended`, and empty while a task is still waiting on its
+author. `appeal_number` is 0 for an ordinary submission and 1 for the one permitted appeal.
+`final_gold_revision` is 1 for the reviewer's own approval and increases with each author
+amendment.
+
+An implausible span — negative, or longer than a day — is reported as `null` rather than as
+a number, so a stale open tab or a wrong client clock never becomes a data point.
+
 ## LLM review storage
 
 The Codex pipeline writes one immutable, manager-reviewed artifact per task state:

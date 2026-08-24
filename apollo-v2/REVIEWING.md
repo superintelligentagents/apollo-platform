@@ -25,11 +25,18 @@ That's it — reviewing is enabled automatically for reviewer builds.
 6. Three ways out:
    - **Approve → finished** — the task ships.
    - **Skip — release it** — put it back for someone else (you're unsure, or out of time).
-   - **Reject — not usable** — spam or no salvageable intent; give a one-line reason.
-     It leaves the queue permanently, reason on record.
+   - **Reject — not usable** — no salvageable intent. Write a real reason: at least a
+     sentence saying what is wrong and what would have to change. Your step notes go with
+     it. The author sees both, without your name, and can appeal once — a vague reason
+     just turns into a wasted appeal for two people.
 
 Your approved/rejected counts show on the queue screen (yours and the total), and every
 review is credited on your stats page (the counter in the top bar).
+
+What you edit goes back to the author. After you approve a task it appears in their
+**My tasks** with your name on it, your version beside their original, and the option to
+accept it or amend it. Rejections reach them anonymously. Rejection rate is not what is
+being watched — how long you spend and how much you explain is.
 
 Before you decide, the advisory LLM panel shows five separate task checks: realistic request,
 live-web feasibility, appropriate difficulty, prompt quality, and whether it works later. Each
@@ -65,5 +72,8 @@ keyboard shortcuts.
   your edits are intact while the lock lasts.
 - **"Already finished by another reviewer" (rare)**: your lock expired and someone else
   completed it. Claim the next one.
-- **Bad task** (spam, gibberish, no salvageable intent): use **Reject** with a short
+- **Bad task** (spam, gibberish, no salvageable intent): use **Reject** with a real
   reason — never approve a weak rubric just to clear the queue.
+- **An appeal**: a task an author revised after a rejection comes back through the normal
+  queue. You will never be offered an appeal of a task you rejected yourself, so when one
+  reaches you it is genuinely a second opinion. Review it on its merits.

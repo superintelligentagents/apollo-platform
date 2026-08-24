@@ -8,6 +8,7 @@ import {
   type AdminSubmission,
   type AdminSubmissionStatus,
   type AdminTaskSnapshot,
+  type AdminUserSummary,
 } from "../../review-client";
 import { participantKey } from "../identity";
 import { isAdminEmail } from "../../admin-access";
@@ -110,7 +111,116 @@ export function filterAdminSubmissions(
   });
 }
 
-function taskSnapshot(label: string, snapshot: AdminTaskSnapshot, extraClass = ""): HTMLElement {
+export interface RejectionReasonCluster {
+  reason: string;
+  count: number;
+}
+
+export interface AuthorRejectionRate {
+  participant_id: string;
+  name: string;
+  email: string;
+  approved: number;
+  rejected: number;
+  rate: number;
+}
+
+export function rejectionReasonClusters(items: readonly AdminSubmission[]): RejectionReasonCluster[] {
+  const counts = new Map<string, number>();
+  const display = new Map<string, string>();
+  for (const item of items) {
+    if (item.status !== "rejected") continue;
+    const raw = (item.rejection_reason ?? "").trim();
+    const label = raw || "(no reason given)";
+    const key = label.toLowerCase();
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+    if (!display.has(key)) display.set(key, label);
+  }
+  return [...counts.entries()]
+    .map(([key, count]) => ({ reason: display.get(key)!, count }))
+    .sort((a, b) => b.count - a.count || a.reason.localeCompare(b.reason, "en"));
+}
+
+export interface ReviewerCalibration {
+  reviewer: string;
+  reviewed: number;
+  rejected: number;
+  rejectionRate: number;
+  medianMinutes: number | null;
+  rushedShare: number;
+  terseShare: number;
+}
+
+// A reason this short tells the author nothing they can act on ("spam",
+// "reject task", "alignment issue").
+const TERSE_REASON_LENGTH = 60;
+// Under this, nobody opened the task's pages, let alone verified them against
+// the live web, which is what the human QC standard asks for.
+const RUSHED_REVIEW_MINUTES = 2;
+
+// Per reviewer: how much they get through, how often they reject, and how much
+// time and explanation they put behind it. Rejection rate on its own is not a
+// quality signal — reviewers who reject most take the longest — so it is shown
+// beside the two measures that do separate care from speed.
+export function reviewerCalibration(items: readonly AdminSubmission[]): ReviewerCalibration[] {
+  const byReviewer = new Map<string, { minutes: number[]; rejected: number; terse: number; reviewed: number }>();
+  for (const item of items) {
+    if (item.status !== "approved" && item.status !== "rejected") continue;
+    const reviewer = (item.reviewer ?? "").trim();
+    if (!reviewer) continue;
+    const row = byReviewer.get(reviewer) ?? { minutes: [], rejected: 0, terse: 0, reviewed: 0 };
+    row.reviewed += 1;
+    if (typeof item.review_minutes === "number") row.minutes.push(item.review_minutes);
+    if (item.status === "rejected") {
+      row.rejected += 1;
+      if ((item.rejection_reason ?? "").trim().length < TERSE_REASON_LENGTH) row.terse += 1;
+    }
+    byReviewer.set(reviewer, row);
+  }
+  return [...byReviewer.entries()]
+    .map(([reviewer, row]) => {
+      const sorted = [...row.minutes].sort((a, b) => a - b);
+      return {
+        reviewer,
+        reviewed: row.reviewed,
+        rejected: row.rejected,
+        rejectionRate: row.rejected / row.reviewed,
+        medianMinutes: sorted.length ? sorted[Math.floor(sorted.length / 2)] : null,
+        rushedShare: sorted.length
+          ? sorted.filter((m) => m < RUSHED_REVIEW_MINUTES).length / sorted.length
+          : 0,
+        terseShare: row.rejected ? row.terse / row.rejected : 0,
+      };
+    })
+    .sort((a, b) => b.reviewed - a.reviewed || a.reviewer.localeCompare(b.reviewer, "en"));
+}
+
+export function authorRejectionRates(users: readonly AdminUserSummary[]): AuthorRejectionRate[] {
+  return users
+    .filter((user) => user.approved + user.rejected > 0)
+    .map((user) => {
+      const finished = user.approved + user.rejected;
+      return {
+        participant_id: user.participant_id,
+        name: user.name,
+        email: user.email,
+        approved: user.approved,
+        rejected: user.rejected,
+        rate: user.rejected / finished,
+      };
+    })
+    .sort((a, b) => b.rate - a.rate || a.name.localeCompare(b.name, "en"));
+}
+
+// `meta` is passed in rather than read off the snapshot: the server keeps
+// distribution metadata beside the snapshots so the reporting content hash
+// stays stable, and both snapshots of a row share the one resolved value.
+function taskSnapshot(
+  label: string,
+  snapshot: AdminTaskSnapshot,
+  meta: { region?: string; subjects?: string[] } | null | undefined,
+  extraClass = ""
+): HTMLElement {
   const criteria = snapshot.criteria.length
     ? el("ol", { class: "admin-rubric-list" }, ...snapshot.criteria.map((criterion) => el("li", null, criterion)))
     : el("p", { class: "muted" }, "No success criteria.");
@@ -123,7 +233,6 @@ function taskSnapshot(label: string, snapshot: AdminTaskSnapshot, extraClass = "
         )
       )
     : el("p", { class: "muted" }, "No authored steps.");
-  const meta = snapshot.metadata;
   return el(
     "section",
     { class: `admin-snapshot ${extraClass}`.trim() },
@@ -179,8 +288,8 @@ function submissionRow(item: AdminSubmission): HTMLElement {
       el(
         "div",
         { class: `admin-snapshots ${item.final ? "has-final" : ""}` },
-        taskSnapshot(item.final ? "Original submission" : "Submitted task", item.original),
-        ...(item.final ? [taskSnapshot(item.changed ? "Final gold · changed" : "Final gold · unchanged", item.final, "final")] : [])
+        taskSnapshot(item.final ? "Original submission" : "Submitted task", item.original, item.task_metadata),
+        ...(item.final ? [taskSnapshot(item.changed ? "Final gold · changed" : "Final gold · unchanged", item.final, item.task_metadata, "final")] : [])
       )
     )
   );
@@ -252,6 +361,7 @@ function hydrateAdminPanel(panel: HTMLElement, data: AdminDashboard): void {
   panel.append(
     stats,
     teamDistribution(data.items),
+    cohortSteering(data.items, data.users),
     el("div", { class: "admin-filters" }, query, userSelect, statusSelect),
     resultCount,
     list
@@ -261,8 +371,17 @@ function hydrateAdminPanel(panel: HTMLElement, data: AdminDashboard): void {
 
 // Team-wide spread across places and subjects. The backend sends metadata only,
 // never browsing history or attachments, alongside the existing admin rows.
+// Tasks authored before the metadata fields shipped carry none, so an empty
+// result says so plainly rather than drawing an empty chart, which would read as
+// "nobody is filling the fields in" when the truth is "these tasks predate them".
 export function teamDistribution(items: readonly AdminSubmission[]): HTMLElement {
-  const authored = items.map((item) => item.final?.metadata ?? item.original.metadata ?? {});
+  // The backend sends the resolved value beside the snapshots as task_metadata
+  // and also stamps it onto each snapshot. Read the resolved field first and
+  // fall back to the snapshots so a row from either shape counts once, with
+  // final gold winning over the author's pick.
+  const authored = items.map(
+    (item) => item.task_metadata ?? item.final?.metadata ?? item.original?.metadata ?? {}
+  );
   const summary = summarizeDistribution(authored);
   const panel = el(
     "section",
@@ -275,7 +394,8 @@ export function teamDistribution(items: readonly AdminSubmission[]): HTMLElement
       el(
         "p",
         { class: "muted" },
-        "No region or subject data has been recorded yet."
+        "No region or subject data has been recorded yet. Both are collected and required on every new task, so this fills in as tasks authored since those fields shipped come through."
+
       )
     );
     return panel;
@@ -297,6 +417,130 @@ export function teamDistribution(items: readonly AdminSubmission[]): HTMLElement
       ? [el("p", { class: "muted small" }, `Based on ${summary.labelled} of ${items.length} submissions; the rest predate these fields.`)]
       : [])
   );
+  return panel;
+}
+
+const REASON_CLUSTER_LIMIT = 8;
+const REASON_DISPLAY_LIMIT = 80;
+const COACHING_RATE_THRESHOLD = 0.3;
+// Below this a reviewer's rates are noise, not a signal worth acting on.
+const MIN_REVIEWS_TO_CALIBRATE = 10;
+
+export function cohortSteering(items: readonly AdminSubmission[], users: readonly AdminUserSummary[]): HTMLElement {
+  const panel = el(
+    "section",
+    { class: "stat-group cohort-steering" },
+    el("h3", null, "Cohort steering")
+  );
+
+  const clusters = rejectionReasonClusters(items);
+  const reasons = el("div", { class: "stat-group cohort-reasons" }, el("h3", null, "Rejection reason clusters"));
+  if (!clusters.length) {
+    reasons.append(el("p", { class: "muted" }, "No rejected tasks — nothing to steer on yet."));
+  } else {
+    const top = clusters.slice(0, REASON_CLUSTER_LIMIT);
+    const max = Math.max(1, ...top.map((cluster) => cluster.count));
+    for (const cluster of top) {
+      const label =
+        cluster.reason.length > REASON_DISPLAY_LIMIT
+          ? `${cluster.reason.slice(0, REASON_DISPLAY_LIMIT - 1)}…`
+          : cluster.reason;
+      const fill = el("span", { class: "stat-fill" });
+      fill.style.width = `${(cluster.count / max) * 100}%`;
+      reasons.append(
+        el(
+          "div",
+          { class: "cohort-reason-row" },
+          el("div", { class: "cohort-reason-label", title: cluster.reason }, label),
+          el(
+            "div",
+            { class: "stat-row" },
+            el("span", { class: "stat-track" }, fill),
+            el("span", { class: "stat-val mono" }, String(cluster.count))
+          )
+        )
+      );
+    }
+    if (clusters.length > REASON_CLUSTER_LIMIT) {
+      reasons.append(el("p", { class: "muted small" }, `Top ${REASON_CLUSTER_LIMIT} of ${clusters.length} distinct reasons.`));
+    }
+  }
+
+  const flagged = authorRejectionRates(users).filter((row) => row.rate > COACHING_RATE_THRESHOLD);
+  const authors = el(
+    "div",
+    { class: "stat-group cohort-authors" },
+    el("h3", null, "Authors to coach"),
+    el("p", { class: "field-hint" }, "Flagged when more than 30% of finished reviews are rejections.")
+  );
+  if (!flagged.length) {
+    authors.append(el("p", { class: "muted" }, "No authors currently need coaching flagging."));
+  } else {
+    for (const row of flagged) {
+      const identity = row.email ? `${row.name} · ${row.email}` : row.name;
+      authors.append(
+        el(
+          "div",
+          { class: "cohort-author-row" },
+          el(
+            "div",
+            { class: "cohort-author-head" },
+            el("span", { class: "chip tag review-chip" }, "review"),
+            el("span", { class: "cohort-author-name", title: identity }, identity)
+          ),
+          el("p", { class: "muted small mono" }, `${row.approved} approved · ${row.rejected} rejected · ${pct(row.rate)}`)
+        )
+      );
+    }
+  }
+
+  panel.append(el("div", { class: "stat-cols" }, reasons, authors));
+
+  // Reviewers, on the same footing as authors. A high rejection rate is not by
+  // itself a problem — the strictest reviewers are also the slowest — so the
+  // row leads with the two numbers that do separate care from speed.
+  const calibration = reviewerCalibration(items).filter((row) => row.reviewed >= MIN_REVIEWS_TO_CALIBRATE);
+  const reviewers = el(
+    "div",
+    { class: "stat-group cohort-reviewers" },
+    el("h3", null, "Reviewer calibration"),
+    el(
+      "p",
+      { class: "field-hint" },
+      `Reviewers with at least ${MIN_REVIEWS_TO_CALIBRATE} finished reviews. "Rushed" is under ${RUSHED_REVIEW_MINUTES} minutes on the task; "terse" is a rejection reason too short for the author to act on.`
+    )
+  );
+  if (!calibration.length) {
+    reviewers.append(el("p", { class: "muted" }, "Not enough finished reviews to calibrate anyone yet."));
+  } else {
+    for (const row of calibration) {
+      const concerns: string[] = [];
+      if (row.rushedShare > 0.5) concerns.push("rushing");
+      if (row.terseShare > 0.5) concerns.push("terse rejections");
+      reviewers.append(
+        el(
+          "div",
+          { class: `cohort-author-row ${concerns.length ? "flagged" : ""}`.trim() },
+          el(
+            "div",
+            { class: "cohort-author-head" },
+            el("span", { class: "chip tag review-chip" }, concerns.length ? concerns.join(" · ") : "ok"),
+            el("span", { class: "cohort-author-name", title: row.reviewer }, row.reviewer)
+          ),
+          el(
+            "p",
+            { class: "muted small mono" },
+            `${row.reviewed} reviewed · ${pct(row.rejectionRate)} rejected · ` +
+              (row.medianMinutes == null
+                ? "no timing yet"
+                : `${row.medianMinutes} min median · ${pct(row.rushedShare)} rushed`) +
+              (row.rejected ? ` · ${pct(row.terseShare)} terse` : "")
+          )
+        )
+      );
+    }
+  }
+  panel.append(reviewers);
   return panel;
 }
 

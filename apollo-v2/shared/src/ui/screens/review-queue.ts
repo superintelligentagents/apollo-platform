@@ -172,6 +172,29 @@ export function renderReviewQueue(ctx: Ctx): HTMLElement {
           el("div", { class: "queue-tile" }, el("strong", null, String(counts.approved ?? counts.finished - (counts.rejected ?? 0))), el("span", null, "approved")),
           el("div", { class: "queue-tile" }, el("strong", null, String(counts.rejected ?? 0)), el("span", null, "rejected"))
         ),
+        ...(counts.own_awaiting_signoff
+          ? [
+              el(
+                "div",
+                { class: "card signoff-callout" },
+                el("h3", null, "Your tasks are waiting on you"),
+                el(
+                  "p",
+                  { class: "muted", style: "margin:4px 0 10px" },
+                  `${counts.own_awaiting_signoff} of your approved task${counts.own_awaiting_signoff === 1 ? " has" : "s have"} been through review and ${counts.own_awaiting_signoff === 1 ? "is" : "are"} waiting for you to sign off. You can accept the reviewer's version or make your own final.`
+                ),
+                el(
+                  "button",
+                  {
+                    class: "btn primary",
+                    type: "button",
+                    onclick: () => ctx.actions.goto("my-tasks"),
+                  },
+                  "Go to My tasks"
+                )
+              ),
+            ]
+          : []),
         ...(counts.own_pending
           ? [
               el(
