@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  finalGoldTaskFromAuthorEdit,
   excludeOwnSubmissions,
   excludeIneligible,
   authorEditEligibility,
@@ -1243,8 +1244,13 @@ test("the author history is ordered, and names a reviewer only on an approval", 
       {
         created_at: "2026-08-22T09:10:00Z",
         appeal_of_sub_key: "older",
+        appeal_submission: true,
         appeal_started_at: "2026-08-22T09:00:00Z",
       },
+      // A later edit of that same appeal, still in the queue. It inherits
+      // appeal_of_sub_key so routing keeps working, and must not read as a
+      // second appeal.
+      { created_at: "2026-08-22T09:30:00Z", appeal_of_sub_key: "older" },
     ],
     doneRecords: [
       { outcome: "rejected", reviewer: "Dana", completed_at: "2026-08-21T09:00:00Z" },
@@ -1258,11 +1264,11 @@ test("the author history is ordered, and names a reviewer only on an approval", 
 
   assert.deepEqual(
     history.map((entry) => entry.event),
-    ["submitted", "rejected", "appealed", "approved", "amended"]
+    ["submitted", "rejected", "appealed", "revised", "approved", "amended"]
   );
   // The rejection reaches the author with no name on it; the approval does not.
   assert.equal(history[1].by, "");
-  assert.equal(history[3].by, "Eli");
+  assert.equal(history[4].by, "Eli");
   // The appeal carries how long the author spent revising.
   assert.equal(history[2].minutes, 10);
 });
@@ -1290,4 +1296,63 @@ test("an amendment that changes nothing produces the same content hash as the ap
 
   const edited = { ...unchanged, task: { ...existing.task, agent_request: "Author rewrote this." } };
   assert.notEqual(reviewContentHash(edited), reviewContentHash(asSubmitted));
+});
+
+test("an amendment keeps the fields no author form exposes, and hashes like an approval", () => {
+  // The shape /review/submit writes. site_scope is derived from the author's
+  // journeys and read by quality scoring, but no author-facing form has it.
+  const approvedTask = {
+    task_title: "Compare rail routes",
+    agent_request: "Compare routes across three carriers.",
+    difficulty: "high",
+    site_scope: ["seat61.com", "trainline.com"],
+    success_criteria: ["A criterion"],
+    must_visit_or_reach: [],
+    required_outputs: [],
+    notes: null,
+    metadata: { region: "GB", subjects: ["Travel and Tourism > Rail"] },
+    steps: [{ order: 1, title: "One", description: "first" }],
+  };
+  // What the author's amend form can actually send back.
+  const fromForm = {
+    task_title: approvedTask.task_title,
+    agent_request: approvedTask.agent_request,
+    difficulty: "high",
+    success_criteria: approvedTask.success_criteria,
+    must_visit_or_reach: [],
+    required_outputs: [],
+    notes: null,
+    steps: approvedTask.steps,
+  };
+
+  const amended = finalGoldTaskFromAuthorEdit(approvedTask, fromForm);
+  assert.deepEqual(amended.site_scope, ["seat61.com", "trainline.com"]);
+  assert.deepEqual(amended.metadata, approvedTask.metadata);
+  // Same keys in the same order, so an amendment that changed nothing hashes
+  // identically and does not burn a revision.
+  assert.deepEqual(Object.keys(amended), Object.keys(approvedTask));
+  assert.equal(reviewContentHash(amended), reviewContentHash(approvedTask));
+
+  // A real edit still moves the hash.
+  const edited = finalGoldTaskFromAuthorEdit(approvedTask, { ...fromForm, agent_request: "Rewritten." });
+  assert.notEqual(reviewContentHash(edited), reviewContentHash(approvedTask));
+  // ...and an author who does set metadata overrides the carried value.
+  const reTagged = finalGoldTaskFromAuthorEdit(approvedTask, { ...fromForm, metadata: { region: "FR", subjects: [] } });
+  assert.deepEqual(reTagged.metadata, { region: "FR", subjects: [] });
+});
+
+test("the standing amendment appears in the author's timeline, not just replaced ones", () => {
+  const history = buildAuthorHistory({
+    revisions: [{ first: true, created_at: "2026-08-20T09:00:00Z" }],
+    doneRecords: [{ outcome: "approved", reviewer: "Eli", completed_at: "2026-08-21T09:00:00Z" }],
+    // What has already been superseded: the reviewer's version, which the done
+    // record above already covers, so it is not repeated.
+    finalGoldHistory: [{ source: "reviewer", by: "Eli", at: "2026-08-21T09:00:00Z" }],
+    // What is standing as final gold right now. It is not in the array above,
+    // because that array holds only what has been replaced.
+    currentAmendment: { amended_by: "alice", amended_at: "2026-08-22T09:00:00Z" },
+  });
+
+  assert.deepEqual(history.map((entry) => entry.event), ["submitted", "approved", "amended"]);
+  assert.equal(history.at(-1).by, "alice");
 });

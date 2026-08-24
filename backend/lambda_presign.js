@@ -1892,7 +1892,12 @@ async function ownAwaitingSignoff(finishedKeys, reviewerPid) {
     const encoded = object.Key.slice(AUTHOR_SIGNOFF_PREFIX.length).replace(/\.json$/, "");
     try {
       const subKey = fromB64url(encoded);
-      if (participantIdFromSubKey(subKey) === pid) signedTaskIds.add(subKey);
+      // Match the same population `own` counts: v2 tasks belonging to this
+      // author. Counting their PC receipts here too would subtract sign-offs
+      // that were never in the total and undercount the badge.
+      if (participantIdFromSubKey(subKey) === pid && subKey.includes("/v2/")) {
+        signedTaskIds.add(subKey);
+      }
     } catch {
       /* malformed receipt key — not addressable by any caller */
     }
@@ -1905,10 +1910,10 @@ async function ownAwaitingSignoff(finishedKeys, reviewerPid) {
 // Order a task's events for the author. Pure so the ordering and the identity
 // rules are testable without S3: `by` is carried on approvals and returns and
 // on the author's own actions, and is never set for a rejection.
-export function buildAuthorHistory({ revisions, doneRecords, finalGoldHistory }) {
+export function buildAuthorHistory({ revisions, doneRecords, finalGoldHistory, currentAmendment }) {
   const entries = [];
   for (const revision of revisions ?? []) {
-    const appeal = Boolean(revision.appeal_of_sub_key);
+    const appeal = Boolean(revision.appeal_submission);
     const startedAt = revision.appeal_started_at ?? revision.edit_started_at ?? null;
     entries.push({
       at: revision.created_at ?? "",
@@ -1931,9 +1936,23 @@ export function buildAuthorHistory({ revisions, doneRecords, finalGoldHistory })
       note: "",
     });
   }
+  // Superseded versions the author wrote. The reviewer's own approval is
+  // already covered by the done record, so it is skipped here.
   for (const record of finalGoldHistory ?? []) {
     if (record.source !== "author") continue;
     entries.push({ at: record.at ?? "", event: "amended", by: record.by ?? "", minutes: null, note: "" });
+  }
+  // The amendment currently standing as final gold. It is not in the history
+  // array — that array holds what has been replaced — so without this the
+  // author's most recent edit is the one thing missing from their timeline.
+  if (currentAmendment?.amended_at) {
+    entries.push({
+      at: currentAmendment.amended_at,
+      event: "amended",
+      by: currentAmendment.amended_by ?? "",
+      minutes: null,
+      note: "",
+    });
   }
   return entries
     .filter((entry) => entry.at)
@@ -1947,9 +1966,10 @@ export function buildAuthorHistory({ revisions, doneRecords, finalGoldHistory })
 async function authorTaskHistory(subKey) {
   const unit = reviewUnitForKey(subKey);
   // Deliberately not loadReviewIndex: this runs every time an author expands a
-  // row, and the index lists three prefixes in full. Only this unit's done
-  // records are needed, and their keys decode to the submission they belong to,
-  // so one listing answers it.
+  // row, and the index lists inbox/, done/ and locks/ in full. Only this unit's
+  // done records are needed, and their keys decode to the submission they belong
+  // to, so the done/ listing alone answers it. That listing is still whole-bucket
+  // and is the remaining cost on this path.
   const [objects, doneObjects] = await Promise.all([
     listAllObjects(`${unit}/`),
     listAllObjects(`${REVIEW_PREFIX}done/`),
@@ -1981,6 +2001,7 @@ async function authorTaskHistory(subKey) {
     revisions,
     doneRecords,
     finalGoldHistory: Array.isArray(finished?.history) ? finished.history : [],
+    currentAmendment: finished?.amended_at ? finished : null,
   });
 }
 
@@ -2696,6 +2717,32 @@ export function finalGoldRevision(finished) {
 // History is bounded tighter than buildPCAdminEdit's 19: entries hold whole
 // task bodies, against the 512KB cap /review/submit enforces.
 const FINAL_GOLD_HISTORY_LIMIT = 10;
+// Final gold has one shape, written by /review/submit. An author amendment has
+// to produce that same shape, in that same key order, or two things break: the
+// fields their form cannot edit are silently dropped from the gold record, and
+// reviewContentHash — which hashes JSON.stringify output, so key order counts —
+// never matches, meaning a save that changed nothing still burns a revision.
+//
+// site_scope is the field that made this concrete: the app derives it from the
+// author's journeys and quality scoring reads it, but no author-facing form has
+// ever exposed it. Carried over from the version being replaced, along with
+// metadata, unless the author supplied a value.
+export function finalGoldTaskFromAuthorEdit(existingTask, safeTask) {
+  const metadata = safeTask.metadata ?? existingTask?.metadata ?? null;
+  return {
+    task_title: safeTask.task_title,
+    agent_request: safeTask.agent_request,
+    difficulty: safeTask.difficulty,
+    site_scope: Array.isArray(existingTask?.site_scope) ? existingTask.site_scope.slice(0, 30) : [],
+    success_criteria: safeTask.success_criteria,
+    must_visit_or_reach: safeTask.must_visit_or_reach,
+    required_outputs: safeTask.required_outputs,
+    notes: safeTask.notes,
+    ...(metadata ? { metadata } : {}),
+    steps: safeTask.steps,
+  };
+}
+
 // `contentHash` must be derived the same way /review/submit derives it, so the
 // field keeps one meaning. The POST_QC gate does not read it — that gate keys on
 // reportingTaskContentHash over the snapshots, which changes on its own when the
@@ -2773,7 +2820,10 @@ function buildHumanReviewForAuthor(finished, source) {
 // Deliberately carries no identity: an author gets the substance of why the
 // task was rejected, not who rejected it.
 function buildRejectionFeedbackForAuthor(rejected, source) {
-  if (!rejected || typeof rejected !== "object" || !rejected.review) return null;
+  // Require rubrics the reviewer actually wrote. cleanRubrics falls back to the
+  // task's own steps when a review carries none, which would present the
+  // author's own text back to them as reviewer feedback.
+  if (!Array.isArray(rejected?.review?.rubrics) || !rejected.review.rubrics.length) return null;
   const original = cleanTaskSnapshot(source?.task ?? source);
   if (!original) return null;
   const rubrics = cleanRubrics(rejected.review, original, null);
@@ -2840,7 +2890,10 @@ async function handleReview(path, body) {
       pending: eligible.length,
       claimable,
       awaiting_live_audit: allEligible.length - eligible.length,
-      own_pending: pending.length - allEligible.length,
+      // Only the caller's own submissions, computed on its own: allEligible now
+      // also drops appeals of tasks they rejected, and attributing that to
+      // "your own submissions" would overstate it.
+      own_pending: pending.length - excludeOwnSubmissions(pending, reviewerPid).length,
       rejected,
       // How many of the caller's own approved tasks are still waiting for them
       // to sign off. Derived from the two listings above plus one more, with no
@@ -2872,11 +2925,14 @@ async function handleReview(path, body) {
 
   if (path === "/review/claim") {
     if (!reviewer) return respond(400, { error: "reviewer required" });
-    const { pending, lockSet, inboxAge, counts } = await queueState();
+    const [{ pending, lockSet, inboxAge, counts }, rejecters] = await Promise.all([
+      queueState(),
+      appealRejecters(),
+    ]);
     // Never hand a reviewer their own submission, nor an appeal of a task they
     // rejected themselves (server-side authoritative — the client-side filter
     // is only cosmetic).
-    const allEligible = excludeIneligible(pending, reviewerPid, await appealRejecters());
+    const allEligible = excludeIneligible(pending, reviewerPid, rejecters);
     const audited = await completedPreQcSubmissionKeys(allEligible);
     const eligible = allEligible.filter((key) => audited.has(key));
     // Try unlocked tasks first, oldest first; then stale-lock takeovers.
@@ -3100,7 +3156,14 @@ async function handleReview(path, body) {
     // rebuilds every row field by field under the same caps the approval path
     // uses, and yields [] when the client sent nothing usable.
     const rejectionRubrics = cleanRubrics(body.review, null, null);
-    const sanitizedRejectionReview = rejectionRubrics.length ? { rubrics: rejectionRubrics } : null;
+    let sanitizedRejectionReview = rejectionRubrics.length ? { rubrics: rejectionRubrics } : null;
+    // cleanRubrics caps row count and titles but leaves the text itself
+    // unbounded, and unlike /review/submit this path had no size check at all.
+    // The object is read back on every my-tasks row, so an oversized one is a
+    // cost every page load pays. Feedback is dropped, never the rejection.
+    if (sanitizedRejectionReview && JSON.stringify(sanitizedRejectionReview).length > 256 * 1024) {
+      sanitizedRejectionReview = null;
+    }
     const rejId = String(task_id || "task-unknown").replace(/[^A-Za-z0-9_-]/g, "_");
     const rejectedKey = `${REVIEW_PREFIX}rejected/${rejId}_${createHash("sha256").update(sub_key).digest("hex").slice(0, 16)}.json`;
     const contentHash = reviewContentHash({ task_id: rejId, reason: rejectionReason.slice(0, 500) });
@@ -3452,11 +3515,22 @@ async function handleReview(path, body) {
     // How long the author spent on this revision. Stored as the pair of stamps
     // the reporting layer derives minutes from, never as a client-sent duration.
     const editStartedAt = cleanText(body.edit_started_at, 60) || null;
+    // Stage stamps are per revision. The spread above copies the previous
+    // revision's, so a client that sends none would otherwise pair a stale start
+    // with this revision's created_at and report a fabricated duration.
+    delete newSubmission.edit_started_at;
+    delete newSubmission.appeal_started_at;
     if (editStartedAt) {
       newSubmission[eligibility.appeal ? "appeal_started_at" : "edit_started_at"] = editStartedAt;
     }
     // The rejection this revision answers, so the author's own screen and the
     // reporting feed can tell an appeal apart from an ordinary revision.
+    //
+    // Carried forward, not recomputed: only the revision made directly from the
+    // rejection sees outcome "rejected". Once it is in the queue the author can
+    // keep editing, and each of those revisions looks like an ordinary pending
+    // edit — so without inheriting this, a second edit would drop the marker and
+    // hand the appeal straight back to the reviewer who rejected it.
     let rejectedByPid = "";
     if (eligibility.appeal) {
       const rejectedDoc = newestDone?.target
@@ -3465,6 +3539,17 @@ async function handleReview(path, body) {
       rejectedByPid = cleanText(rejectedDoc?.rejected_by_pid, 80) || "";
       newSubmission.appeal_of_sub_key = newest;
       newSubmission.appeal_number = rejectionCount;
+      // Only this revision is the appeal itself. appeal_of_sub_key rides along
+      // on later edits so routing keeps working, so the timeline needs its own
+      // marker or every subsequent edit would read as another appeal.
+      newSubmission.appeal_submission = true;
+    } else if (original.appeal_of_sub_key) {
+      rejectedByPid = (await readJson(appealKeyFor(newest))
+        .then(({ json }) => cleanText(json?.rejected_by_pid, 80))
+        .catch(() => "")) || "";
+      newSubmission.appeal_of_sub_key = original.appeal_of_sub_key;
+      newSubmission.appeal_number = Number(original.appeal_number) || 1;
+      delete newSubmission.appeal_submission;
     }
     if (JSON.stringify(newSubmission).length > 512 * 1024) {
       return respond(400, { error: "edited payload too large (512KB max)" }, { "Cache-Control": "no-store" });
@@ -3503,14 +3588,14 @@ async function handleReview(path, body) {
     // A small side marker the claim path reads, so an appeal is never offered
     // back to the reviewer who rejected it. Kept out of the submission body:
     // /review/claim would otherwise have to read every candidate task to route.
-    if (eligibility.appeal) {
+    if (newSubmission.appeal_of_sub_key) {
       await s3
         .send(new PutObjectCommand({
           Bucket: S3_BUCKET,
           Key: appealKeyFor(newSubKey),
           Body: JSON.stringify({
             sub_key: newSubKey,
-            appeal_of: newest,
+            appeal_of: newSubmission.appeal_of_sub_key,
             rejected_by_pid: rejectedByPid,
             created_at: revisedAt,
           }),
@@ -3526,7 +3611,7 @@ async function handleReview(path, body) {
         new_sub_key: newSubKey,
         new_content_hash: newContentHash,
         status: "awaiting_codex",
-        appeal: Boolean(eligibility.appeal),
+        appeal: Boolean(newSubmission.appeal_of_sub_key),
       },
       { "Cache-Control": "no-store" }
     );
@@ -3546,7 +3631,13 @@ async function handleReview(path, body) {
     if (participantIdFromSubKey(sub_key) !== participantId) {
       return respond(403, { error: "You can only sign off your own tasks" }, { "Cache-Control": "no-store" });
     }
-    const done = await readDoneRecord(sub_key);
+    // Keyed on the unit's newest submission, not on whatever sub_key the client
+    // held: /review/my-tasks decides needs_signoff against `newest`, so a receipt
+    // written under a stale key would leave the row in the queue forever.
+    const unit = reviewUnitForKey(sub_key);
+    const { byTaskDir } = await loadReviewIndex();
+    const newest = byTaskDir.get(unit)?.newest ?? sub_key;
+    const done = await readDoneRecord(newest);
     if (doneOutcome(done) !== "approved") {
       return respond(409, { error: "Only an approved task can be signed off." }, { "Cache-Control": "no-store" });
     }
@@ -3555,7 +3646,7 @@ async function handleReview(path, body) {
       : null;
     const signedOffAt = new Date().toISOString();
     const receipt = {
-      sub_key,
+      sub_key: newest,
       task_id: cleanText(done?.task_id, 300),
       participant_id: participantId,
       action: "accepted",
@@ -3567,7 +3658,7 @@ async function handleReview(path, body) {
     };
     const created = await tryConditionalWrite(() => s3.send(new PutObjectCommand({
       Bucket: S3_BUCKET,
-      Key: authorSignoffKeyFor(sub_key),
+      Key: authorSignoffKeyFor(newest),
       Body: JSON.stringify(receipt, null, 2),
       ContentType: "application/json",
       IfNoneMatch: "*",
@@ -3575,7 +3666,7 @@ async function handleReview(path, body) {
     if (!created) {
       // Already signed off. A repeat click, or a retry that lost its response —
       // either way the existing receipt stands rather than being overwritten.
-      const existing = await readJson(authorSignoffKeyFor(sub_key))
+      const existing = await readJson(authorSignoffKeyFor(newest))
         .then(({ json }) => json)
         .catch(() => null);
       return respond(
@@ -3629,14 +3720,15 @@ async function handleReview(path, body) {
     if (!existing || !etag) {
       return respond(404, { error: "Final gold not found" }, { "Cache-Control": "no-store" });
     }
+    const amendedTask = finalGoldTaskFromAuthorEdit(existing.task, safeTask);
     // Hashed the same way /review/submit hashes final gold, over the same
-    // fields. Deriving it differently here would leave two incompatible values
-    // living in one field, and would break the no-op check below.
+    // fields in the same order. Deriving it differently here would leave two
+    // incompatible values in one field and break the no-op check below.
     const contentHash = reviewContentHash({
       schema_version: existing.schema_version,
       task_id: existing.task_id,
       mode: existing.mode,
-      task: safeTask,
+      task: amendedTask,
       review: existing.review ?? {},
     });
     // Nothing actually changed: report success without burning a revision.
@@ -3650,7 +3742,7 @@ async function handleReview(path, body) {
     const amendedAt = new Date().toISOString();
     const doc = buildAmendedFinalGold({
       existing,
-      amendedTask: safeTask,
+      amendedTask,
       contentHash,
       authorPid: participantId,
       amendedAt,
@@ -3662,15 +3754,24 @@ async function handleReview(path, body) {
     // concurrent amendments cannot both claim the same revision number; the
     // replace is an If-Match on the version that was archived, so neither can
     // overwrite the other's result.
+    const archiveKey = finishedHistoryKeyFor(done.task_id || "task-unknown", finalGoldRevision(existing));
     const archived = await tryConditionalWrite(() => s3.send(new PutObjectCommand({
       Bucket: S3_BUCKET,
-      Key: finishedHistoryKeyFor(done.task_id || "task-unknown", finalGoldRevision(existing)),
+      Key: archiveKey,
       Body: JSON.stringify(existing, null, 2),
       ContentType: "application/json",
       IfNoneMatch: "*",
     })));
     if (!archived) {
-      return respond(409, { error: "Another amendment of this task is already in flight." }, { "Cache-Control": "no-store" });
+      // An archive already exists for this revision. Either another amendment is
+      // mid-flight, or an earlier attempt archived and then failed to replace —
+      // a timeout or a throttle — which would otherwise wedge this task at 409
+      // forever, since every retry recomputes the same key. Resume when the
+      // archived copy is the version being replaced; refuse only when it is not.
+      const archivedDoc = await readJson(archiveKey).then(({ json }) => json).catch(() => null);
+      if (archivedDoc?.review_content_hash !== existing.review_content_hash) {
+        return respond(409, { error: "Another amendment of this task is already in flight." }, { "Cache-Control": "no-store" });
+      }
     }
     const replaced = await tryConditionalWrite(() => s3.send(new PutObjectCommand({
       Bucket: S3_BUCKET,
@@ -3688,9 +3789,9 @@ async function handleReview(path, body) {
     await s3
       .send(new PutObjectCommand({
         Bucket: S3_BUCKET,
-        Key: authorSignoffKeyFor(sub_key),
+        Key: authorSignoffKeyFor(newest),
         Body: JSON.stringify({
-          sub_key,
+          sub_key: newest,
           task_id: cleanText(done?.task_id, 300),
           participant_id: participantId,
           action: "amended",
