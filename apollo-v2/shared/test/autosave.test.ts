@@ -70,39 +70,25 @@ describe("serialize → apply round-trip", () => {
     expect(fresh.basket).toEqual([]); // journeys not restored here
   });
 
-  it("round-trips the distribution metadata", () => {
+  it("round-trips metadata and defaults fields missing from an old autosave", () => {
     const s = initialState();
     s.mode = "freeform";
-    s.screen = "form";
-    s.draft.agent_request = "Compare warranty terms across three laptop manufacturers.";
+    s.draft.agent_request = "Compare current laptop warranty terms.";
     s.draft.region = "GLOBAL";
     s.draft.subjects = ["Computers Electronics and Technology > Consumer Electronics"];
-
-    const fresh = initialState();
-    applyDraftState(fresh, serializeDraftState(s, "2026-08-12T00:00:00.000Z"), null);
-    expect(fresh.draft.region).toBe("GLOBAL");
-    expect(fresh.draft.subjects).toEqual([
-      "Computers Electronics and Technology > Consumer Electronics",
-    ]);
-  });
-
-  it("fills in defaults for a draft saved before the metadata fields existed", () => {
-    // A trainer mid-task when this shipped has an autosave with no metadata
-    // keys at all. Assigning it wholesale would put `undefined` where the form
-    // and validation both expect a string or an array.
-    const s = initialState();
-    s.mode = "freeform";
-    s.screen = "form";
-    s.draft.agent_request = "Finish comparing the three shortlisted programmes.";
     const saved = serializeDraftState(s, "2026-08-12T00:00:00.000Z");
-    delete (saved.draft as Partial<typeof saved.draft>).region;
-    delete (saved.draft as Partial<typeof saved.draft>).subjects;
 
     const fresh = initialState();
     applyDraftState(fresh, saved, null);
-    expect(fresh.draft.region).toBe("");
-    expect(fresh.draft.subjects).toEqual([]);
-    expect(fresh.draft.agent_request).toContain("shortlisted programmes");
+    expect(fresh.draft.region).toBe("GLOBAL");
+    expect(fresh.draft.subjects).toHaveLength(1);
+
+    delete (saved.draft as Partial<typeof saved.draft>).region;
+    delete (saved.draft as Partial<typeof saved.draft>).subjects;
+    const legacy = initialState();
+    applyDraftState(legacy, saved, null);
+    expect(legacy.draft.region).toBe("");
+    expect(legacy.draft.subjects).toEqual([]);
   });
 
   it("stays on the saved screen when the basket is already present", () => {

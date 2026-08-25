@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import tempfile
 import unittest
@@ -98,6 +99,8 @@ def quality_review(task: pipeline.Task, overall: str = "PASS") -> dict:
                 "verdict": "PASS",
                 "summary": "This step is in scope and fair to evaluate.",
                 "issues": [],
+                "request_support": [task.prompt[:300]],
+                "introduced_requirements": [],
             }
             for rubric in task.rubrics
         ],
@@ -577,8 +580,8 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("Do not add an unstated requirement", manager)
         self.assertIn("upcoming viable value", manager)
 
-    def test_v19_uses_source_flexibility_and_thorpe_park_regression_rule(self) -> None:
-        self.assertEqual(pipeline.PIPELINE_VERSION, "apollo-llm-feasibility-v19")
+    def test_v22_uses_source_flexibility_and_thorpe_park_regression_rule(self) -> None:
+        self.assertEqual(pipeline.PIPELINE_VERSION, "apollo-llm-feasibility-v22")
         worker = (pipeline.PROMPT_DIR / "rubric_worker.md").read_text(encoding="utf-8")
         manager = (pipeline.PROMPT_DIR / "manager.md").read_text(encoding="utf-8")
         verifier = (pipeline.PROMPT_DIR / "rubric_repair_verifier.md").read_text(encoding="utf-8")
@@ -684,7 +687,51 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("aligned with the original request", prompt)
         self.assertIn("asked for or is reasonably in scope", prompt)
         self.assertIn("fair to evaluate", prompt)
+        self.assertIn("request_support", prompt)
+        self.assertIn("introduced_requirements", prompt)
+        self.assertIn("never mentions CryptPad", prompt)
         self.assertNotIn("difficulty rating", prompt)
+
+    def test_quality_gate_rejects_unrequested_named_app_even_when_model_says_pass(self) -> None:
+        task = pipeline.Task(
+            "alignment-cryptpad",
+            "Research the trip and prepare a clear day-by-day itinerary.",
+            (
+                pipeline.Rubric("R1", "Research the available flights and hotels."),
+                pipeline.Rubric("R2", "Create the final itinerary in a new CryptPad document."),
+            ),
+        )
+        review = quality_review(task)
+        self.assertEqual(pipeline.unrequested_named_requirements(task, task.rubrics[1]), ("CryptPad",))
+        with self.assertRaisesRegex(pipeline.PipelineError, "unrequested named requirement: CryptPad"):
+            pipeline.validate_quality_review(review, task)
+
+        enforced = pipeline.enforce_named_requirement_alignment(review, task)
+        self.assertEqual(enforced["rubric_assessments"][1]["verdict"], "FAIL")
+        self.assertEqual(enforced["overall_verdict"], "FAIL")
+        self.assertIn("Require CryptPad", enforced["rubric_assessments"][1]["introduced_requirements"])
+        pipeline.validate_quality_review(enforced, task)
+
+        review["rubric_assessments"][1].update({
+            "verdict": "FAIL",
+            "summary": "This step needs attention because the task does not ask for a CryptPad document.",
+            "issues": ["CryptPad is introduced only in the scored step."],
+            "request_support": ["prepare a clear day-by-day itinerary"],
+            "introduced_requirements": ["Create the final itinerary in CryptPad"],
+        })
+        review["overall_verdict"] = "FAIL"
+        pipeline.validate_quality_review(review, task)
+
+    def test_quality_pass_requires_literal_request_support(self) -> None:
+        task = pipeline.Task(
+            "alignment-proof",
+            "Compare two public train routes and recommend one.",
+            (pipeline.Rubric("R1", "Compare the two train routes."),),
+        )
+        review = quality_review(task)
+        review["rubric_assessments"][0]["request_support"] = ["A paraphrase not in the request"]
+        with self.assertRaisesRegex(pipeline.PipelineError, "quote the task request exactly"):
+            pipeline.validate_quality_review(review, task)
 
     def test_every_model_prompt_requires_plain_reviewer_language(self) -> None:
         prompt = pipeline.render_prompt("rubric_worker.md", {"task_id": "task", "rubric": {}})
@@ -779,6 +826,25 @@ class ValidationTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_task_queue_identity_rejects_cross_app_writes(self) -> None:
+        self.assertTrue(pipeline.task_belongs_to_queue("pc_task-1", "pc"))
+        self.assertFalse(pipeline.task_belongs_to_queue("v2/alice/internal/task-1", "pc"))
+        self.assertTrue(pipeline.task_belongs_to_queue("v2/alice/internal/task-1", "v2"))
+        self.assertFalse(pipeline.task_belongs_to_queue("pc_task-1", "v2"))
+        self.assertTrue(pipeline.task_belongs_to_queue("legacy-task", "v2"))
+
+    def test_pc_queue_resolves_only_pc_qc_prefixes(self) -> None:
+        args = pipeline.make_parser().parse_args([
+            "--input", "fixture.json",
+            "--no-upload",
+            "--plan",
+            "--queue", "pc",
+        ])
+        pipeline.validate_args(args)
+        self.assertEqual(args.s3_pass_prefix, "pc-review/llm_pass")
+        self.assertEqual(args.s3_fail_prefix, "pc-review/llm_fail")
+        self.assertEqual(args.s3_claim_prefix, "pc-review/llm_claims")
+
     def test_cli_cannot_target_source_task_prefixes(self) -> None:
         args = pipeline.make_parser().parse_args([
             "--input", "fixture.json",
@@ -788,7 +854,7 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(pipeline.PipelineError, "source-task prefixes are never writable"):
             pipeline.validate_args(args)
 
-    def test_worker_environment_removes_api_and_aws_secrets(self) -> None:
+    def test_worker_environment_removes_source_and_deployment_secrets(self) -> None:
         scrubbed = pipeline.scrub_worker_environment(
             {
                 "PATH": "/bin",
@@ -796,6 +862,9 @@ class PipelineTests(unittest.TestCase):
                 "AWS_ACCESS_KEY_ID": "aws-secret",
                 "AWS_SESSION_TOKEN": "aws-session",
                 "APOLLO_REPORTING_TOKEN": "reporting-secret",
+                "cloudflare_api_token": "cloudflare-secret",
+                "CMU_BROWSERUSE_REVIEW_KEY": "annotation-secret",
+                "VERCEL_TOKEN": "deployment-secret",
                 "CUSTOM_REPORTING_KEY": "other-secret",
             }
         )
@@ -818,6 +887,32 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("read-only", command)
         self.assertNotIn("web_search", command)
 
+        reasoning_command = pipeline.CodexRunner(
+            dataclasses.replace(config, reasoning_effort="medium")
+        )._command(
+            Path("/schema.json"), Path("/output.json"), Path("/isolated-job"),
+            web_search=True,
+        )
+        self.assertIn('model_reasoning_effort="medium"', reasoning_command)
+
+        bedrock_command = pipeline.CodexRunner(
+            dataclasses.replace(
+                config,
+                model="openai.gpt-5.6-sol",
+                model_provider="amazon-bedrock",
+                aws_region="us-east-1",
+            )
+        )._command(
+            Path("/schema.json"), Path("/output.json"), Path("/isolated-job"),
+            web_search=True,
+        )
+        self.assertIn('model_provider="amazon-bedrock"', bedrock_command)
+        self.assertIn(
+            'model_providers.amazon-bedrock.aws.region="us-east-1"',
+            bedrock_command,
+        )
+        self.assertEqual(bedrock_command[bedrock_command.index("--model") + 1], "openai.gpt-5.6-sol")
+
         browser_command = pipeline.CodexRunner(config)._command(
             Path("/schema.json"), Path("/output.json"), Path("/isolated-job"),
             web_search=False, browser=True,
@@ -825,6 +920,35 @@ class PipelineTests(unittest.TestCase):
         self.assertIn('mcp_servers.playwright.command="npx"', browser_command)
         self.assertTrue(any(f"@playwright/mcp@{pipeline.PLAYWRIGHT_MCP_VERSION}" in arg for arg in browser_command))
         self.assertIn("--ignore-user-config", browser_command)
+
+    def test_immutable_upload_retries_a_transient_aws_failure(self) -> None:
+        config = pipeline.Config(
+            workdir=Path("unused"), workers=1, timeout_seconds=60, retries=0, model=None,
+            codex_bin="codex", upload=True, s3_bucket="private-bucket",
+            s3_pass_prefix="v2-review/llm_pass", s3_fail_prefix="v2-review/llm_fail",
+            s3_claim_prefix="v2-review/llm_claims",
+            aws_profile=None, aws_region=None, lock_stale_seconds=120, browser_escalation=True,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            artifact = Path(temp_dir) / "artifact.json"
+            artifact.write_text("{}", encoding="utf-8")
+            transient = mock.Mock(returncode=1, stdout="", stderr="SlowDown")
+            success = mock.Mock(returncode=0, stdout="{}", stderr="")
+            with (
+                mock.patch.object(pipeline, "s3_existing_metadata", return_value=None),
+                mock.patch.object(pipeline.subprocess, "run", side_effect=[transient, success]) as run,
+                mock.patch.object(pipeline.time, "sleep") as sleep,
+            ):
+                pipeline.upload_immutable(
+                    config,
+                    artifact,
+                    "v2-review/llm_pass/task.hash.v19.json",
+                    "LLM_PASS",
+                    "a" * 64,
+                )
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args.kwargs["timeout"], 60)
+            sleep.assert_called_once()
 
     def test_process_is_resumable_and_writes_pass_key(self) -> None:
         task = pipeline.Task(
@@ -1276,6 +1400,21 @@ class PipelineTests(unittest.TestCase):
             pipeline.artifact_key(config, task, "NEEDS_HUMAN_REVIEW"),
             f"v2-review/llm_fail/{pipeline.base64url(task.task_id)}.{task.task_content_hash}.{pipeline.PIPELINE_VERSION}.json",
         )
+
+    def test_pipeline_error_does_not_upload_or_claim(self) -> None:
+        task = pipeline.Task("error-task", "Prompt", (pipeline.Rubric("R1", "Criterion"),))
+        config = pipeline.Config(
+            workdir=Path("unused"), workers=1, timeout_seconds=60, retries=0, model=None,
+            codex_bin="codex", upload=True, s3_bucket="example-bucket",
+            s3_pass_prefix="v2-review/llm_pass", s3_fail_prefix="v2-review/llm_fail",
+            s3_claim_prefix="v2-review/llm_claims",
+            aws_profile=None, aws_region=None, lock_stale_seconds=120, browser_escalation=True,
+        )
+        with mock.patch.object(pipeline, "upload_immutable") as upload:
+            pipeline.upload_with_decision_claim(
+                config, Path("artifact.json"), task, "PIPELINE_ERROR"
+            )
+        upload.assert_not_called()
 
     def test_pre_qc_uses_isolated_cache_and_storage_prefixes(self) -> None:
         task = pipeline.Task(

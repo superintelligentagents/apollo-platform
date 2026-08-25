@@ -92,8 +92,13 @@ export function renderTrajectoryEdit(ctx: Ctx): HTMLElement {
     submit.disabled = true;
     submit.textContent = "Submitting…";
     try {
-      await trajectorySubmit(state.reviewKey!, ctx.actions.reviewerName(), claim, judgment);
-      ctx.actions.endTrajectoryReview("Trajectory grade saved. Claim another run?");
+      await trajectorySubmit(state.reviewKey!, ctx.actions.reviewerName(), ctx.actions.reviewerPid(), claim, judgment);
+      const message = judgment.trajectory.overall_outcome === "EDIT_NEEDED"
+        ? "Grade saved. A linked revision is waiting for its Codex check, then returns to Review."
+        : judgment.trajectory.overall_outcome === "NEEDS_RERUN"
+          ? "Grade saved. Upload the replacement run when ready; it will return to Grade."
+          : "Trajectory grade saved. Claim another run?";
+      ctx.actions.endTrajectoryReview(message);
     } catch (error) {
       submit.textContent = "Submit grade";
       submit.disabled = !complete();

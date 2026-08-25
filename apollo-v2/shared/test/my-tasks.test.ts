@@ -3,7 +3,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Ctx } from "../src/ui/context";
 import { initialState } from "../src/ui/context";
-import { editModeFor, editSeed, renderMyTasks, setDiffView, signoffProgress, signoffSuffix } from "../src/ui/screens/my-tasks";
+import {
+  approvedReviewChanges,
+  editModeFor,
+  editSeed,
+  filterAndSortMyTasks,
+  renderMyTask,
+  renderMyTasks,
+  resetMyTasksViewState,
+  signoffProgress,
+  signoffSuffix,
+} from "../src/ui/screens/my-tasks";
 import {
   authorAmend,
   authorEdit,
@@ -190,9 +200,7 @@ async function openEditor(root: HTMLElement): Promise<void> {
 
 describe("my tasks screen", () => {
   beforeEach(() => {
-    // The redline/side-by-side choice is module state so it carries across rows
-    // in a session. Reset it so it cannot carry across tests.
-    setDiffView("unified");
+    resetMyTasksViewState();
     vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
       cb(0);
       return 1;
@@ -224,11 +232,99 @@ describe("my tasks screen", () => {
     expect(root.textContent).toContain("Back to home");
   });
 
+  it("opens a task on its own route instead of expanding it inside the list", async () => {
+    mockMyTaskPage.mockResolvedValue(page([item({ title: "Dedicated editor task" })]));
+    const context = ctx();
+    const root = renderMyTasks(context);
+    await flush();
+
+    root.querySelector<HTMLElement>(".admin-submission-summary")!.click();
+
+    expect(context.state.myTaskSelection?.title).toBe("Dedicated editor task");
+    expect(context.actions.goto).toHaveBeenCalledWith("my-task");
+    expect(root.textContent).not.toContain("Loading feedback…");
+  });
+
+  it("renders the selected task and its editor on a dedicated page", async () => {
+    const context = ctx();
+    context.state.myTaskSelection = item({ status: "returned", returned_reason: "Please clarify it." });
+    mockMyTaskFeedback.mockResolvedValue(feedback({ status: "returned", task: currentTask() }));
+
+    const root = renderMyTask(context);
+    expect(root.textContent).toContain("Loading feedback…");
+    await flush();
+
+    expect(mockMyTaskFeedback).toHaveBeenCalledWith("review-key", "author", "s1");
+    expect(root.textContent).toContain("Please clarify it.");
+    expect(btn(root, "Edit task")).toBeTruthy();
+    expect(btn(root, "Back to My Tasks")).toBeTruthy();
+  });
+
   it("shows an empty state when the author has no tasks", async () => {
     mockMyTaskPage.mockResolvedValue(page([]));
     const root = renderMyTasks(ctx());
     await flush();
     expect(root.textContent).toContain("You haven't submitted any tasks yet.");
+  });
+
+  it("searches, filters, clears, and explains an empty result", async () => {
+    mockMyTaskPage.mockResolvedValue(page([
+      item({ task_id: "alpha", sub_key: "alpha", title: "Alpha approved", status: "approved", needs_signoff: true }),
+      item({ task_id: "beta", sub_key: "beta", title: "Beta rejected", status: "rejected", can_appeal: true }),
+      item({ task_id: "gamma", sub_key: "gamma", title: "Gamma pending", status: "pending" }),
+    ]));
+    const root = renderMyTasks(ctx());
+    await flush();
+
+    const visibleTitles = () => Array.from(root.querySelectorAll(".admin-submission-summary strong"))
+      .map((node) => node.textContent);
+    const search = root.querySelector<HTMLInputElement>('input[aria-label="Search my tasks"]')!;
+    const filter = root.querySelector<HTMLSelectElement>('select[aria-label="Filter tasks"]')!;
+    const sort = root.querySelector<HTMLSelectElement>('select[aria-label="Sort tasks"]')!;
+    expect(search).toBeTruthy();
+    expect(filter).toBeTruthy();
+    expect(sort).toBeTruthy();
+
+    search.value = "beta";
+    search.dispatchEvent(new Event("input"));
+    expect(visibleTitles()).toEqual(["Beta rejected"]);
+
+    search.value = "";
+    search.dispatchEvent(new Event("input"));
+    filter.value = "action";
+    filter.dispatchEvent(new Event("change"));
+    expect(visibleTitles()).toEqual(["Alpha approved", "Beta rejected"]);
+
+    search.value = "nothing matches this";
+    search.dispatchEvent(new Event("input"));
+    expect(root.textContent).toContain("No tasks match");
+    btn(root, "Clear filters")!.click();
+    expect(visibleTitles()).toEqual(["Alpha approved", "Beta rejected", "Gamma pending"]);
+  });
+
+  it("loads 200 tasks at a time and remembers a later page across screen rebuilds", async () => {
+    mockMyTaskPage.mockResolvedValue({
+      ...page([item({ title: "Later-page task" })]),
+      source_total: 450,
+      limit: 200,
+    });
+    let root = renderMyTasks(ctx());
+    await flush();
+    expect(mockMyTaskPage).toHaveBeenLastCalledWith("review-key", "author", 0, 200);
+
+    btn(root, "Older")!.click();
+    await flush();
+    expect(mockMyTaskPage).toHaveBeenLastCalledWith("review-key", "author", 200, 200);
+    btn(root, "Older")!.click();
+    await flush();
+    expect(mockMyTaskPage).toHaveBeenLastCalledWith("review-key", "author", 400, 200);
+
+    // Notifications and route changes can recreate the screen. The author's
+    // place survives that rebuild instead of falling back to page one.
+    root = renderMyTasks(ctx());
+    await flush();
+    expect(root.textContent).toContain("Later-page task");
+    expect(mockMyTaskPage).toHaveBeenLastCalledWith("review-key", "author", 400, 200);
   });
 
   it("shows a retry button when the list fails to load", async () => {
@@ -320,122 +416,40 @@ describe("my tasks screen", () => {
     row.dispatchEvent(new Event("toggle"));
     await flush();
 
-    // Default is the unified redline: the reviewer's removals struck through,
-    // their additions marked, in one column.
-    expect(root.querySelector(".my-task-redline")).toBeTruthy();
-    expect(root.querySelector(".admin-snapshots.has-final")).toBeFalsy();
-    const removed = Array.from(root.querySelectorAll("del.redline-del")).map((n) => n.textContent);
-    const added = Array.from(root.querySelectorAll("ins.redline-ins")).map((n) => n.textContent);
-    expect(removed).toContain("Original");
-    expect(added).toContain("Final");
-    expect(root.textContent).toContain("Changed: the title, the request and 1 of 1 step.");
-
-    // Side-by-side is still one click away, and still shows both whole versions.
-    btn(root, "Side-by-side")!.click();
-    await flush();
-    expect(root.querySelector(".admin-snapshots.has-final")).toBeTruthy();
     expect(root.textContent).toContain("Your original");
     expect(root.textContent).toContain("Final gold version");
     expect(root.textContent).toContain("Original title");
     expect(root.textContent).toContain("Final title");
-
-    btn(root, "Redline")!.click();
-    await flush();
-    expect(root.querySelector(".my-task-redline")).toBeTruthy();
+    expect(root.textContent).toContain("3 fields edited");
+    expect(root.textContent).toContain("highlighted changes appear first.");
+    expect(root.querySelectorAll(".my-task-change-field")).toHaveLength(3);
+    expect(root.querySelectorAll("del.diff-del").length).toBeGreaterThan(0);
+    expect(root.querySelectorAll("ins.diff-ins").length).toBeGreaterThan(0);
+    expect(root.querySelector(".my-task-full-compare")).toBeTruthy();
   });
 
-  it("shows a step the reviewer deleted, at the position it used to hold", async () => {
-    mockMyTaskPage.mockResolvedValue(page([item({ status: "approved" })]));
-    mockMyTaskFeedback.mockResolvedValue(
-      feedback({
-        status: "approved",
-        human_review: humanReview({
-          original: {
-            title: "T",
-            request: "R",
-            criteria: [],
-            steps: [
-              { order: 1, title: "Step 1", description: "Keep this." },
-              { order: 2, title: "Step 2", description: "Drop this one." },
-            ],
-          },
-          final: {
-            title: "T",
-            request: "R",
-            criteria: [],
-            steps: [{ order: 1, title: "Step 1", description: "Keep this." }],
-          },
-          // The reviewer spliced step 2 out, so nothing claims source_index 1.
-          rubrics: [
-            { rubric_id: "rubric-1", kind: "step", source_index: 0, title: "Step 1", original: "Keep this.", final: "Keep this.", changed: false, checked: true },
-          ],
-          title_edited: false,
-          request_edited: false,
-        }),
-      })
-    );
-    const root = renderMyTasks(ctx());
-    await flush();
-    await openRow(root);
-
-    const removedRow = root.querySelector(".my-task-redline-row.is-removed");
-    expect(removedRow).toBeTruthy();
-    expect(removedRow!.textContent).toContain("Drop this one.");
-    expect(removedRow!.querySelector("del.redline-del")).toBeTruthy();
-  });
-
-  it("says nothing changed instead of rendering two identical columns", async () => {
-    const same = {
-      title: "Same title",
-      request: "Same request.",
-      criteria: [],
-      steps: [{ order: 1, title: "Step 1", description: "Same step." }],
-    };
-    mockMyTaskPage.mockResolvedValue(page([item({ status: "approved" })]));
-    mockMyTaskFeedback.mockResolvedValue(
-      feedback({
-        status: "approved",
-        human_review: humanReview({
-          original: same,
-          final: same,
-          rubrics: [],
-          title_edited: false,
-          request_edited: false,
-          changed: false,
-        }),
-      })
-    );
-    const root = renderMyTasks(ctx());
-    await flush();
-    await openRow(root);
-
-    expect(root.textContent).toContain("Approved as you wrote it");
-    expect(root.querySelectorAll(".admin-snapshot")).toHaveLength(1);
-    expect(root.querySelectorAll("del.redline-del")).toHaveLength(0);
-    expect(root.querySelectorAll("ins.redline-ins")).toHaveLength(0);
-  });
-
-  it("renders reviewer text as text, never as markup", async () => {
-    mockMyTaskPage.mockResolvedValue(page([item({ status: "approved" })]));
-    mockMyTaskFeedback.mockResolvedValue(
-      feedback({
-        status: "approved",
-        human_review: humanReview({
-          final: {
-            title: "Final title",
-            request: "<script>alert(1)</script>",
-            criteria: [],
-            steps: [{ order: 1, title: "Step 1", description: "Final step." }],
-          },
-        }),
-      })
-    );
-    const root = renderMyTasks(ctx());
-    await flush();
-    await openRow(root);
-
-    expect(root.querySelector("script")).toBeNull();
-    expect(root.textContent).toContain("<script>alert(1)</script>");
+  it("builds a scan-first field list for additions, removals, and step-title edits", () => {
+    const changes = approvedReviewChanges(humanReview({
+      original: {
+        title: "Plan a museum day",
+        request: "Build a museum itinerary.",
+        criteria: ["Include opening hours", "Include ticket prices"],
+        steps: [{ order: 1, title: "Research", description: "Find two museums." }],
+      },
+      final: {
+        title: "Plan a museum day",
+        request: "Build a detailed museum itinerary.",
+        criteria: ["Include current opening hours"],
+        steps: [{ order: 1, title: "Compare museums", description: "Find two museums." }],
+      },
+    }));
+    expect(changes.map((change) => change.label)).toEqual([
+      "Task request",
+      "Success criterion 1",
+      "Success criterion 2",
+      "Step 1 · title",
+    ]);
+    expect(changes[2]).toMatchObject({ before: "Include ticket prices", after: "" });
   });
 
   it("closes the edit form on Cancel, while Remove only drops a step", async () => {
@@ -499,19 +513,21 @@ describe("my tasks screen", () => {
     // message with it — the one case where the reason matters most.
     expect(mockMyTaskPage).toHaveBeenCalledTimes(1);
   });
-  it("names the reviewer on an approved task so the author can go and ask them", async () => {
+  it("keeps approval identity anonymous even if an older payload includes it", async () => {
     mockMyTaskPage.mockResolvedValue(
-      page([item({ status: "approved", reviewed_by: "Dana", reviewer_changed: true, needs_signoff: true })])
+      page([item({ status: "approved", reviewed_by: "Dana", reviewer_changed: true, needs_signoff: true } as never)])
     );
     mockMyTaskFeedback.mockResolvedValue(
-      feedback({ status: "approved", needs_signoff: true, human_review: humanReview({ reviewed_by: "Dana" }) })
+      feedback({ status: "approved", needs_signoff: true, human_review: humanReview({ reviewed_by: "Dana" } as never) })
     );
     const root = renderMyTasks(ctx());
     await flush();
     await openRow(root);
 
-    expect(root.textContent).toMatch(/reviewed by/i);
-    expect(root.textContent).toContain("Dana");
+    expect(root.textContent).toContain("human review");
+    expect(root.textContent).toContain("Approved with edits");
+    expect(root.textContent).not.toMatch(/reviewed by/i);
+    expect(root.textContent).not.toContain("Dana");
   });
 
   it("gives a rejected task the reviewer's step notes and never their name", async () => {
@@ -536,6 +552,13 @@ describe("my tasks screen", () => {
             },
           ],
         },
+        // Even if a malformed backend payload includes names, every reviewer
+        // decision remains anonymous in the author UI.
+        history: [
+          { at: "2026-08-24T11:00:00Z", event: "returned", by: "Dana", minutes: 4, note: "" },
+          { at: "2026-08-24T12:00:00Z", event: "rejected", by: "Dana", minutes: 5, note: "" },
+          { at: "2026-08-24T13:00:00Z", event: "approved", by: "Eli", minutes: 6, note: "" },
+        ],
       })
     );
     const root = renderMyTasks(ctx());
@@ -548,6 +571,7 @@ describe("my tasks screen", () => {
     // The substance reaches the author; the identity behind it does not.
     expect(root.textContent).not.toMatch(/reviewed by/i);
     expect(root.textContent).not.toContain("Dana");
+    expect(root.textContent).not.toContain("Eli");
   });
 
   it("offers one appeal on a rejected task, and none once it is used", async () => {
@@ -571,6 +595,180 @@ describe("my tasks screen", () => {
     await openRow(root);
     expect(btn(root, "Revise and appeal")).toBeFalsy();
     expect(root.textContent).toMatch(/already appealed/i);
+  });
+
+  it("requires an appeal reason and sends it to the fresh reviewer workflow", async () => {
+    mockMyTaskPage.mockResolvedValue(
+      page([item({ status: "rejected", rejection_reason: "The reviewer thought the scope was unclear.", can_appeal: true })])
+    );
+    mockMyTaskFeedback.mockResolvedValue(
+      feedback({ status: "rejected", rejection_reason: "The reviewer thought the scope was unclear.", task: currentTask() })
+    );
+    mockAuthorEdit.mockResolvedValue({
+      ok: true,
+      new_sub_key: "s2",
+      new_content_hash: "hash",
+      status: "awaiting_codex",
+      appeal: true,
+    });
+    const root = renderMyTasks(ctx());
+    await flush();
+    await openRow(root);
+    btn(root, "Revise and appeal")!.click();
+    await flush();
+
+    const reason = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Why should this rejection be reviewed again?"]')!;
+    expect(reason).toBeTruthy();
+    expect(reason.minLength).toBe(20);
+    btn(root, "Send back for another review")!.click();
+    await flush();
+    expect(mockAuthorEdit).not.toHaveBeenCalled();
+    expect(root.textContent).toMatch(/20 characters minimum/i);
+
+    reason.value = "The requested market and verification sources are already explicit in the prompt.";
+    btn(root, "Send back for another review")!.click();
+    await flush();
+    expect(mockAuthorEdit).toHaveBeenCalledTimes(1);
+    expect(mockAuthorEdit.mock.calls[0][5]).toBe(reason.value);
+  });
+
+  it("edits existing step titles and gives a newly added step a custom title during appeal", async () => {
+    const manySteps = currentTask();
+    manySteps.steps = Array.from({ length: 14 }, (_, index) => ({
+      order: index + 1,
+      title: `Original ${index + 1}`,
+      description: `Description ${index + 1}`,
+    }));
+    mockMyTaskPage.mockResolvedValue(
+      page([item({ status: "rejected", rejection_reason: "Clarify the updated steps.", can_appeal: true })])
+    );
+    mockMyTaskFeedback.mockResolvedValue(
+      feedback({ status: "rejected", rejection_reason: "Clarify the updated steps.", task: manySteps })
+    );
+    mockAuthorEdit.mockResolvedValue({
+      ok: true,
+      new_sub_key: "s2",
+      new_content_hash: "hash",
+      status: "awaiting_codex",
+      appeal: true,
+    });
+    const root = renderMyTasks(ctx());
+    await flush();
+    await openRow(root);
+    btn(root, "Revise and appeal")!.click();
+    await flush();
+
+    const s10 = root.querySelector<HTMLInputElement>('input[aria-label="Step 10 title"]')!;
+    const s13 = root.querySelector<HTMLInputElement>('input[aria-label="Step 13 title"]')!;
+    s10.value = "Verify regional eligibility";
+    s10.dispatchEvent(new Event("input"));
+    s13.value = "Compare final evidence";
+    s13.dispatchEvent(new Event("input"));
+
+    btn(root, "+ Add a step")!.click();
+    const s15 = root.querySelector<HTMLInputElement>('input[aria-label="Step 15 title"]')!;
+    expect(s15.value).toBe("");
+    s15.value = "Document exceptions";
+    s15.dispatchEvent(new Event("input"));
+    const s15Description = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Step 15 description"]')!;
+    s15Description.value = "Record each exception and cite the supporting source.";
+    s15Description.dispatchEvent(new Event("input"));
+
+    const reason = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Why should this rejection be reviewed again?"]')!;
+    reason.value = "The revised titles now match the clarified scope of each updated step.";
+    btn(root, "Send back for another review")!.click();
+    await flush();
+
+    const submitted = mockAuthorEdit.mock.calls[0][3];
+    expect(submitted.steps[9].title).toBe("Verify regional eligibility");
+    expect(submitted.steps[12].title).toBe("Compare final evidence");
+    expect(submitted.steps[14]).toMatchObject({
+      order: 15,
+      title: "Document exceptions",
+      description: "Record each exception and cite the supporting source.",
+    });
+  });
+
+  it("edits success criteria, required outputs, URLs, and notes during appeal", async () => {
+    const task = {
+      ...currentTask(),
+      criteria: ["Original success criterion"],
+      required_outputs: ["Original required report"],
+      must_visit_or_reach: ["https://original.example/docs"],
+      notes: "Original author note",
+    };
+    mockMyTaskPage.mockResolvedValue(
+      page([item({ status: "rejected", rejection_reason: "Clarify the required evidence.", can_appeal: true })])
+    );
+    mockMyTaskFeedback.mockResolvedValue(
+      feedback({ status: "rejected", rejection_reason: "Clarify the required evidence.", task })
+    );
+    mockAuthorEdit.mockResolvedValue({
+      ok: true,
+      new_sub_key: "s2",
+      new_content_hash: "hash",
+      status: "awaiting_codex",
+      appeal: true,
+    });
+    const root = renderMyTasks(ctx());
+    await flush();
+    await openRow(root);
+    btn(root, "Revise and appeal")!.click();
+    await flush();
+
+    const criterion = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Success criterion 1"]')!;
+    const output = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Required output 1"]')!;
+    const url = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Required URL or destination 1"]')!;
+    const notes = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Notes"]')!;
+    expect(criterion.value).toBe("Original success criterion");
+    expect(output.value).toBe("Original required report");
+    expect(url.value).toBe("https://original.example/docs");
+    expect(notes.value).toBe("Original author note");
+
+    criterion.value = "Every regional requirement is supported by a first-party citation.";
+    criterion.dispatchEvent(new Event("input"));
+    btn(root, "+ Add success criterion")!.click();
+    const criterion2 = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Success criterion 2"]')!;
+    criterion2.value = "Conflicts and exceptions are explicitly resolved.";
+    criterion2.dispatchEvent(new Event("input"));
+    output.value = "A cited implementation decision";
+    output.dispatchEvent(new Event("input"));
+    url.value = "https://docs.example.com/requirements";
+    url.dispatchEvent(new Event("input"));
+    notes.value = "Use only documentation current on the appeal date.";
+    notes.dispatchEvent(new Event("input"));
+
+    const reason = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Why should this rejection be reviewed again?"]')!;
+    reason.value = "The revision now makes every required source, output, criterion, and constraint explicit.";
+    btn(root, "Send back for another review")!.click();
+    await flush();
+
+    const submitted = mockAuthorEdit.mock.calls[0][3];
+    expect(submitted.success_criteria).toEqual([
+      "Every regional requirement is supported by a first-party citation.",
+      "Conflicts and exceptions are explicitly resolved.",
+    ]);
+    expect(submitted.required_outputs).toEqual(["A cited implementation decision"]);
+    expect(submitted.must_visit_or_reach).toEqual(["https://docs.example.com/requirements"]);
+    expect(submitted.notes).toBe("Use only documentation current on the appeal date.");
+  });
+
+  it("explains when a legacy rejection needs routing repair before appeal", async () => {
+    mockMyTaskPage.mockResolvedValue(
+      page([item({
+        status: "rejected",
+        rejection_reason: "No.",
+        can_appeal: false,
+        appeal_unavailable_reason: "This rejection cannot be appealed yet. Ask the task lead to unlock it.",
+      })])
+    );
+    mockMyTaskFeedback.mockResolvedValue(feedback({ status: "rejected", rejection_reason: "No.", task: currentTask() }));
+    const root = renderMyTasks(ctx());
+    await flush();
+    await openRow(root);
+
+    expect(btn(root, "Revise and appeal")).toBeFalsy();
+    expect(root.textContent).toMatch(/ask the task lead to unlock it/i);
   });
 
   it("lists only the tasks awaiting sign-off in the sign-off section", async () => {
@@ -601,10 +799,10 @@ describe("my tasks screen", () => {
 
   it("accepts the reviewer's version and sends how long the author looked at it", async () => {
     mockMyTaskPage.mockResolvedValue(
-      page([item({ status: "approved", needs_signoff: true, reviewed_by: "Dana" })])
+      page([item({ status: "approved", needs_signoff: true })])
     );
     mockMyTaskFeedback.mockResolvedValue(
-      feedback({ status: "approved", needs_signoff: true, human_review: humanReview({ reviewed_by: "Dana" }) })
+      feedback({ status: "approved", needs_signoff: true, human_review: humanReview({}) })
     );
     mockAuthorSignoff.mockResolvedValue({ ok: true, action: "accepted", signed_off_at: "2026-08-24T00:00:00.000Z" });
     const root = renderMyTasks(ctx());
@@ -624,6 +822,14 @@ describe("my tasks screen", () => {
   });
 
   it("amends an approved task from the reviewer's version, not the author's original", async () => {
+    const reviewerFinal = {
+      ...currentTask(),
+      request: "The reviewer's approved request.",
+      criteria: ["Reviewer success criterion"],
+      required_outputs: ["Reviewer required output"],
+      must_visit_or_reach: ["https://reviewer.example/final"],
+      notes: "Reviewer-approved note",
+    };
     mockMyTaskPage.mockResolvedValue(page([item({ status: "approved", needs_signoff: true })]));
     mockMyTaskFeedback.mockResolvedValue(
       feedback({
@@ -631,7 +837,7 @@ describe("my tasks screen", () => {
         needs_signoff: true,
         human_review: humanReview({}),
         task: { ...currentTask(), request: "The author's own original request." },
-        final_task: { ...currentTask(), request: "The reviewer's approved request." },
+        final_task: reviewerFinal,
       })
     );
     mockAuthorAmend.mockResolvedValue({ ok: true, revision_count: 2, new_content_hash: "h" });
@@ -643,17 +849,60 @@ describe("my tasks screen", () => {
     await flush();
     const area = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Full task request"]')!;
     expect(area.value).toBe("The reviewer's approved request.");
+    expect(root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Success criterion 1"]')!.value)
+      .toBe("Reviewer success criterion");
+    expect(root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Required output 1"]')!.value)
+      .toBe("Reviewer required output");
+    expect(root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Required URL or destination 1"]')!.value)
+      .toBe("https://reviewer.example/final");
+    expect(root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Notes"]')!.value)
+      .toBe("Reviewer-approved note");
+
+    const criterion = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Success criterion 1"]')!;
+    criterion.value = "Author-final success criterion";
+    criterion.dispatchEvent(new Event("input"));
+    const output = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Required output 1"]')!;
+    output.value = "Author-final required output";
+    output.dispatchEvent(new Event("input"));
+    const url = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Required URL or destination 1"]')!;
+    url.value = "https://author.example/final";
+    url.dispatchEvent(new Event("input"));
+    const notes = root.querySelector<HTMLTextAreaElement>('textarea[aria-label="Notes"]')!;
+    notes.value = "Author-final note";
+    notes.dispatchEvent(new Event("input"));
 
     btn(root, "Save as the final version")!.click();
     await flush();
     expect(mockAuthorAmend).toHaveBeenCalledTimes(1);
     expect(mockAuthorEdit).not.toHaveBeenCalled();
+    const submitted = mockAuthorAmend.mock.calls[0][3];
+    expect(submitted.success_criteria).toEqual(["Author-final success criterion"]);
+    expect(submitted.required_outputs).toEqual(["Author-final required output"]);
+    expect(submitted.must_visit_or_reach).toEqual(["https://author.example/final"]);
+    expect(submitted.notes).toBe("Author-final note");
   });
 });
 
 describe("my tasks pure helpers", () => {
+  it("filters by action or progress and sorts deterministically", () => {
+    const tasks = [
+      item({ task_id: "old", title: "Older approved", status: "approved", submitted_at: "2026-08-01T00:00:00Z" }),
+      item({ task_id: "new", title: "New pending", status: "pending", submitted_at: "2026-08-03T00:00:00Z" }),
+      item({ task_id: "act", title: "Appealable rejection", status: "rejected", can_appeal: true, submitted_at: "2026-08-02T00:00:00Z" }),
+    ];
+    expect(filterAndSortMyTasks(tasks, "", "action", "newest").map((task) => task.task_id)).toEqual(["act"]);
+    expect(filterAndSortMyTasks(tasks, "", "in_progress", "newest").map((task) => task.task_id)).toEqual(["new"]);
+    expect(filterAndSortMyTasks(tasks, "", "all", "oldest").map((task) => task.task_id)).toEqual(["old", "act", "new"]);
+    expect(filterAndSortMyTasks(tasks, "appeal", "all", "newest").map((task) => task.task_id)).toEqual(["act"]);
+  });
+
   it("picks the action a task's state allows", () => {
     expect(editModeFor(item({ status: "pending" }))).toBe("revise");
+    expect(editModeFor(item({ status: "awaiting_codex", rejection_count: 1 }))).toBe(null);
+    expect(editModeFor(item({ status: "pending", rejection_count: 1 }))).toBe(null);
+    // An explicit reviewer return reopens the correction flow even when the
+    // task originally reached this reviewer through its one appeal.
+    expect(editModeFor(item({ status: "returned", rejection_count: 1 }))).toBe("revise");
     // Amend is offered for every approved task, whether or not the reviewer
     // changed anything and whether or not it has already been signed off.
     expect(editModeFor(item({ status: "approved", reviewer_changed: false }))).toBe("amend");
@@ -682,13 +931,13 @@ describe("my tasks pure helpers", () => {
     // Nothing changed in QC is not a reason to take the pen away: the author
     // may still want to improve their own task before it ships.
     mockMyTaskPage.mockResolvedValue(
-      page([item({ status: "approved", needs_signoff: true, reviewed_by: "Dana", reviewer_changed: false })])
+      page([item({ status: "approved", needs_signoff: true, reviewer_changed: false })])
     );
     mockMyTaskFeedback.mockResolvedValue(
       feedback({
         status: "approved",
         needs_signoff: true,
-        human_review: humanReview({ reviewed_by: "Dana", changed: false, request_edited: false, title_edited: false }),
+        human_review: humanReview({ changed: false, request_edited: false, title_edited: false }),
         final_task: currentTask(),
       })
     );

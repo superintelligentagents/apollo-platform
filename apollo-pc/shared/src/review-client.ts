@@ -129,7 +129,7 @@ export interface TrajectoryJudgmentDraft {
   rubrics: { rubric_id: string; human_verdict: HumanRubricVerdict; notes: string }[];
   trajectory: { overall_outcome: TrajectoryOverallOutcome; task_satisfied: HumanRubricVerdict; notes: string };
 }
-export interface TrajectoryCounts { submitted: number; finished: number; locked: number; pending: number; claimable: number; own_pending?: number }
+export interface TrajectoryCounts { submitted: number; finished: number; locked: number; pending: number; claimable: number; assigned_to_you?: number; assigned_to_others?: number; unassigned?: number }
 
 export async function reviewStatus(reviewKey: string, reviewerPid?: string): Promise<ReviewCounts> {
   return (await post("/review/status", { reviewKey, ...(reviewerPid ? { reviewer_pid: reviewerPid } : {}) })) as unknown as ReviewCounts;
@@ -157,12 +157,40 @@ export async function reviewRelease(reviewKey: string, claim: ReviewClaim): Prom
   await post("/review/release", { reviewKey, sub_key: claim.subKey, token: claim.token });
 }
 
-// reviewerPid matters beyond attribution: the queue is shared with Apollo v2,
-// and an author appealing a rejection is routed away from the reviewer who
-// rejected it by matching this pid. Omitting it silently hands the appeal
-// straight back to them.
-export async function reviewReject(reviewKey: string, reviewer: string, claim: ReviewClaim, reason: string, reviewerPid?: string): Promise<void> {
-  await post("/review/reject", { reviewKey, reviewer, ...(reviewerPid ? { reviewer_pid: reviewerPid } : {}), sub_key: claim.subKey, token: claim.token, task_id: claim.task.task_id, reason });
+export async function reviewReject(
+  reviewKey: string,
+  reviewer: string,
+  claim: ReviewClaim,
+  reason: string,
+  rubrics?: RubricRow[],
+  reviewerPid?: string
+): Promise<void> {
+  await post("/review/reject", {
+    reviewKey,
+    reviewer,
+    ...(reviewerPid ? { reviewer_pid: reviewerPid } : {}),
+    sub_key: claim.subKey,
+    token: claim.token,
+    task_id: claim.task.task_id,
+    reason,
+    ...(rubrics?.length ? { review: rejectionReviewBlock(rubrics) } : {}),
+  });
+}
+
+export function rejectionReviewBlock(rubrics: RubricRow[]): Record<string, unknown> {
+  return {
+    rubrics: rubrics
+      .filter((row) => row.text.trim())
+      .map((row) => ({
+        kind: row.kind,
+        source_index: row.sourceIndex,
+        title: row.title,
+        original: row.original,
+        final: row.text.trim(),
+        changed: row.original === null || row.text.trim() !== row.original.trim(),
+        checked: row.checked,
+      })),
+  };
 }
 
 export function seedRubrics(task: ReviewLongTask): RubricRow[] {
@@ -277,8 +305,8 @@ export async function trajectoryClaim(reviewKey: string, reviewer: string, revie
 export async function trajectoryRelease(reviewKey: string, claim: TrajectoryClaim): Promise<void> {
   await post("/trajectory/release", { reviewKey, manifest_key: claim.manifestKey, token: claim.token });
 }
-export async function trajectorySubmit(reviewKey: string, reviewer: string, claim: TrajectoryClaim, judgment: TrajectoryJudgmentDraft): Promise<void> {
-  await post("/trajectory/submit", { reviewKey, reviewer, manifest_key: claim.manifestKey, token: claim.token, judgment });
+export async function trajectorySubmit(reviewKey: string, reviewer: string, reviewerPid: string, claim: TrajectoryClaim, judgment: TrajectoryJudgmentDraft): Promise<void> {
+  await post("/trajectory/submit", { reviewKey, reviewer, reviewer_pid: reviewerPid, manifest_key: claim.manifestKey, token: claim.token, judgment });
 }
 
 type Store = { get(key: string): Promise<string | null>; set(key: string, value: string): Promise<void> };

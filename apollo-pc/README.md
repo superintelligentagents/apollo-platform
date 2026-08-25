@@ -1,35 +1,38 @@
 # Apollo PC — Personal-Context Collector
 
-The web client includes separate top-level **Review** and **Grade** workspaces. Review uses the shared human task-QC queue, shows the full request and completed Codex live-web feedback, keeps the original and reviewed task versions separate, and allows edits only in the human working copy. Grade is trajectory-only: it shows recorded steps/screenshots, each rubric, and the overall task-satisfaction judgment while hiding the LLM judge from graders.
+The web client includes separate top-level **Review** and **Grade** workspaces. Review uses the PC-only `pc-review/` task-QC queue, shows the full request and completed Codex live-web feedback, keeps the original and reviewed task versions separate, and allows edits only in the human working copy. Grade uses the separate PC trajectory queue: it shows recorded steps/screenshots, each rubric, and the overall task-satisfaction judgment while hiding the LLM judge from graders.
 
 Tasks are not claimable in either Apollo client until a supported Codex PRE_QC run has completed every rubric for the exact current content hash. The Review queue shows these submissions as **waiting for Codex check**. Keyboard shortcuts in Grade are `←/→` for trajectory steps, `W/S` for rubrics, `P/O` for pass/fail, and `U` for unclear.
 
-Collects **real, consented, redacted personal context** (email, calendar, contacts, WhatsApp
-chats, and orders mined from receipt emails) plus participant-authored agent tasks grounded in
-that data. Feeds persona/environment recreation for MyPCBench/iOSWorld-style benchmarks.
+Collects **real, consented, redacted personal context** from email and calendar, including
+orders mined from receipt emails, plus participant-authored agent tasks grounded in that data.
+Contact and WhatsApp parsers exist behind hidden development flags but are not participant-facing
+or part of the current production collection scope.
 
-Sibling of `apollo-v2/` (browsing-history collector). Shares the presign lambda, S3 bucket,
-and design system, but is a standalone workspace — nothing here imports `@odyssey/shared`.
+Sibling of `apollo-v2/` (browsing-history collector). It shares reviewed backend source, the S3
+bucket, and the design language, but production uses a separate API, Lambda role, upload scope,
+and `pc-review/` queue. The workspace is standalone and does not import `@odyssey/shared`.
 
 ## How it works
 
-1. **Import** — participants export their own data (Google Takeout `.mbox`, `.ics`, `.vcf`,
-   WhatsApp `.txt`) and load the files here. Parsing is 100% in-browser; a date-window select
+1. **Import** — participants export their own email (`.mbox`) and calendar (`.ics`) data and
+   load the files here. Parsing is 100% in-browser; a date-window select
    (default 12 months) drops older records *at parse time*. Email bodies are truncated
    (5 KB head+tail), attachments reduced to metadata, and stored in IndexedDB.
 2. **Review & redact** — all imported email is selected by default; per-item and filtered
    bulk controls can keep anything private. Field editing, entity aliases, replacement rules,
    and the direct-identifier/credential mask layer apply only to the upload copy.
-3. **People & entities** — recurring people are detected across all sources (contacts act as
-   the join table) and pseudonymized with **one consistent alias per person** so cross-source
+3. **People & entities** — recurring people are detected across imported sources and
+   pseudonymized with **one consistent alias per person** so cross-source
    correlation survives. Merchants keep real names. The real→alias map **never uploads**.
 4. **Tasks** — five templates matching the MyPCBench taxonomy; each task attaches
    `referenced_record_ids` and (where required) a ground-truth `expected_answer`.
 5. **Submit** — records and tasks serialize through `redact.ts` (edits → rules → masks → aliases),
    then an independent bundle-wide privacy audit fails closed on unapproved PII. Passing files
    split into `records_{kind}[_partN].json` files under the 5 MB presign cap, uploaded
-   sequentially with `manifest.json` **last** (the lambda's review-inbox marker only fires
-   on the manifest, so interrupted uploads never look complete).
+   sequentially, followed by `manifest.json`. Privacy-safe task sidecars upload only after the
+   complete bundle; only those sidecars create PC task-review inbox markers. An interrupted or
+   incomplete bundle therefore never creates a claimable task.
 
 Schema: `odyssey_personal_context_v1`. S3 layout:
 `prolific/journeys/{pid}/pc/{pid}/internal/bundle-{id}/{ts}_{filename}`.
@@ -57,8 +60,14 @@ npx vercel deploy --prod
 ```
 
 Backend: the `isPC` branch lives in `backend/lambda_presign.js` (repo file = deployed
-source — re-zip and update the `journeys-presign` lambda when it changes; `backend/server.js`
-mirrors it for local dev).
+source). Production PC traffic uses the isolated `journeys-pc-presign` Lambda at
+`https://t1ynh195m1.execute-api.us-east-1.amazonaws.com/presign`, with
+`APP_SCOPE=pc` and `REVIEW_PREFIX=pc-review/`. Re-zip the same reviewed source for
+both Lambdas when shared backend behavior changes. PC runs under the separate
+`journeys-pc-presign-role`, limited to PC upload objects and `pc-review/*`.
+`backend/server.js` mirrors the upload validation for local development. See
+[`../docs/APOLLO_PLATFORM_README.md`](../docs/APOLLO_PLATFORM_README.md) for the
+deployment and queue checklist.
 
 ## Privacy invariants (do not break)
 

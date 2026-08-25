@@ -1,15 +1,9 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it } from "vitest";
-import {
-  authorRejectionRates,
-  cohortSteering,
-  filterAdminSubmissions,
-  rejectionReasonClusters,
-  reviewerCalibration,
-  teamDistribution,
-} from "../src/ui/screens/progress";
-import type { AdminSubmission, AdminUserSummary } from "../src/review-client";
+import { authorQcRoundPanel, authorQualityPanel, filterAdminSubmissions, resolveAdminTaskMetadata, reviewerQualityPanel, teamDistribution } from "../src/ui/screens/progress";
+import { vi } from "vitest";
+import type { AdminSubmission } from "../src/review-client";
 
 function submission(overrides: Partial<AdminSubmission>): AdminSubmission {
   return {
@@ -28,20 +22,6 @@ function submission(overrides: Partial<AdminSubmission>): AdminSubmission {
     changed: false,
     original: { title: "Book dinner", request: "Find a table", difficulty: "high", criteria: [], steps: [] },
     final: null,
-    ...overrides,
-  };
-}
-
-function user(overrides: Partial<AdminUserSummary>): AdminUserSummary {
-  return {
-    participant_id: "alice",
-    name: "Alice",
-    email: "alice@example.com",
-    submitted: 0,
-    pending: 0,
-    in_review: 0,
-    approved: 0,
-    rejected: 0,
     ...overrides,
   };
 }
@@ -72,200 +52,169 @@ describe("admin submission filters", () => {
   });
 });
 
-describe("team spread panel", () => {
-  it("charts places and subjects from the row's distribution metadata", () => {
-    const items = [
-      submission({ task_metadata: { region: "IN", subjects: ["Travel and Tourism > Air Travel"] } }),
-      submission({ task_metadata: { region: "GLOBAL", subjects: ["Health > Medicine"] } }),
-    ];
-
-    const text = teamDistribution(items).textContent ?? "";
-    expect(text).toContain("India");
-    expect(text).toContain("No specific country");
-    expect(text).toContain("Travel and Tourism");
-    expect(text).toContain("50%");
+describe("team distribution", () => {
+  it("keeps region and subject metadata from current snapshot-shaped dashboard rows", () => {
+    const item = submission({
+      original: {
+        title: "Book dinner",
+        request: "Find a table",
+        difficulty: "high",
+        criteria: [],
+        steps: [],
+        metadata: { region: "IN", subjects: ["Travel and Tourism > Restaurants"] },
+      },
+    });
+    expect(resolveAdminTaskMetadata(item)).toEqual({
+      region: "IN",
+      subjects: ["Travel and Tourism > Restaurants"],
+    });
   });
 
-  // Which of original/final wins is resolved server-side by
-  // taskMetadataForReporting, which has its own test in the backend suite.
-  it("counts a task once, from the single resolved value", () => {
-    const text = teamDistribution([submission({ task_metadata: { region: "BR", subjects: [] } })]).textContent ?? "";
-    expect(text).toContain("Brazil");
-    expect(text).not.toContain("India");
+  it("renders the complete place and subject spread supplied by the backend", () => {
+    const root = teamDistribution([
+      { region: "IN", subjects: ["Travel and Tourism > Air Travel"] },
+      { region: "IN", subjects: ["Travel and Tourism > Accommodation and Hotels"] },
+      { region: "GLOBAL", subjects: ["Health > Medicine"] },
+      { region: "US", subjects: ["Science and Education > Education"] },
+    ]);
+    expect(root.textContent).toContain("Spread across the team");
+    expect(root.textContent).toContain("India");
+    expect(root.textContent).toContain("No specific country");
+    expect(root.textContent).toContain("Travel and Tourism");
+    expect(root.textContent).toContain("50% · 2");
   });
 
-  it("shows a true empty state when no metadata has been recorded", () => {
-    // Tasks authored before the metadata fields shipped carry none.
-    const text = teamDistribution([submission({})]).textContent ?? "";
-    expect(text).toContain("No region or subject data has been recorded yet.");
+  it("does not draw misleading bars when the aggregate has not loaded", () => {
+    const root = teamDistribution(undefined);
+    expect(root.querySelectorAll(".share-row")).toHaveLength(0);
+    expect(root.textContent).toContain("next dashboard refresh");
   });
 
   it("keeps a large team spread compact", () => {
-    const items = ["US", "IN", "GB", "BR", "CA", "AU"].map((region, index) =>
-      submission({
-        task_id: `task-${index}`,
-        original: {
-          title: `Task ${index}`, request: "", difficulty: "high", criteria: [], steps: [],
-          metadata: { region, subjects: [] },
-        },
-      })
-    );
-    const root = teamDistribution(items);
+    const root = teamDistribution([
+      { region: "US" },
+      { region: "IN" },
+      { region: "GB" },
+      { region: "BR" },
+      { region: "CA" },
+      { region: "AU" },
+    ]);
     expect(root.querySelectorAll(".share-row")).toHaveLength(5);
     expect(root.textContent).toContain("top 5 of 6");
     expect(root.textContent).not.toContain("United States");
   });
 });
 
-describe("rejection reason clusters", () => {
-  it("groups rejected items by reason, lowercased for grouping but keeping first-seen casing", () => {
-    const items = [
-      submission({ task_id: "1", status: "rejected", rejection_reason: "Non-evergreen" }),
-      submission({ task_id: "2", status: "rejected", rejection_reason: "non-evergreen" }),
-      submission({ task_id: "3", status: "rejected", rejection_reason: "India-only site" }),
-      submission({ task_id: "4", status: "approved", rejection_reason: "Non-evergreen" }),
-    ];
+describe("reviewer quality panel", () => {
+  const stamper = {
+    reviewer: "Stamper",
+    reviewed: 28, approved: 28, rejected: 0, edited_approvals: 0, unedited_approvals: 28,
+    first_reviewed_at: "2026-08-19T00:00:00Z", last_reviewed_at: "2026-08-19T05:00:00Z",
+    reject_rate: 0, edit_rate: 0, median_gap_minutes: 1.2, fast_share: 0.9,
+    flags: ["no_rejections", "rarely_edits", "fast"] as const,
+    suspicious: true,
+  };
+  const careful = {
+    reviewer: "Careful",
+    reviewed: 33, approved: 23, rejected: 10, edited_approvals: 23, unedited_approvals: 0,
+    first_reviewed_at: "2026-08-18T00:00:00Z", last_reviewed_at: "2026-08-19T05:00:00Z",
+    reject_rate: 0.303, edit_rate: 1, median_gap_minutes: 13.6, fast_share: 0,
+    flags: [] as const,
+    suspicious: false,
+  };
 
-    expect(rejectionReasonClusters(items)).toEqual([
-      { reason: "Non-evergreen", count: 2 },
-      { reason: "India-only site", count: 1 },
-    ]);
+  it("flags suspicious reviewers and offers filter + bulk re-queue", async () => {
+    const onShow = vi.fn();
+    const onReopenUnedited = vi.fn(async (_row: unknown, status: HTMLElement) => { status.textContent = "28 tasks back in the queue."; });
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    const panel = reviewerQualityPanel([stamper, careful] as never, { onShow, onReopenUnedited });
+    const rows = panel.querySelectorAll("tbody tr");
+    expect(rows).toHaveLength(2);
+    expect(rows[0].classList.contains("suspicious")).toBe(true);
+    expect(rows[0].textContent).toContain("never rejects");
+    expect(rows[0].textContent).toContain("very fast");
+    expect(rows[0].textContent).toContain("0/28");
+    expect(rows[1].classList.contains("suspicious")).toBe(false);
+    expect(rows[1].textContent).toContain("10 (30%)");
+    expect(panel.textContent).toContain("2 reviewers · 1 flagged");
+
+    const [show, reopen] = rows[0].querySelectorAll<HTMLButtonElement>("button");
+    show.click();
+    expect(onShow).toHaveBeenCalledWith("Stamper");
+    expect(reopen.textContent).toBe("Re-queue 28 unedited");
+    reopen.click();
+    await Promise.resolve();
+    expect(onReopenUnedited).toHaveBeenCalledTimes(1);
+    // Nothing to re-queue for a reviewer who edited every approval.
+    expect(rows[1].querySelectorAll<HTMLButtonElement>("button")[1].disabled).toBe(true);
   });
 
-  it("treats empty and whitespace reasons as (no reason given)", () => {
-    const items = [
-      submission({ task_id: "1", status: "rejected", rejection_reason: "" }),
-      submission({ task_id: "2", status: "rejected", rejection_reason: "   " }),
-      submission({ task_id: "3", status: "rejected", rejection_reason: "Infeasible" }),
-    ];
-
-    const clusters = rejectionReasonClusters(items);
-    expect(clusters).toContainEqual({ reason: "(no reason given)", count: 2 });
-    expect(clusters).toContainEqual({ reason: "Infeasible", count: 1 });
-  });
-
-  it("breaks count ties by reason, alphabetically", () => {
-    const items = [
-      submission({ task_id: "1", status: "rejected", rejection_reason: "Zebra" }),
-      submission({ task_id: "2", status: "rejected", rejection_reason: "Apple" }),
-    ];
-
-    expect(rejectionReasonClusters(items).map((c) => c.reason)).toEqual(["Apple", "Zebra"]);
-  });
-
-  it("returns nothing when there are no rejected tasks", () => {
-    expect(rejectionReasonClusters([submission({ status: "approved" })])).toEqual([]);
-  });
-});
-
-describe("author rejection rates", () => {
-  it("computes rejected/(approved+rejected) for authors with finished reviews, sorted descending", () => {
-    const users = [
-      user({ participant_id: "alice", name: "Alice", approved: 8, rejected: 2 }),
-      user({ participant_id: "bob", name: "Bob", approved: 2, rejected: 8 }),
-      user({ participant_id: "cara", name: "Cara", pending: 5 }),
-    ];
-
-    const rates = authorRejectionRates(users);
-    expect(rates.map((r) => r.participant_id)).toEqual(["bob", "alice"]);
-    expect(rates.find((r) => r.participant_id === "bob")?.rate).toBeCloseTo(0.8);
-    expect(rates.find((r) => r.participant_id === "alice")?.rate).toBeCloseTo(0.2);
-  });
-
-  it("skips authors with no finished reviews", () => {
-    expect(authorRejectionRates([user({ approved: 0, rejected: 0, pending: 5 })])).toEqual([]);
-  });
-
-  it("breaks rate ties by name, alphabetically", () => {
-    const users = [
-      user({ participant_id: "zoe", name: "Zoe", approved: 5, rejected: 5 }),
-      user({ participant_id: "amy", name: "Amy", approved: 5, rejected: 5 }),
-    ];
-
-    expect(authorRejectionRates(users).map((r) => r.name)).toEqual(["Amy", "Zoe"]);
+  it("explains when the backend predates reviewer stats", () => {
+    expect(reviewerQualityPanel(undefined, { onShow: vi.fn(), onReopenUnedited: vi.fn() }).textContent).toContain("next backend deploy");
   });
 });
 
-describe("cohort steering panel", () => {
-  it("lists rejection clusters and flags authors over the coaching threshold", () => {
-    const items = [
-      submission({ task_id: "1", status: "rejected", rejection_reason: "Non-evergreen" }),
-      submission({ task_id: "2", status: "rejected", rejection_reason: "non-evergreen" }),
-      submission({ task_id: "3", status: "rejected", rejection_reason: "India-only site" }),
-    ];
-    const users = [
-      user({ participant_id: "bob", name: "Bob", email: "bob@example.com", approved: 2, rejected: 8 }),
-      user({ participant_id: "alice", name: "Alice", email: "alice@example.com", approved: 9, rejected: 1 }),
-    ];
+describe("author quality panel", () => {
+  const users = [
+    {
+      participant_id: "sloppy", name: "Sloppy", email: "s@t.com", submitted: 40,
+      pending: 10, in_review: 2, approved: 18, rejected: 10, decided: 28,
+      approval_rate: 0.643, qc_edited_approvals: 6, qc_edit_rate: 0.333,
+      qc_edited_author_accepted: 3, qc_edited_author_amended: 2, qc_edited_awaiting_signoff: 1,
+      author_accepted_approvals: 8, author_amended_approvals: 4, awaiting_signoff: 6,
+      appealed: 3, double_rejected: 2, author_requeues: 5,
+    },
+    {
+      participant_id: "solid", name: "Solid", email: "so@t.com", submitted: 30,
+      pending: 5, in_review: 0, approved: 24, rejected: 1, decided: 25,
+      approval_rate: 0.96, qc_edited_approvals: 2, qc_edit_rate: 0.083,
+      qc_edited_author_accepted: 2, qc_edited_author_amended: 0, qc_edited_awaiting_signoff: 0,
+      author_accepted_approvals: 20, author_amended_approvals: 1, awaiting_signoff: 3,
+      appealed: 1, double_rejected: 0, author_requeues: 2,
+    },
+    { participant_id: "new", name: "Newcomer", email: "n@t.com", submitted: 3, pending: 3, in_review: 0, approved: 0, rejected: 0 },
+  ];
 
-    const text = cohortSteering(items, users).textContent ?? "";
-    expect(text).toContain("Cohort steering");
-    expect(text).toContain("Non-evergreen");
-    expect(text).toContain("India-only site");
-    expect(text).toContain("Bob · bob@example.com");
-    expect(text).toContain("80%");
-    expect(text).not.toContain("Alice");
+  it("ranks authors by rejection rate over decided tasks and flags outliers", () => {
+    const onShow = vi.fn();
+    const panel = authorQualityPanel(users as never, onShow);
+    const rows = panel.querySelectorAll("tbody tr");
+    expect(rows).toHaveLength(3);
+    // Sorted worst-first; undecided authors sink to the bottom unrated.
+    expect(rows[0].textContent).toContain("Sloppy");
+    expect(rows[0].textContent).toContain("64%");
+    expect(rows[0].textContent).toContain("18/28");
+    expect(rows[0].textContent).toContain("10 rejected");
+    expect(rows[0].textContent).toContain("6/18");
+    expect(rows[0].textContent).toContain("8 accepted · 4 edited");
+    expect(rows[0].classList.contains("suspicious")).toBe(true);
+    expect(rows[0].textContent).toContain("high rejection");
+    expect(rows[1].textContent).toContain("Solid");
+    expect(rows[1].textContent).toContain("96%");
+    expect(rows[1].textContent).toContain("clean record");
+    expect(rows[2].textContent).toContain("—");
+    expect(rows[2].textContent).toContain("no decisions yet");
+    expect(panel.textContent).toContain("3 authors");
+    expect(panel.textContent).toContain("· 1 flagged");
+    expect(panel.textContent).toContain("4 appealed");
+    expect(panel.textContent).toContain("2 rejected twice");
+    expect(panel.textContent).toContain("7 author requeues");
+    expect(rows[0].querySelectorAll("td")[5].textContent).toBe("3");
+    expect(rows[0].querySelectorAll("td")[6].textContent).toBe("2");
+    expect(rows[0].querySelectorAll("td")[7].textContent).toBe("5");
+    // Pending column counts in_review too.
+    expect(rows[0].querySelectorAll("td")[8].textContent).toBe("12");
+    (rows[0].querySelector("button") as HTMLButtonElement).click();
+    expect(onShow).toHaveBeenCalledWith("sloppy");
   });
 
-  it("shows muted fallbacks when there is nothing to steer on", () => {
-    const text = cohortSteering([submission({ status: "approved" })], [user({ approved: 1, rejected: 0 })]).textContent ?? "";
-    expect(text).toContain("No rejected tasks");
-    expect(text).toContain("No authors currently need coaching flagging");
-  });
-});
-
-describe("reviewer calibration", () => {
-  const review = (over: Partial<AdminSubmission>) => submission({ status: "approved", reviewer: "Dana", ...over });
-
-  it("separates how fast a reviewer works from how often they reject", () => {
-    const rows = reviewerCalibration([
-      // Fast and average on rejections — the pattern that looks fine on a
-      // rejection-rate table alone.
-      ...Array.from({ length: 4 }, (_, i) =>
-        review({ task_id: `f${i}`, reviewer: "Fast", review_minutes: 0.2 })
-      ),
-      review({ task_id: "f5", reviewer: "Fast", status: "rejected", rejection_reason: "spam", review_minutes: 0.3 }),
-      // Slow and strict.
-      ...Array.from({ length: 3 }, (_, i) =>
-        review({ task_id: `s${i}`, reviewer: "Slow", review_minutes: 11 })
-      ),
-      review({
-        task_id: "s4",
-        reviewer: "Slow",
-        status: "rejected",
-        rejection_reason: "The core objective depends on live prices that go stale within a week.",
-        review_minutes: 12,
-      }),
-    ]);
-
-    const fast = rows.find((row) => row.reviewer === "Fast")!;
-    const slow = rows.find((row) => row.reviewer === "Slow")!;
-    expect(fast.reviewed).toBe(5);
-    expect(fast.rejectionRate).toBeCloseTo(0.2);
-    expect(fast.medianMinutes).toBeCloseTo(0.2);
-    expect(fast.rushedShare).toBe(1);
-    expect(fast.terseShare).toBe(1);
-
-    expect(slow.rejectionRate).toBeCloseTo(0.25);
-    expect(slow.rushedShare).toBe(0);
-    expect(slow.terseShare).toBe(0);
-    // Busiest first, so the reviewer doing the most work is read first.
-    expect(rows[0].reviewer).toBe("Fast");
-  });
-
-  it("reports no timing for reviews finished before durations were recorded", () => {
-    const [row] = reviewerCalibration([review({ task_id: "old" })]);
-    expect(row.medianMinutes).toBeNull();
-    expect(row.rushedShare).toBe(0);
-  });
-
-  it("ignores unfinished reviews and rows with no reviewer", () => {
-    const rows = reviewerCalibration([
-      review({ task_id: "p", status: "pending", reviewer: "" }),
-      review({ task_id: "l", status: "in_review", reviewer: "Dana" }),
-      review({ task_id: "d", reviewer: "Dana", review_minutes: 5 }),
-    ]);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ reviewer: "Dana", reviewed: 1 });
+  it("shows the explicit original-author QC round and reviewer-edit breakdown", () => {
+    const panel = authorQcRoundPanel(users as never);
+    expect(panel.textContent).toContain("Author QC round");
+    expect(panel.textContent).toContain("Awaiting author9");
+    expect(panel.textContent).toContain("Accepted28");
+    expect(panel.textContent).toContain("Edited & finalized5");
+    expect(panel.textContent).toContain("Round complete79%");
+    expect(panel.textContent).toContain("Of 8 reviewer-edited approvals: 5 accepted · 2 edited again by the author · 1 awaiting.");
   });
 });

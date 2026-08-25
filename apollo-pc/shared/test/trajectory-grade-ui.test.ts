@@ -51,6 +51,9 @@ describe("Apollo PC trajectory grader", () => {
     expect(root.querySelector<HTMLButtonElement>(".pc-trajectory-actions .primary")?.disabled).toBe(true);
 
     const note = root.querySelector<HTMLTextAreaElement>(".pc-outcome-notes")!;
+    note.value = "Too short";
+    note.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(root.querySelector<HTMLButtonElement>(".pc-trajectory-actions .primary")?.disabled).toBe(true);
     note.value = "Rubric R2 asks for evidence the task never requested.";
     note.dispatchEvent(new Event("input", { bubbles: true }));
     expect(state.trajectoryJudgment?.trajectory.notes).toContain("task never requested");

@@ -103,8 +103,8 @@ export function buildPendingTask(ctx: Ctx): LongTask | null {
       metadata: {
         region: d.region,
         subjects: d.subjects
-          .flatMap((s) => {
-            const canonical = normalizeSubject(s);
+          .flatMap((subject) => {
+            const canonical = normalizeSubject(subject);
             return canonical ? [canonical] : [];
           })
           .slice(0, MAX_SUBJECTS),
@@ -130,5 +130,6 @@ export function buildPendingTask(ctx: Ctx): LongTask | null {
     attachedUrls,
   });
   task.quality_signals = computeQualitySignals(task, state.generatedDraft);
+  task.authoring = { started_at: state.authoringStartedAt ?? null };
   return task;
 }

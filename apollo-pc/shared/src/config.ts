@@ -2,7 +2,7 @@ export const APP_NAME = "apollo-pc";
 export const APP_VERSION = "0.2.4";
 export const CONSENT_VERSION = "2026-08-12";
 
-export const DEFAULT_PRESIGN_ENDPOINT = "https://2fb2wkpayf.execute-api.us-east-1.amazonaws.com/presign";
+export const DEFAULT_PRESIGN_ENDPOINT = "https://t1ynh195m1.execute-api.us-east-1.amazonaws.com/presign";
 
 // Presign lambda caps uploads at 5 MB; leave headroom for form encoding.
 export const MAX_UPLOAD_BYTES = 4_500_000;

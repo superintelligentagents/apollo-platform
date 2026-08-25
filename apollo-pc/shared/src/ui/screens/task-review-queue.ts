@@ -7,9 +7,9 @@ export function renderTaskReviewQueue(ctx: Ctx): HTMLElement {
   const root = el("section", { class: "screen narrow qc-queue-screen" });
   root.append(
     el("header", { class: "screen-head" },
-      el("p", { class: "eyebrow mono" }, "HUMAN TASK QC"),
-      el("h2", { class: "display" }, "Review submitted tasks"),
-      el("p", { class: "screen-sub" }, "Check the complete request first, then verify every rubric on the live web. Preserve the author's intent and make only necessary edits.")
+      el("p", { class: "eyebrow mono" }, "APOLLO PC · HUMAN TASK QC"),
+      el("h2", { class: "display" }, "Review PC-written tasks"),
+      el("p", { class: "screen-sub" }, "This PC-only queue is populated from privacy-safe task files produced by Write tasks. Check the complete request first, then verify every rubric on the live web.")
     )
   );
   const resume = el("div");
@@ -72,7 +72,7 @@ export function renderTaskReviewQueue(ctx: Ctx): HTMLElement {
             ? [el("p", { class: "reviewer-line muted" }, `Reviews so far: ${reviewerLine}`)]
             : []),
         claimButton,
-        el("p", { class: "muted small qc-queue-note" }, "A task becomes ready only after its current version completes the Codex live-web check. A claim is private to one reviewer for 30 minutes, and your edits are saved separately from the original submission.")
+        el("p", { class: "muted small qc-queue-note" }, "Only Apollo PC task sidecars enter this queue. A task becomes ready after its current version completes the Codex live-web check; a claim is private for 30 minutes.")
       );
     } catch (error) {
       body.replaceChildren(el("p", { class: "muted" }, `Couldn't reach the task queue: ${error instanceof Error ? error.message : String(error)}`), el("button", { class: "btn ghost", type: "button", onclick: () => void refresh() }, "Retry"));

@@ -3,7 +3,7 @@ import "./site.css";
 import { mountApp } from "@apollo-pc/shared";
 import { createPcAdapter } from "./pc-adapter";
 
-document.documentElement.dataset.apolloPcRelease = "2026-08-12.5";
+document.documentElement.dataset.apolloPcRelease = "2026-08-12.6";
 
 const root = document.getElementById("app");
 if (!root) throw new Error("Missing #app root");

@@ -1,32 +1,90 @@
 import type { Ctx } from "../context";
 import { el } from "../components/helpers";
 import {
+  rememberReviewSkip,
   reviewLlmFeedback,
   reviewReject,
   reviewRelease,
   reviewReturn,
   reviewSubmit,
   type LlmReviewForHuman,
+  type RemovedRubric,
   type RubricRow,
   seedRubrics,
   upgradeRubrics,
 } from "../../review-client";
-
-// Matches the server floor in /review/reject. Was 3, which let "spam" and
-// "reject task" through; an author can appeal a rejection now, and an appeal
-// against a four-word verdict wastes two people's time.
-const MIN_REJECT_REASON = 40;
 import { appendUploadLog, STORAGE_KEYS } from "../../platform";
 import { participantKey } from "../identity";
 import { saveClaimSnapshot } from "../../review-client";
-import {
-  conciseReviewText,
-  distinctReviewText,
-  plainReviewText,
-  renderLlmPanel,
-} from "../components/llm-panel";
 
-export { conciseReviewText, plainReviewText } from "../components/llm-panel";
+// Keep the client-side affordance aligned with the backend validation floor.
+const MIN_REJECT_REASON = 40;
+
+/** Keep the reporting API exact while translating older pipeline prose for reviewers. */
+export function plainReviewText(value: string | null | undefined): string | null {
+  if (!value) return null;
+  return value
+    .replace(/\bthe feasibility manager marked this rubric IMPOSSIBLE because\b/gi, "This step needs attention because")
+    .replace(/\brequires NOT_FEASIBLE\b/g, "means the task cannot be completed as written")
+    .replace(/\bis not presently feasible\b/gi, "cannot currently be completed")
+    .replace(/\bnot presently feasible\b/gi, "cannot currently be completed")
+    .replace(/\bunresolved verification shortfalls\b/gi, "items the automated check could not fully verify")
+    .replace(/\bessential step[\s‐‑‒–—-]?(\d+) impossibility\b/gi, "problem in step $1")
+    .replace(/\bstep[‐‑‒–—-](\d+)\b/gi, "step $1")
+    .replace(/\bcompatibility failed\b/gi, "the step does not fit the task")
+    .replace(/\brubric compatibility\b/gi, "how the step fits the task")
+    .replace(/\bfeasibility manager\b/gi, "overall check")
+    .replace(/\bcoherence manager\b/gi, "task check")
+    .replace(/\bPlaywright navigation to (?:all three )?(?:the )?supplied targets\b/gi, "opening the referenced websites")
+    .replace(/\bbrowser escalation\b/gi, "website check")
+    .replace(/\bPlaywright navigation\b/gi, "automated website check")
+    .replace(/\bverifier[- ]access limitation\b/gi, "limitation of the automated check")
+    .replace(/\bsupplied targets\b/gi, "websites")
+    .replace(/\btarget pages\b/gi, "websites")
+    .replace(/\bpage rendered\b/gi, "website loaded")
+    .replace(/\bpre[- ]purchase path\b/gi, "booking path")
+    .replace(/\blive[- ]web\b/gi, "website")
+    .replace(/\brubrics\b/gi, "steps")
+    .replace(/\brubric\b/gi, "step")
+    .replace(/\bcompatibility\b/gi, "fit with the task")
+    .replace(/\bcompatible with\b/gi, "consistent with")
+    .replace(/\bcompatible\b/gi, "consistent")
+    .replace(/\bdeterministically bounded\b/gi, "clearly limited")
+    .replace(/\benumerable\b/gi, "possible to list completely")
+    .replace(/\bNEEDS_HUMAN_REVIEW\b/g, "needs a person to check")
+    .replace(/\bNOT_FEASIBLE\b/g, "cannot be completed as written")
+    .replace(/\bFEASIBLE\b/g, "can be completed")
+    .replace(/\bWORKER_ERROR\b/g, "could not be checked")
+    .replace(/\bSHORTFALL\b/g, "could not be fully checked")
+    .replace(/\bIMPOSSIBLE\b/g, "cannot be completed as written")
+    .replace(/\bPOSSIBLE\b/g, "can be completed")
+    .replace(/\bworker\b/gi, "check")
+    .replace(/\bmanager\b/gi, "overall check")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+export function conciseReviewText(value: string | null | undefined, maxChars = 240): string | null {
+  const plain = plainReviewText(value);
+  if (!plain) return null;
+  const sentences = plain.match(/[^.!?]+[.!?]+|[^.!?]+$/g) ?? [plain];
+  let concise = sentences.slice(0, 2).join(" ").replace(/\s+/g, " ").trim();
+  if (concise.length <= maxChars) return concise;
+  concise = concise.slice(0, maxChars - 1).replace(/\s+\S*$/, "").trimEnd();
+  return `${concise}…`;
+}
+
+function distinctReviewText(values: Array<string | null | undefined>): string[] {
+  const seen = new Set<string>();
+  return values.flatMap((value) => {
+    const text = conciseReviewText(value);
+    if (!text) return [];
+    const key = text.toLocaleLowerCase();
+    if (seen.has(key)) return [];
+    seen.add(key);
+    return [text];
+  });
+}
 
 export function renderReviewEdit(ctx: Ctx): HTMLElement {
   const { state } = ctx;
@@ -51,8 +109,18 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
   }
   const edits = state.reviewEdits;
   const rubrics: RubricRow[] = state.reviewRubrics ? upgradeRubrics(task, state.reviewRubrics) : seedRubrics(task);
+  // Codex results are keyed rubric-1..N in the ORIGINAL seed order. Bind them
+  // to rows via (kind, sourceIndex) — stable across insert/reorder/delete —
+  // never via loop position, which made a deleted row's Codex verdicts jump
+  // onto the next row.
+  const llmIdBySource = new Map<string, string>();
+  seedRubrics(task).forEach((row, index) => llmIdBySource.set(`${row.kind}:${row.sourceIndex}`, `rubric-${index + 1}`));
+  const llmIdFor = (row: RubricRow): string | null =>
+    row.original !== null && row.sourceIndex !== null ? llmIdBySource.get(`${row.kind}:${row.sourceIndex}`) ?? null : null;
   state.reviewRubrics = rubrics;
-  const persist = () => void saveClaimSnapshot(ctx.adapter.storage, { claim, rubrics, edits });
+  const removedRubrics: RemovedRubric[] = state.reviewRemovedRubrics ?? [];
+  state.reviewRemovedRubrics = removedRubrics;
+  const persist = () => void saveClaimSnapshot(ctx.adapter.storage, { claim, rubrics, removedRubrics, edits });
 
   // Live lock countdown: static text goes stale, and a reviewer who runs past
   // the TTL deserves a warning before submit starts failing.
@@ -112,25 +180,132 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
     )
   );
 
+  const appealReason = task.appeal_of_sub_key ? task.appeal_reason?.trim() : "";
+  if (appealReason) {
+    root.append(
+      el(
+        "section",
+        { class: "notice info author-appeal-context", "aria-label": "Author appeal" },
+        el("strong", null, "Author appeal · fresh review required"),
+        el("p", null, appealReason),
+        el(
+          "small",
+          null,
+          "Review the current task independently. The reviewer who rejected it is excluded from this queue item."
+        )
+      )
+    );
+  }
+
   let llmReview: LlmReviewForHuman | null = null;
   let requestEditor: HTMLTextAreaElement | null = null;
   let llmStatus: "loading" | "not_reviewed" | "pre_qc_passed" | "pre_qc_attention" | "stale" | "error" = "loading";
   const llmPanel = el("div", { class: "llm-preqc-slot" });
   const drawLlmPanel = () => {
-    llmPanel.replaceChildren(
-      renderLlmPanel({
-        review: llmReview,
-        status: llmStatus,
-        onApplyTaskSuggestion: (text) => {
-          if (!requestEditor) return;
-          edits.request = text;
-          requestEditor.value = edits.request;
-          requestEditor.style.height = "auto";
-          requestEditor.style.height = `${Math.max(220, requestEditor.scrollHeight + 2)}px`;
-          persist();
-        },
-      })
+    if (llmStatus === "loading") {
+      llmPanel.replaceChildren(el("div", { class: "llm-preqc-loading" }, el("span", { class: "spinner-dot" }), "Loading the Codex live check…"));
+      return;
+    }
+    if (!llmReview) {
+      // Make "Codex never ran" unmistakable and distinct from "Codex ran and
+      // found nothing" (which renders as a green pass panel below). Reviewers
+      // are briefed to use Codex as a lead; with no lead they must do the
+      // full check themselves.
+      const title = llmStatus === "stale"
+        ? "Codex check is stale"
+        : llmStatus === "error"
+          ? "Codex check unavailable"
+          : "No Codex check for this task";
+      const copy = llmStatus === "stale"
+        ? "This task changed after its last Codex check, so that result no longer applies. There is no automated lead for this version — verify every website and rubric yourself."
+        : llmStatus === "error"
+          ? "The Codex result could not be loaded right now. Treat this review as having no automated lead and verify everything yourself."
+          : "Codex never ran on this version, so nothing has been pre-checked. This is not a clean result — verify every website and rubric yourself.";
+      llmPanel.replaceChildren(el("div", { class: `llm-preqc-empty llm-preqc-missing ${llmStatus}` },
+        el("span", { class: "llm-preqc-missing-icon", "aria-hidden": "true" }, "!"),
+        el("div", null, el("strong", null, title), el("span", null, copy))));
+      return;
+    }
+    const flagged = llmReview.rubrics.filter((rubric) =>
+      rubric.verdict !== "POSSIBLE" || (rubric.quality_verdict !== null && rubric.quality_verdict !== "PASS")
+    ).length;
+    const overallPass = llmReview.status === "LLM_PASS";
+    const coherence = llmReview.quality?.task_coherence ?? llmReview.quality?.prompt_quality ?? null;
+    const taskClear = coherence?.verdict === "PASS";
+    const websitesWork = llmReview.manager_disposition === "FEASIBLE";
+    const taskNote = conciseReviewText(coherence?.summary ?? llmReview.quality?.summary);
+    const websiteNote = conciseReviewText(llmReview.manager_summary);
+    const extraNotes = websiteNote ? [] : distinctReviewText([llmReview.task_feedback]).filter((note) =>
+      taskNote?.toLocaleLowerCase() !== note.toLocaleLowerCase()
     );
+    const details = el(
+      "details",
+      { class: `llm-preqc-panel ${overallPass ? "pass" : "attention"}` },
+      el(
+        "summary",
+        null,
+        el(
+          "span",
+          { class: "llm-preqc-title" },
+          el("strong", null, "Codex live check"),
+          el("small", null, "Task quality, alignment, and feasibility")
+        ),
+        el(
+          "span",
+          { class: `badge ${overallPass ? "ok" : "warn"}` },
+          overallPass ? "Looks good" : flagged > 0 ? `${flagged} step${flagged === 1 ? "" : "s"} need a look` : "Task needs a look"
+        )
+      ),
+      el(
+        "div",
+        { class: "llm-preqc-body" },
+        el(
+          "div",
+          { class: "codex-check-list" },
+          el(
+            "div",
+            { class: `codex-check-item ${taskClear ? "pass" : "attention"}` },
+            el("span", { class: "codex-check-mark", "aria-hidden": "true" }, taskClear ? "✓" : "!"),
+            el("span", { class: "codex-check-copy" }, el("strong", null, "Coherent and high quality"), taskNote ? el("small", null, taskNote) : null),
+            el("span", { class: "codex-check-result" }, taskClear ? "Yes" : "Needs a look")
+          ),
+          el(
+            "div",
+            { class: `codex-check-item ${websitesWork ? "pass" : "attention"}` },
+            el("span", { class: "codex-check-mark", "aria-hidden": "true" }, websitesWork ? "✓" : "!"),
+            el("span", { class: "codex-check-copy" }, el("strong", null, "Feasible overall"), websiteNote ? el("small", null, websiteNote) : null),
+            el("span", { class: "codex-check-result" }, websitesWork ? "Yes" : "Needs a look")
+          )
+        ),
+        ...extraNotes.slice(0, 1).map((note) => el("p", { class: "llm-task-feedback" }, note)),
+        llmReview.task_repair
+          ? el(
+              "details",
+              { class: "llm-repair task-repair" },
+              el("summary", null, "Suggested task edit"),
+              el("p", { class: "suggested-copy" }, llmReview.task_repair.suggested_task_prompt),
+              el(
+                "button",
+                {
+                  class: "btn ghost small",
+                  type: "button",
+                  onclick: () => {
+                    if (!requestEditor || !llmReview?.task_repair) return;
+                    edits.request = llmReview.task_repair.suggested_task_prompt;
+                    requestEditor.value = edits.request;
+                    requestEditor.style.height = "auto";
+                    requestEditor.style.height = `${Math.max(220, requestEditor.scrollHeight + 2)}px`;
+                    persist();
+                  },
+                },
+                "Use this suggestion"
+              )
+            )
+          : null,
+        el("p", { class: "muted small codex-check-foot" }, "Use this as evidence, not the final decision. Nothing changes unless you apply a suggestion.")
+      )
+    );
+    llmPanel.replaceChildren(details);
   };
   drawLlmPanel();
 
@@ -166,6 +341,12 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
   // Rubrics
   const rubricList = el("div", { class: "rubric-list" });
   const expandedRubrics = new Set<RubricRow>();
+  const removedRubricSection = el("section", {
+    class: "removed-rubrics",
+    "aria-label": "Removed rubrics",
+    "aria-live": "polite",
+  });
+  removedRubricSection.hidden = true;
   const approveBtn = el(
     "button",
     { class: "btn primary", type: "button", disabled: true },
@@ -209,6 +390,43 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
         )
       );
     }
+    const newRow = (): RubricRow => ({
+      text: "",
+      original: null,
+      checked: false,
+      kind: usesStepRubrics ? "step" : "criterion",
+      sourceIndex: null,
+      title: usesStepRubrics ? "Added step" : null,
+      seedVersion: 3,
+    });
+    const insertRowAt = (index: number) => {
+      const added = newRow();
+      rubrics.splice(index, 0, added);
+      expandedRubrics.add(added);
+      persist();
+      syncApprove();
+      drawRubrics();
+    };
+    const moveRow = (index: number, delta: number) => {
+      const target = index + delta;
+      if (target < 0 || target >= rubrics.length) return;
+      [rubrics[index], rubrics[target]] = [rubrics[target], rubrics[index]];
+      persist();
+      drawRubrics();
+    };
+    const insertDivider = (index: number) => el(
+      "button",
+      {
+        class: "rubric-insert",
+        type: "button",
+        title: "Insert a step here",
+        "aria-label": `Insert a step at position ${index + 1}`,
+        onclick: () => insertRowAt(index),
+      },
+      el("span", { class: "rubric-insert-line", "aria-hidden": "true" }),
+      el("span", { class: "rubric-insert-plus" }, "+ step"),
+      el("span", { class: "rubric-insert-line", "aria-hidden": "true" })
+    );
     rubrics.forEach((r, i) => {
       // Snapshots created by earlier builds did not carry source metadata.
       // Treat those rows as criteria so an in-flight review remains usable.
@@ -216,7 +434,7 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
       if (r.sourceIndex === undefined) r.sourceIndex = r.kind === "criterion" ? i : null;
       r.title ??= null;
       r.seedVersion ??= 3;
-      const rowNumber = (r.sourceIndex ?? i) + 1;
+      const rowNumber = i + 1;
       const rowKind = "Step";
       const isEdited = () => r.original !== null && r.text.trim() !== r.original.trim();
       const check = el("input", {
@@ -255,7 +473,8 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
         text.style.height = `${Math.max(96, text.scrollHeight + 2)}px`;
       };
       const label = `Step ${rowNumber}${r.title ? ` · ${r.title}` : ""}`;
-      const llm = llmReview?.rubrics.find((candidate) => candidate.rubric_id === `rubric-${i + 1}`) ?? null;
+      const llmId = llmIdFor(r);
+      const llm = llmId ? llmReview?.rubrics.find((candidate) => candidate.rubric_id === llmId) ?? null : null;
       const llmNeedsAttention = Boolean(
         llm && (llm.verdict !== "POSSIBLE" || (llm.quality_verdict !== null && llm.quality_verdict !== "PASS"))
       );
@@ -341,10 +560,14 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
           title: "Remove this step",
           "aria-label": `Remove step ${rowNumber}`,
           onclick: () => {
+            const completeIndex = completeIndexForActiveIndex(i);
             expandedRubrics.delete(r);
             rubrics.splice(i, 1);
+            removedRubrics.push({ row: r, index: completeIndex });
+            removedRubrics.sort((a, b) => a.index - b.index);
             persist();
             drawRubrics();
+            drawRemovedRubrics();
           },
         },
         "Remove"
@@ -420,15 +643,31 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
         }
       };
       summary.onclick = () => setExpanded(!expandedRubrics.has(r));
+      const moveUp = el("button", {
+        class: "rubric-move",
+        type: "button",
+        title: "Move this step up",
+        "aria-label": `Move step ${rowNumber} up`,
+        disabled: i === 0,
+        onclick: () => moveRow(i, -1),
+      }, "↑") as HTMLButtonElement;
+      const moveDown = el("button", {
+        class: "rubric-move",
+        type: "button",
+        title: "Move this step down",
+        "aria-label": `Move step ${rowNumber} down`,
+        disabled: i === rubrics.length - 1,
+        onclick: () => moveRow(i, 1),
+      }, "↓") as HTMLButtonElement;
       const row = el(
         "div",
         { class: `rubric-row ${isEdited() ? "edited" : ""}` },
-        el("span", { class: "rubric-num mono" }, `S${rowNumber}`),
+        el("div", { class: "rubric-row-rail" }, el("span", { class: "rubric-num mono" }, `S${rowNumber}`), el("span", { class: "rubric-move-stack" }, moveUp, moveDown)),
         check,
         el("div", { class: "rubric-content" }, summary, editor)
       );
       setExpanded(expandedRubrics.has(r));
-      rubricList.append(row);
+      rubricList.append(insertDivider(i), row);
     });
     rubricList.append(
       el(
@@ -436,28 +675,78 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
         {
           class: "btn ghost small",
           type: "button",
-          onclick: () => {
-            const added: RubricRow = {
-              text: "",
-              original: null,
-              checked: false,
-              kind: usesStepRubrics ? "step" : "criterion",
-              sourceIndex: null,
-              title: usesStepRubrics ? "Added step" : null,
-              seedVersion: 3,
-            };
-            rubrics.push(added);
-            expandedRubrics.add(added);
-            persist();
-            drawRubrics();
-          },
+          onclick: () => insertRowAt(rubrics.length),
         },
         "+ Add a step"
       )
     );
     syncApprove();
   };
+
+  function completeIndexForActiveIndex(activeIndex: number): number {
+    let completeIndex = activeIndex;
+    for (const removed of removedRubrics) {
+      if (removed.index <= completeIndex) completeIndex += 1;
+    }
+    return completeIndex;
+  }
+
+  function restoreRemovedRubric(removedIndex: number): void {
+    const [removed] = removedRubrics.splice(removedIndex, 1);
+    if (!removed) return;
+    const earlierStillRemoved = removedRubrics.filter((candidate) => candidate.index < removed.index).length;
+    const restoreAt = Math.max(0, Math.min(removed.index - earlierStillRemoved, rubrics.length));
+    rubrics.splice(restoreAt, 0, removed.row);
+    expandedRubrics.add(removed.row);
+    persist();
+    drawRubrics();
+    drawRemovedRubrics();
+  }
+
+  function drawRemovedRubrics(): void {
+    removedRubricSection.hidden = removedRubrics.length === 0;
+    if (!removedRubrics.length) {
+      removedRubricSection.replaceChildren();
+      return;
+    }
+    removedRubricSection.replaceChildren(
+      el(
+        "div",
+        { class: "removed-rubrics-head" },
+        el("strong", null, "Removed rubrics"),
+        el("span", null, "Excluded from approval unless restored")
+      ),
+      el(
+        "div",
+        { class: "removed-rubrics-list" },
+        ...removedRubrics.map((removed, index) =>
+          el(
+            "div",
+            { class: "removed-rubric-row" },
+            el(
+              "div",
+              { class: "removed-rubric-copy" },
+              el("span", { class: "removed-rubric-label" }, removed.row.title || "Removed step"),
+              el("span", { class: "removed-rubric-preview" }, removed.row.text || "Empty step")
+            ),
+            el(
+              "button",
+              {
+                class: "btn ghost small removed-rubric-undo",
+                type: "button",
+                "aria-label": `Undo removal of ${removed.row.title || `step ${removed.index + 1}`}`,
+                onclick: () => restoreRemovedRubric(index),
+              },
+              "Undo"
+            )
+          )
+        )
+      )
+    );
+  }
+
   drawRubrics();
+  drawRemovedRubrics();
 
   const evergreenField = el(
     "label",
@@ -475,7 +764,8 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
     { class: "field" },
     el("span", { class: "field-label" }, "Rubrics"),
     el("p", { class: "field-hint" }, "Open each rubric. Check live-web feasibility and task fit, edit if needed, then check it off."),
-    rubricList
+    rubricList,
+    removedRubricSection
   );
   form.append(
     el("section", { class: "review-request-column", "aria-label": "Task prompt review" }, requestField, evergreenField, llmPanel),
@@ -484,18 +774,24 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
 
   // Reject: for tasks with no salvageable intent. Two-step (button reveals a
   // reason row) so one misclick can't discard someone's submission.
-  const rejectReason = el("input", {
+  const rejectReasonCount = el(
+    "span",
+    { id: "review-rejection-reason-count", class: "reject-reason-count", "aria-live": "polite" },
+    "0 / 500"
+  );
+  const rejectReason = el("textarea", {
+    id: "review-rejection-reason",
     class: "input reject-reason",
-    type: "text",
-    placeholder: "Say what is wrong and what the author would have to change — they see this.",
+    rows: "4",
+    maxlength: "500",
+    required: true,
+    "aria-describedby": "review-rejection-reason-help review-rejection-reason-count",
+    placeholder: "Describe the fundamental problem and why a small edit cannot fix it.",
     oninput: () => {
-      const short = rejectReason.value.trim().length < MIN_REJECT_REASON;
-      rejectConfirm.disabled = short;
-      rejectConfirm.title = short
-        ? `Give the author at least ${MIN_REJECT_REASON} characters to work with`
-        : "";
+      rejectConfirm.disabled = rejectReason.value.trim().length < MIN_REJECT_REASON;
+      rejectReasonCount.textContent = `${rejectReason.value.length} / 500`;
     },
-  }) as HTMLInputElement;
+  }) as HTMLTextAreaElement;
   const rejectConfirm = el(
     "button",
     {
@@ -541,15 +837,21 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
   ) as HTMLButtonElement;
   rejectConfirm.disabled = true;
   const rejectRow = el(
-    "div",
-    { class: "reject-row" },
-    rejectReason,
-    rejectConfirm,
+    "section",
+    { class: "reject-row", "aria-label": "Reject task" },
     el(
-      "p",
-      { class: "field-hint reject-hint" },
-      "Your step notes go to the author with this, anonymously. They can appeal a rejection once, and a vague reason is what turns into a wasted appeal."
-    )
+      "div",
+      { class: "reject-field" },
+      el("label", { class: "field-label", for: "review-rejection-reason" }, "Reason for rejection"),
+      el(
+        "p",
+        { id: "review-rejection-reason-help", class: "field-hint" },
+        "Required. Reject only when the task cannot be repaired without replacing its core goal."
+      ),
+      rejectReason,
+      rejectReasonCount
+    ),
+    el("div", { class: "reject-confirm-actions" }, rejectConfirm)
   );
   rejectRow.style.display = "none";
   const rejectBtn = el(
@@ -587,7 +889,13 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
         returnConfirm.disabled = true;
         returnConfirm.textContent = "Sending back…";
         try {
-          await reviewReturn(state.reviewKey!, ctx.actions.reviewerName(), claim, returnReason.value.trim());
+          await reviewReturn(
+            state.reviewKey!,
+            ctx.actions.reviewerName(),
+            claim,
+            returnReason.value.trim(),
+            ctx.actions.reviewerPid()
+          );
           ctx.actions.endReview("Sent back to the author for revision.");
         } catch (err) {
           ctx.actions.notifyError(err instanceof Error ? err.message : String(err));
@@ -624,12 +932,15 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
       type: "button",
       onclick: async () => {
         skipBtn.disabled = true;
+        // Remember the skip BEFORE releasing so the next claim in this
+        // session hands back a different task, not this one again.
+        rememberReviewSkip(claim.subKey);
         try {
-          await reviewRelease(state.reviewKey!, claim);
+          await reviewRelease(state.reviewKey!, claim, ctx.actions.reviewerName());
         } catch {
           // lock will expire on its own — still leave the screen
         }
-        ctx.actions.endReview("Task released back to the queue.");
+        ctx.actions.endReview("Task released back to the queue — you'll get a different one next claim.");
       },
     },
     "Skip"

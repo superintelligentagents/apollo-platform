@@ -14,6 +14,7 @@ import base64
 import hashlib
 import json
 import mimetypes
+import re
 import shutil
 import subprocess
 import tempfile
@@ -23,14 +24,45 @@ from typing import Any, Iterable
 
 
 SCHEMA_VERSION = "apollo-trajectory-review-package-v1"
-S3_ROOT = "v2-review/trajectory-runs"
-INBOX_ROOT = "v2-review/trajectory-inbox"
+QUEUE_ROOTS = {
+    "v2": ("v2-review/trajectory-runs", "v2-review/trajectory-inbox"),
+    "pc": ("pc-review/trajectory-runs", "pc-review/trajectory-inbox"),
+}
 MAX_STEPS = 500
 MAX_PACKAGE_BYTES = 4_000_000
 
 
 class PackageError(ValueError):
     pass
+
+
+def task_belongs_to_queue(task_id: str, queue: str) -> bool:
+    """Keep PC packages out of v2 and all non-PC packages out of PC."""
+    is_pc = str(task_id).startswith(("pc_", "pc/"))
+    return is_pc if queue == "pc" else not is_pc
+
+
+VALID_PID = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$")
+
+
+def creator_pid_for(task_result: dict[str, Any], task_id: str, override: str = "") -> str:
+    """Resolve the Apollo author used for creator-only trajectory grading."""
+    candidates = [
+        override,
+        task_result.get("creator_pid"),
+        task_result.get("participant_id"),
+        task_result.get("author_pid"),
+    ]
+    match = re.match(r"^(?:v2|pc)/([^/]+)/", task_id)
+    if match:
+        candidates.append(match.group(1))
+    for value in candidates:
+        pid = _text(value, 80).lower()
+        if VALID_PID.fullmatch(pid):
+            return pid
+    raise PackageError(
+        f"creator_pid is required for task {task_id}; use an Apollo task ID or provide --creator-map"
+    )
 
 
 def _text(value: Any, limit: int) -> str:
@@ -184,12 +216,14 @@ def prepare_one(
     agent: str = "",
     model: str = "",
     run_label: str = "",
+    creator_pid: str = "",
 ) -> tuple[Path, dict[str, Any]]:
     task_id = _text(task_result.get("task_id"), 300)
     prompt = _text(task_result.get("task"), 200_000)
     run_value = _text(task_result.get("run_dir"), 10_000)
     if not task_id or not prompt or not run_value:
         raise PackageError("task_id, task, and run_dir are required")
+    resolved_creator_pid = creator_pid_for(task_result, task_id, creator_pid)
     raw_run_dir = Path(run_value).expanduser()
     candidates = [raw_run_dir] if raw_run_dir.is_absolute() else [
         (runs_root / raw_run_dir) if runs_root else None,
@@ -214,6 +248,7 @@ def prepare_one(
         "agent": _text(agent, 120),
         "model": _text(model, 160),
         "run_label": _text(run_label, 240),
+        "creator_pid": resolved_creator_pid,
     }
     normalized_result = json.dumps(fingerprint_result, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     evidence_chunks = [normalized_result, trajectory_path.read_bytes()]
@@ -256,6 +291,7 @@ def prepare_one(
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "task_id": task_id,
+        "creator_pid": resolved_creator_pid,
         "task_prompt": prompt,
         "created_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "source": {
@@ -289,9 +325,11 @@ def prepare_one(
 def validate_manifest(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("schema_version") != SCHEMA_VERSION:
         raise PackageError(f"schema_version must be {SCHEMA_VERSION}")
-    for field in ("run_id", "task_id", "task_prompt"):
+    for field in ("run_id", "task_id", "task_prompt", "creator_pid"):
         if not isinstance(value.get(field), str) or not value[field].strip():
             raise PackageError(f"{field} is required")
+    if not VALID_PID.fullmatch(value["creator_pid"]):
+        raise PackageError("creator_pid must be a valid Apollo participant id")
     rubrics = value.get("rubrics")
     steps = value.get("steps")
     if not isinstance(rubrics, list) or not rubrics:
@@ -349,11 +387,27 @@ def put_object_if_absent(
     raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout, stderr=result.stderr)
 
 
-def upload_package(manifest_path: Path, manifest: dict[str, Any], bucket: str, aws_cli: str = "aws") -> str:
+def upload_package(
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    bucket: str,
+    aws_cli: str = "aws",
+    *,
+    queue: str = "v2",
+) -> str:
     package_dir = manifest_path.parent
     task_id = manifest["task_id"]
+    creator_pid = _text(manifest.get("creator_pid"), 80).lower()
+    if not VALID_PID.fullmatch(creator_pid):
+        raise PackageError("creator_pid is required before a trajectory can be queued")
     run_id = manifest["run_id"]
-    s3_prefix = f"{S3_ROOT}/{_encoded(task_id)}/{run_id}"
+    if not task_belongs_to_queue(task_id, queue):
+        raise PackageError(f"Task {task_id} does not belong to the {queue} trajectory queue")
+    try:
+        s3_root, inbox_root = QUEUE_ROOTS[queue]
+    except KeyError as exc:
+        raise PackageError(f"Unknown trajectory queue: {queue}") from exc
+    s3_prefix = f"{s3_root}/{_encoded(task_id)}/{run_id}"
     screens_dir = package_dir / "screens"
     if screens_dir.is_dir():
         subprocess.run([
@@ -368,7 +422,7 @@ def upload_package(manifest_path: Path, manifest: dict[str, Any], bucket: str, a
         content_type="application/json",
         aws_cli=aws_cli,
     )
-    marker_key = f"{INBOX_ROOT}/{_encoded(manifest_key)}"
+    marker_key = f"{inbox_root}/{creator_pid}/{_encoded(manifest_key)}"
     with tempfile.NamedTemporaryFile("w", encoding="utf-8") as marker:
         marker.write(manifest_key)
         marker.flush()
@@ -412,6 +466,12 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path(".work/trajectory_review"))
     parser.add_argument("--runs-root", type=Path, default=None, help="Optional base for relative run_dir values")
     parser.add_argument("--s3-bucket", default=None, help="Upload packages and enqueue them after local validation")
+    parser.add_argument(
+        "--queue",
+        choices=tuple(QUEUE_ROOTS),
+        default="v2",
+        help="Human grading queue and S3 prefix family (use pc for Apollo PC trajectories)",
+    )
     parser.add_argument("--aws-cli", default="aws")
     parser.add_argument(
         "--task-id",
@@ -423,6 +483,12 @@ def main() -> None:
     parser.add_argument("--agent", default="", help="Agent or runner name shown to human graders")
     parser.add_argument("--model", default="", help="Model name shown to human graders")
     parser.add_argument("--run-label", default="", help="Optional experiment or evaluation label")
+    parser.add_argument(
+        "--creator-map",
+        type=Path,
+        default=None,
+        help="JSON object mapping task_id to the original Apollo creator participant id",
+    )
     args = parser.parse_args()
 
     eval_path = args.eval_results.expanduser().resolve()
@@ -434,6 +500,13 @@ def main() -> None:
         tasks = select_task_results(tasks, args.task_id, args.limit)
     except PackageError as exc:
         raise SystemExit(str(exc)) from exc
+
+    creator_map: dict[str, str] = {}
+    if args.creator_map:
+        raw_map = json.loads(args.creator_map.expanduser().read_text(encoding="utf-8"))
+        if not isinstance(raw_map, dict):
+            raise SystemExit("--creator-map must contain a JSON object")
+        creator_map = {str(key): str(value) for key, value in raw_map.items()}
 
     prepared: list[dict[str, Any]] = []
     skipped: list[dict[str, str]] = []
@@ -450,11 +523,21 @@ def main() -> None:
                 agent=args.agent,
                 model=args.model,
                 run_label=args.run_label,
+                creator_pid=creator_map.get(_text(task_result.get("task_id"), 300), ""),
             )
-            manifest_key = upload_package(manifest_path, manifest, args.s3_bucket, args.aws_cli) if args.s3_bucket else None
+            if not task_belongs_to_queue(manifest["task_id"], args.queue):
+                raise PackageError(f"Task {manifest['task_id']} does not belong to the {args.queue} trajectory queue")
+            manifest_key = upload_package(
+                manifest_path,
+                manifest,
+                args.s3_bucket,
+                args.aws_cli,
+                queue=args.queue,
+            ) if args.s3_bucket else None
             prepared.append({
                 "task_id": manifest["task_id"],
                 "run_id": manifest["run_id"],
+                "creator_pid": manifest["creator_pid"],
                 "manifest_path": str(manifest_path),
                 "manifest_key": manifest_key,
             })
@@ -464,6 +547,7 @@ def main() -> None:
     summary = {
         "schema_version": "apollo-trajectory-prepare-summary-v1",
         "created_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "queue": args.queue,
         "prepared": prepared,
         "skipped": skipped,
     }

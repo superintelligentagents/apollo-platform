@@ -61,9 +61,6 @@ export interface UploadLogEntry {
   strength?: string;
   score?: number;
   at: string; // ISO timestamp
-  // Distribution metadata, kept locally so an author can see the spread of
-  // their own submissions without a round trip. Optional: rows written before
-  // the field existed are still valid.
   region?: string;
   subjects?: string[];
 }

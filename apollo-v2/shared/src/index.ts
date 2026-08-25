@@ -9,7 +9,6 @@ export * from "./upload";
 export * from "./templates";
 export * from "./drafts";
 export * from "./quality";
-export * from "./diff";
 export * from "./platform";
 export * from "./config";
 export { mountApp } from "./ui/app";

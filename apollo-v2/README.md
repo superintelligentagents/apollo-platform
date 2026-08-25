@@ -12,6 +12,7 @@ v1 (`journeys-helper-tauri/`, `web_app/`) is untouched.
 | **Reviewer guide** | [REVIEWING.md](REVIEWING.md) |
 | **History helper extension** | [`extension/`](extension/README.md) — one-click Chrome history import (store package ready, see `extension/PUBLISH.md`) |
 | **Upload API** | `https://2fb2wkpayf.execute-api.us-east-1.amazonaws.com/presign` → bucket `journeys-prolific` |
+| **Review queue** | `v2-review/` via Lambda `journeys-presign`; isolated from Apollo PC |
 | **Collection monitor** | `JourneysData/v2_dashboard.html` + `ingest_v2_long_tasks.py --watch N` |
 
 ```
@@ -63,7 +64,8 @@ A submission is not claimable until every rubric in its exact current content ha
   on the presign lambda, gated by its `REVIEW_KEY` env var (rotate via
   `aws lambda update-function-configuration`). Unknown routes and non-POST methods are rejected.
   API Gateway is throttled globally, with a tighter throttle on `/presign`. Source:
-  `backend/lambda_presign.js`.
+  `backend/lambda_presign.js`. Production sets `APP_SCOPE=primary` and
+  `REVIEW_PREFIX=v2-review/`; valid PC-shaped uploads are rejected before presigning.
 
 ## Human trajectory QC
 
@@ -111,10 +113,15 @@ npm run dev:tauri   # desktop
 
 | What | How |
 |---|---|
-| Web | `npm run build -w web`, copy `web/dist/` to a clean dir linked to Vercel project `apollo-v2-site`, `npx vercel deploy --prod`. **Never** cloud-build (workspace dep breaks it). Any static host works; subpaths need `--base`. |
+| Web | Merges to `main` are built by the Git-connected Vercel project `apollo-v2-site` from root `apollo-v2` using `npm ci` and `npm run build:web`; output is `web/dist`. `web/deploy_prod.sh` remains the prebuilt emergency fallback. Any static host works; subpaths need `--base`. |
 | Desktop DMG | `IDENTITY=… NOTARY_PROFILE=… ./scripts/build_mac_v2.sh` (repo root) — signs, notarizes, uploads; never touches v1. |
 | Extension | Unpacked zip served at `/apollo-history-helper.zip`; Chrome Web Store package `extension/apollo-history-helper-store.zip` contains only store assets and code. The private signing key never ships. Steps: `extension/PUBLISH.md`. |
 | Review key | `REVIEW_KEY` env on lambda `journeys-presign` validates every call; bake it into clients with `VITE_REVIEW_KEY=… npm run build -w web` (reviewers never enter it). |
+
+The V2 Lambda runs as `journeys-presign-role`, which can access V2/legacy upload
+objects and `v2-review/*` and explicitly denies PC upload objects. Apollo PC has
+its own Lambda, role, API, and review root. Follow the shared deployment and
+queue checklist in [`../docs/APOLLO_PLATFORM_README.md`](../docs/APOLLO_PLATFORM_README.md).
 
 ## Limits worth knowing
 

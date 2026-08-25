@@ -43,8 +43,11 @@ describe("distribution fields on the authoring screen", () => {
     const block = root.querySelector(".metadata-fields");
 
     expect(block).not.toBeNull();
+    expect(block!.textContent).toContain("Two quick picks help keep the collection balanced.");
     expect(block!.textContent).toContain("Where is it anchored?");
     expect(block!.textContent).toContain("What is it about?");
+    expect(block!.textContent).toContain(`Pick 1-${MAX_SUBJECTS} subjects.`);
+    expect(block!.querySelector(".metadata-grid")).not.toBeNull();
     // The sites a task uses are computed from the record, never asked for.
     expect(block!.textContent).not.toContain("Which sites");
     expect(block!.querySelectorAll("input")).toHaveLength(0);
