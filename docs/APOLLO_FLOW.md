@@ -47,7 +47,7 @@ flowchart TD
 
 Task reviewers see the immutable submitted task beside a working copy, Task coherence and Live-web feasibility, Reachable and Compatible status for every rubric, evidence, and only independently verified suggestions. A suggestion changes the working copy only after the reviewer clicks the apply button.
 
-Authors see their own tasks at `#/my-tasks`. An approved task shows the reviewer's name, their original beside the final gold, and a choice: accept it, or edit the reviewer's version into a new final gold. A rejected task shows the reason and the reviewer's step-level notes with no name attached, and offers one appeal, which a different reviewer picks up.
+Authors see their own tasks at `#/my-tasks`. An approved task shows the reviewer's name, an inline redline of every edit the reviewer made — removals struck through, additions marked, untouched steps folded away — and a choice: accept it, or edit the reviewer's version into a new final gold. An approval the reviewer did not touch says so instead of showing a diff, and the full side-by-side versions stay one click away. A rejected task shows the reason and the reviewer's step-level notes with no name attached, and offers one appeal, which a different reviewer picks up.
 
 Trajectory graders see the prompt and rubric/verifier text only as reference, plus chronological screenshots and actions. They independently mark each rubric `Pass`, `Fail`, or `Unclear`, then give the same overall task-satisfaction verdict. The LLM trajectory judgment is deliberately hidden until the human submits, so it cannot bias the grade. Prompt quality and rubric correctness are handled in human task QC, not repeated here.
 

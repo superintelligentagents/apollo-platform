@@ -1419,6 +1419,58 @@ kbd.hotkey {
 .admin-rubric-list li, .admin-step-list li { margin-bottom: 6px; padding-left: 3px; }
 .admin-step-list p { margin: 2px 0 0; }
 .admin-empty { padding: 30px 8px; text-align: center; }
+
+/* ---------- Author sign-off redline ---------- */
+/* Word-level diff of the author's submission against final gold. Colour is
+   decoration only: the meaning is carried by <del>/<ins> plus the strike and
+   underline, so it survives a greyscale print or a colour-blind reader. */
+.my-task-versions { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+.my-task-diff-toggle { display: flex; align-items: center; gap: 6px; }
+.my-task-diff-toggle .btn.active { background: var(--cobalt-wash); color: var(--cobalt-deep); border-color: var(--cobalt); }
+.my-task-redline-wrap { min-width: 0; }
+.my-task-redline .field-hint { margin: 10px 0 0; }
+.redline-block { margin-top: 14px; }
+.redline-block h6, .my-task-redline-section h6 { margin: 0 0 6px; font-size: 12px; }
+.redline-text {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.redline-del {
+  color: var(--red);
+  background: var(--red-wash);
+  text-decoration: line-through;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+.redline-ins {
+  color: var(--green);
+  background: var(--green-wash);
+  text-decoration: underline;
+  border-radius: 3px;
+  padding: 0 1px;
+}
+.my-task-redline-section { margin-top: 16px; }
+.my-task-redline-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.my-task-redline-row { padding: 8px 10px; border: 1px solid var(--line); border-left-width: 3px; border-radius: var(--radius-sm); background: var(--surface-2); }
+.my-task-redline-row.is-unchanged { border-left-color: var(--line); }
+.my-task-redline-row.is-changed { border-left-color: var(--cobalt); }
+.my-task-redline-row.is-added { border-left-color: var(--green); }
+.my-task-redline-row.is-removed { border-left-color: var(--red); }
+.my-task-redline-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.my-task-redline-head strong { font-size: 12.5px; }
+.redline-chip.is-changed { background: var(--cobalt-wash); color: var(--cobalt-deep); }
+.redline-chip.is-added { background: var(--green-wash); color: var(--green); }
+.redline-chip.is-removed { background: var(--red-wash); color: var(--red); }
+.my-task-redline-row.is-unchanged { padding: 4px 10px; background: transparent; }
+.redline-unchanged summary { display: flex; align-items: center; gap: 8px; cursor: pointer; color: var(--ink-faint); font-size: 12.5px; }
+.redline-unchanged summary strong { font-weight: 500; }
+.redline-unchanged .redline-text { margin-top: 6px; }
+.my-task-redline-none { margin: 0 0 10px; }
+
 @media (max-width: 820px) {
   .admin-section-head { align-items: start; flex-direction: column; gap: 8px; }
   .admin-section-head > .muted { text-align: left; }

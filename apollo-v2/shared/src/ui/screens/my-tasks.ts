@@ -22,8 +22,22 @@ import {
   type LlmPanelStatus,
 } from "../components/llm-panel";
 import { participantId as schemaParticipantId } from "../../schema";
+import { alignCriteria, alignSteps, summarizeChanges, type StepDiffRow } from "../../diff";
+import { redlineBlock, redlineNodes } from "../components/redline";
 
 const PAGE_SIZE = 50;
+
+// Unified redline or the old two-column view. Module-scoped on purpose: an
+// author works down a queue of approvals, so the choice should hold across rows
+// for the session. Nothing in shared/src uses localStorage and this is not the
+// place to start.
+type DiffView = "unified" | "split";
+let diffView: DiffView = "unified";
+
+/** Reset hook: the view is module state, so tests must not inherit it. */
+export function setDiffView(view: DiffView): void {
+  diffView = view;
+}
 
 const STATUS_LABEL: Record<MyTaskStatus, string> = {
   awaiting_codex: "Awaiting Codex",
@@ -112,7 +126,9 @@ function diffSnapshot(label: string, snap: MyTaskContentSnapshot, extraClass = "
   );
 }
 
-function renderDiff(hr: MyTaskHumanReview): HTMLElement {
+// The original two-column view. Named for what it actually does — it renders
+// two whole snapshots and diffs nothing — now that a real diff sits beside it.
+function renderSplitSnapshots(hr: MyTaskHumanReview): HTMLElement {
   const finalLabel = hr.amended_by
     ? "Final gold · your amendment"
     : hr.changed === false
@@ -123,6 +139,156 @@ function renderDiff(hr: MyTaskHumanReview): HTMLElement {
     { class: "admin-snapshots has-final my-task-diff" },
     diffSnapshot(hr.title_edited || hr.request_edited ? "Your original" : "Your submission", hr.original),
     diffSnapshot(finalLabel, hr.final, "final")
+  );
+}
+
+const ROW_CHIP: Record<Exclude<StepDiffRow["status"], "unchanged">, string> = {
+  changed: "edited",
+  added: "added",
+  removed: "removed",
+};
+
+function redlineRow(row: StepDiffRow, index: number): HTMLElement {
+  // Untouched rows fold away. On the common approval — one step edited out of
+  // ten — this is the difference between a screenful and a scroll.
+  if (row.status === "unchanged") {
+    return el(
+      "li",
+      { class: "my-task-redline-row is-unchanged" },
+      el(
+        "details",
+        { class: "redline-unchanged" },
+        el(
+          "summary",
+          null,
+          el("span", { class: "rubric-num mono" }, String(index + 1)),
+          el("strong", null, row.title),
+          el("span", { class: "muted small" }, "unchanged")
+        ),
+        el("p", { class: "redline-text" }, row.after ?? "")
+      )
+    );
+  }
+
+  const body: (HTMLElement | string)[] =
+    row.status === "removed"
+      ? [el("del", { class: "redline-del" }, row.before ?? "")]
+      : row.status === "added"
+        ? [el("ins", { class: "redline-ins" }, row.after ?? "")]
+        : redlineNodes(row.before ?? "", row.after ?? "");
+
+  return el(
+    "li",
+    { class: `my-task-redline-row is-${row.status}` },
+    el(
+      "div",
+      { class: "my-task-redline-head" },
+      el("span", { class: "rubric-num mono" }, String(index + 1)),
+      el("strong", null, row.title),
+      el("span", { class: `chip tag redline-chip is-${row.status}` }, ROW_CHIP[row.status])
+    ),
+    el("p", { class: "redline-text" }, ...body)
+  );
+}
+
+function redlineSection(heading: string, rows: StepDiffRow[]): HTMLElement | null {
+  if (!rows.length) return null;
+  return el(
+    "div",
+    { class: "my-task-redline-section" },
+    el("h6", null, heading),
+    el("ol", { class: "my-task-redline-list" }, ...rows.map(redlineRow))
+  );
+}
+
+// One sentence naming what moved, so the author knows what to look for before
+// they start reading.
+function changeSummaryLine(hr: MyTaskHumanReview): string {
+  const summary = summarizeChanges(hr);
+  const parts: string[] = [];
+  if (summary.titleChanged) parts.push("the title");
+  if (summary.requestChanged) parts.push("the request");
+  if (summary.stepsChanged) {
+    parts.push(`${summary.stepsChanged} of ${summary.stepsTotal} ${summary.stepsTotal === 1 ? "step" : "steps"}`);
+  }
+  if (summary.criteriaChanged) {
+    parts.push(`${summary.criteriaChanged} success ${summary.criteriaChanged === 1 ? "criterion" : "criteria"}`);
+  }
+  if (!parts.length) return "Nothing changed.";
+  const listed = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
+  return `Changed: ${listed}.`;
+}
+
+function renderUnifiedRedline(hr: MyTaskHumanReview): HTMLElement {
+  const summary = summarizeChanges(hr);
+
+  // An untouched approval used to render two identical columns. There is
+  // nothing to compare, so show the task once and say so.
+  if (!summary.anyChange) {
+    return el(
+      "div",
+      { class: "my-task-redline-wrap" },
+      el("p", { class: "notice ok my-task-redline-none" }, "Approved as you wrote it — the reviewer changed nothing."),
+      diffSnapshot("Final gold · unchanged", hr.final, "final")
+    );
+  }
+
+  // After an amendment this is no longer purely the reviewer's doing: the
+  // frozen review block is never rewritten, so original → final now spans the
+  // author's own edit too. Say that rather than implying the reviewer did it.
+  const heading = hr.amended_by ? "Your original vs the current final gold" : "What the reviewer changed";
+  const note = hr.amended_by
+    ? "This includes your own amendment, not just the reviewer's edits."
+    : null;
+
+  return el(
+    "div",
+    { class: "my-task-redline-wrap" },
+    el(
+      "section",
+      { class: "admin-snapshot my-task-redline" },
+      el("div", { class: "admin-snapshot-head" }, el("h5", null, heading)),
+      el("p", { class: "field-hint" }, changeSummaryLine(hr)),
+      note ? el("p", { class: "muted small" }, note) : null,
+      redlineBlock("Title", hr.original.title || "", hr.final.title || ""),
+      redlineBlock("Request", hr.original.request || "", hr.final.request || ""),
+      redlineSection("Success criteria", alignCriteria(hr)),
+      redlineSection("Steps", alignSteps(hr))
+    )
+  );
+}
+
+function diffViewToggle(onPick: () => void): HTMLElement {
+  const button = (view: DiffView, label: string) =>
+    el(
+      "button",
+      {
+        class: `btn ghost tiny ${diffView === view ? "active" : ""}`.trim(),
+        type: "button",
+        "aria-pressed": diffView === view ? "true" : "false",
+        onclick: () => {
+          if (diffView === view) return;
+          diffView = view;
+          onPick();
+        },
+      },
+      label
+    );
+  return el(
+    "div",
+    { class: "my-task-diff-toggle" },
+    el("span", { class: "muted small" }, "View"),
+    button("unified", "Redline"),
+    button("split", "Side-by-side")
+  );
+}
+
+export function renderVersionPanel(hr: MyTaskHumanReview, onToggle: () => void): HTMLElement {
+  return el(
+    "div",
+    { class: "my-task-versions" },
+    diffViewToggle(onToggle),
+    diffView === "unified" ? renderUnifiedRedline(hr) : renderSplitSnapshots(hr)
   );
 }
 
@@ -446,7 +612,7 @@ function renderFeedback(
     if (approved && fb.human_review) {
       const line = reviewerLine(fb.human_review);
       if (line) wrap.append(line);
-      wrap.append(renderDiff(fb.human_review));
+      wrap.append(renderVersionPanel(fb.human_review, draw));
     } else {
       wrap.append(readOnlyTask(item, fb));
     }
