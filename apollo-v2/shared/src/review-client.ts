@@ -712,6 +712,10 @@ export interface MyTaskContentSnapshot {
 export interface MyTaskHumanReviewRubric {
   rubric_id: string;
   kind: string;
+  // The index of the step this rubric came from in the author's ORIGINAL task,
+  // or null for a step the reviewer added. Optional: records reviewed before
+  // this shipped, and the rejection-feedback payload, may omit it.
+  source_index?: number | null;
   title: string | null;
   original: string | null;
   final: string;

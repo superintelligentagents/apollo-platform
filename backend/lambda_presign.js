@@ -2861,7 +2861,7 @@ export function buildAmendedFinalGold({ existing, amendedTask, contentHash, auth
 // reviewer's name — the author should be able to go and talk to whoever edited
 // their work. Rejections and returns stay anonymous; that is handled at the
 // call site, which never passes a rejecter through.
-function buildHumanReviewForAuthor(finished, source) {
+export function buildHumanReviewForAuthor(finished, source) {
   if (!finished || typeof finished !== "object") return null;
   const original = cleanTaskSnapshot(source?.task ?? source);
   const final = cleanTaskSnapshot(finished?.task ?? null);
@@ -2873,6 +2873,11 @@ function buildHumanReviewForAuthor(finished, source) {
     rubrics: rubrics.map((rubric) => ({
       rubric_id: rubric.rubric_id,
       kind: rubric.kind,
+      // Which ORIGINAL step this rubric came from, or null when the reviewer
+      // added it. The author screen needs this to align the redline: a step the
+      // reviewer DELETED leaves no rubric at all, so the only way to show the
+      // author it was dropped is to find the original indices nothing claims.
+      source_index: rubric.source_index,
       title: rubric.title,
       original: rubric.original,
       final: rubric.final,
@@ -2911,6 +2916,7 @@ function buildRejectionFeedbackForAuthor(rejected, source) {
     rubrics: rubrics.map((rubric) => ({
       rubric_id: rubric.rubric_id,
       kind: rubric.kind,
+      source_index: rubric.source_index,
       title: rubric.title,
       original: rubric.original,
       final: rubric.final,

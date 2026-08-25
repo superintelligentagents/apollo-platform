@@ -42,6 +42,7 @@ import {
   hydrateReportingLlmReviews,
   cleanTaskSnapshot,
   cleanRubrics,
+  buildHumanReviewForAuthor,
   taskMetadataForReporting,
   sortPendingReviewUnits,
   pendingReviewUnits,
@@ -1371,4 +1372,56 @@ test("the standing amendment appears in the author's timeline, not just replaced
 
   assert.deepEqual(history.map((entry) => entry.event), ["submitted", "approved", "amended"]);
   assert.equal(history.at(-1).by, "alice");
+});
+
+test("forwards source_index to the author, so a deleted step is still visible", () => {
+  // The author sign-off redline pairs steps on source_index. A step the
+  // reviewer REMOVED leaves no rubric behind, so the only way to show the
+  // author it was dropped is to find the original index nothing claims.
+  const source = {
+    task: {
+      task_title: "Book a trip",
+      agent_request: "Book a trip.",
+      steps: [
+        { order: 1, title: "One", description: "Keep this." },
+        { order: 2, title: "Two", description: "Drop this." },
+        { order: 3, title: "Three", description: "Edit this." },
+      ],
+    },
+  };
+  const finished = {
+    task: {
+      task_title: "Book a trip",
+      agent_request: "Book a trip.",
+      steps: [
+        { order: 1, title: "One", description: "Keep this." },
+        { order: 2, title: "Three", description: "Edit this, revised." },
+        { order: 3, title: "Four", description: "Added by the reviewer." },
+      ],
+    },
+    reviewed_by: "Dana",
+    review: {
+      rubrics: [
+        { kind: "step", source_index: 0, title: "One", original: "Keep this.", final: "Keep this.", changed: false, checked: true },
+        { kind: "step", source_index: 2, title: "Three", original: "Edit this.", final: "Edit this, revised.", changed: true, checked: true },
+        { kind: "step", source_index: null, title: "Four", original: null, final: "Added by the reviewer.", changed: true, checked: true },
+      ],
+    },
+  };
+
+  const hr = buildHumanReviewForAuthor(finished, source);
+  assert.deepEqual(hr.rubrics.map((r) => r.source_index), [0, 2, null]);
+  // Index 1 is claimed by nobody: that is the deleted step.
+  const claimed = new Set(hr.rubrics.map((r) => r.source_index).filter((i) => typeof i === "number"));
+  assert.equal(claimed.has(1), false);
+  assert.equal(hr.original.steps[1].description, "Drop this.");
+});
+
+test("forwards source_index through the cleanRubrics fallback too", () => {
+  const source = { task: { task_title: "T", agent_request: "R", steps: [{ order: 1, title: "One", description: "Before." }] } };
+  const finished = { task: { task_title: "T", agent_request: "R", steps: [{ order: 1, title: "One", description: "After." }] }, review: {} };
+  const hr = buildHumanReviewForAuthor(finished, source);
+  assert.equal(hr.rubrics[0].source_index, 0);
+  assert.equal(hr.rubrics[0].original, "Before.");
+  assert.equal(hr.rubrics[0].final, "After.");
 });

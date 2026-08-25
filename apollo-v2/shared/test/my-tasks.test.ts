@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Ctx } from "../src/ui/context";
 import { initialState } from "../src/ui/context";
-import { editModeFor, editSeed, renderMyTasks, signoffProgress, signoffSuffix } from "../src/ui/screens/my-tasks";
+import { editModeFor, editSeed, renderMyTasks, setDiffView, signoffProgress, signoffSuffix } from "../src/ui/screens/my-tasks";
 import {
   authorAmend,
   authorEdit,
@@ -190,6 +190,9 @@ async function openEditor(root: HTMLElement): Promise<void> {
 
 describe("my tasks screen", () => {
   beforeEach(() => {
+    // The redline/side-by-side choice is module state so it carries across rows
+    // in a session. Reset it so it cannot carry across tests.
+    setDiffView("unified");
     vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
       cb(0);
       return 1;
@@ -317,10 +320,122 @@ describe("my tasks screen", () => {
     row.dispatchEvent(new Event("toggle"));
     await flush();
 
+    // Default is the unified redline: the reviewer's removals struck through,
+    // their additions marked, in one column.
+    expect(root.querySelector(".my-task-redline")).toBeTruthy();
+    expect(root.querySelector(".admin-snapshots.has-final")).toBeFalsy();
+    const removed = Array.from(root.querySelectorAll("del.redline-del")).map((n) => n.textContent);
+    const added = Array.from(root.querySelectorAll("ins.redline-ins")).map((n) => n.textContent);
+    expect(removed).toContain("Original");
+    expect(added).toContain("Final");
+    expect(root.textContent).toContain("Changed: the title, the request and 1 of 1 step.");
+
+    // Side-by-side is still one click away, and still shows both whole versions.
+    btn(root, "Side-by-side")!.click();
+    await flush();
+    expect(root.querySelector(".admin-snapshots.has-final")).toBeTruthy();
     expect(root.textContent).toContain("Your original");
     expect(root.textContent).toContain("Final gold version");
     expect(root.textContent).toContain("Original title");
     expect(root.textContent).toContain("Final title");
+
+    btn(root, "Redline")!.click();
+    await flush();
+    expect(root.querySelector(".my-task-redline")).toBeTruthy();
+  });
+
+  it("shows a step the reviewer deleted, at the position it used to hold", async () => {
+    mockMyTaskPage.mockResolvedValue(page([item({ status: "approved" })]));
+    mockMyTaskFeedback.mockResolvedValue(
+      feedback({
+        status: "approved",
+        human_review: humanReview({
+          original: {
+            title: "T",
+            request: "R",
+            criteria: [],
+            steps: [
+              { order: 1, title: "Step 1", description: "Keep this." },
+              { order: 2, title: "Step 2", description: "Drop this one." },
+            ],
+          },
+          final: {
+            title: "T",
+            request: "R",
+            criteria: [],
+            steps: [{ order: 1, title: "Step 1", description: "Keep this." }],
+          },
+          // The reviewer spliced step 2 out, so nothing claims source_index 1.
+          rubrics: [
+            { rubric_id: "rubric-1", kind: "step", source_index: 0, title: "Step 1", original: "Keep this.", final: "Keep this.", changed: false, checked: true },
+          ],
+          title_edited: false,
+          request_edited: false,
+        }),
+      })
+    );
+    const root = renderMyTasks(ctx());
+    await flush();
+    await openRow(root);
+
+    const removedRow = root.querySelector(".my-task-redline-row.is-removed");
+    expect(removedRow).toBeTruthy();
+    expect(removedRow!.textContent).toContain("Drop this one.");
+    expect(removedRow!.querySelector("del.redline-del")).toBeTruthy();
+  });
+
+  it("says nothing changed instead of rendering two identical columns", async () => {
+    const same = {
+      title: "Same title",
+      request: "Same request.",
+      criteria: [],
+      steps: [{ order: 1, title: "Step 1", description: "Same step." }],
+    };
+    mockMyTaskPage.mockResolvedValue(page([item({ status: "approved" })]));
+    mockMyTaskFeedback.mockResolvedValue(
+      feedback({
+        status: "approved",
+        human_review: humanReview({
+          original: same,
+          final: same,
+          rubrics: [],
+          title_edited: false,
+          request_edited: false,
+          changed: false,
+        }),
+      })
+    );
+    const root = renderMyTasks(ctx());
+    await flush();
+    await openRow(root);
+
+    expect(root.textContent).toContain("Approved as you wrote it");
+    expect(root.querySelectorAll(".admin-snapshot")).toHaveLength(1);
+    expect(root.querySelectorAll("del.redline-del")).toHaveLength(0);
+    expect(root.querySelectorAll("ins.redline-ins")).toHaveLength(0);
+  });
+
+  it("renders reviewer text as text, never as markup", async () => {
+    mockMyTaskPage.mockResolvedValue(page([item({ status: "approved" })]));
+    mockMyTaskFeedback.mockResolvedValue(
+      feedback({
+        status: "approved",
+        human_review: humanReview({
+          final: {
+            title: "Final title",
+            request: "<script>alert(1)</script>",
+            criteria: [],
+            steps: [{ order: 1, title: "Step 1", description: "Final step." }],
+          },
+        }),
+      })
+    );
+    const root = renderMyTasks(ctx());
+    await flush();
+    await openRow(root);
+
+    expect(root.querySelector("script")).toBeNull();
+    expect(root.textContent).toContain("<script>alert(1)</script>");
   });
 
   it("closes the edit form on Cancel, while Remove only drops a step", async () => {
