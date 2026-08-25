@@ -1,3 +1,3 @@
 """Apollo LLM feasibility-review pipeline."""
 
-PIPELINE_VERSION = "apollo-llm-feasibility-v19"
+PIPELINE_VERSION = "apollo-llm-feasibility-v22"

@@ -21,6 +21,7 @@ import {
   validateLongTask,
 } from "../schema";
 import { defaultReviewKey, LONG_TASK_FILENAME } from "../config";
+import { isAdminEmail } from "../admin-access";
 import {
   BLANK_TEMPLATE,
   JOURNEYS_TEMPLATE,
@@ -45,8 +46,8 @@ import { renderForm } from "./screens/form";
 import { renderReview } from "./screens/review";
 import { renderExamples } from "./screens/examples";
 import { renderProgress } from "./screens/progress";
-import { renderMyTasks } from "./screens/my-tasks";
-import { renderReviewQueue } from "./screens/review-queue";
+import { renderMyTask, renderMyTasks } from "./screens/my-tasks";
+import { prefetchReviewQueueCounts, renderReviewQueue } from "./screens/review-queue";
 import { renderReviewEdit } from "./screens/review-edit";
 import { renderTrajectoryQueue } from "./screens/trajectory-queue";
 import { renderTrajectoryEdit } from "./screens/trajectory-edit";
@@ -54,6 +55,7 @@ import {
   clearClaimSnapshot,
   clearTrajectoryClaimSnapshot,
   contributionStatus,
+  reviewRegister,
   saveClaimSnapshot,
   saveTrajectoryClaimSnapshot,
   seedTrajectoryJudgment,
@@ -67,6 +69,7 @@ const SCREEN_PATH: Record<Screen, string> = {
   submit: "/submit",
   progress: "/progress",
   "my-tasks": "/my-tasks",
+  "my-task": "/my-task",
   "review-queue": "/review-queue",
   "review-edit": "/review-task",
   "trajectory-queue": "/trajectory-review",
@@ -84,6 +87,10 @@ export function screenFromHash(hash: string): Screen | null {
   const path = hash.replace(/^#/, "") || "/";
   const match = (Object.entries(SCREEN_PATH) as [Screen, string][]).find(([, screenPath]) => screenPath === path);
   return match?.[0] ?? null;
+}
+
+export function canAccessAdminDashboard(email: string | null | undefined): boolean {
+  return isAdminEmail(email);
 }
 
 export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
@@ -155,6 +162,9 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
         goto(destination);
         // Reconcile across web and desktop after the local-first login has
         // rendered. A network failure leaves the durable local totals intact.
+        // Warm the review-queue tiles so the first click on Review paints
+        // instantly instead of blocking on the status round-trip.
+        prefetchReviewQueueCounts(ctx);
         void cloudCounts.then((counts) => {
           if (!counts || !state.identity || participantKey(state.identity) !== owner) return;
           state.uploadedCount = Math.max(state.uploadedCount, counts.submitted);
@@ -222,6 +232,7 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
         state.requestDirty = false;
         state.pendingTaskId = null;
         state.pendingCreatedAt = null;
+        state.authoringStartedAt = new Date().toISOString();
         state.formErrors = {};
         if (mode === "guided") {
           state.activeTemplate = BLANK_TEMPLATE;
@@ -467,13 +478,15 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
       startReview(claim: ReviewClaim) {
         state.reviewClaim = claim;
         state.reviewRubrics = null; // review-edit seeds from the task
+        state.reviewRemovedRubrics = null;
         state.reviewEdits = null;
-        void saveClaimSnapshot(adapter.storage, { claim, rubrics: null, edits: null });
+        void saveClaimSnapshot(adapter.storage, { claim, rubrics: null, removedRubrics: null, edits: null });
         goto("review-edit");
       },
       endReview(msg: string) {
         state.reviewClaim = null;
         state.reviewRubrics = null;
+        state.reviewRemovedRubrics = null;
         state.reviewEdits = null;
         void clearClaimSnapshot(adapter.storage);
         notify(msg, "ok");
@@ -506,16 +519,10 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
         const identity = state.identity;
         const built = buildPendingTask(ctx);
         if (!identity || !built) return;
-        // Validate here as well as on the way in. Reaching this screen is not
-        // proof of having passed validation: a draft autosaved on the review
-        // screen resumes straight back to it, skipping the authoring screen and
-        // its gate. Without this, a draft saved before a field existed uploads
-        // with that field empty.
+        // A pre-metadata autosave can resume directly on the review screen.
+        // Revalidate at the final boundary so it cannot bypass the new fields.
         const check = validateLongTask(built);
         if (!check.valid) {
-          // Navigate first: transition() clears formErrors on the way into a
-          // screen, so errors set before the goto would be wiped and the author
-          // would land on the editor with nothing marked.
           goto("guided");
           state.formErrors = check.errors;
           notify("A few fields need attention before this can be submitted.", "err");
@@ -534,6 +541,10 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
             participantId: task.participant.participant_id,
             studyId: task.participant.session_id ?? "internal",
           });
+          if (state.reviewKey) {
+            await reviewRegister(state.reviewKey, task.task_id, task.participant.participant_id)
+              .catch((error) => console.warn("Task uploaded but dashboard indexing is temporarily unavailable", error));
+          }
         } catch (err) {
           notify(`Couldn't submit: ${message(err)}`, "err");
           state.busy = null;
@@ -636,6 +647,7 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
     state.requestDirty = false;
     state.pendingTaskId = null;
     state.pendingCreatedAt = null;
+    state.authoringStartedAt = null;
     state.generatedDraft = null;
     state.hasResumableDraft = false;
     state.formErrors = {};
@@ -701,12 +713,13 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
       { label: "Examples", target: "examples", owns: ["examples"] },
       { label: "Dashboard", target: "progress", owns: ["progress"] },
     ];
+    const canSeeDashboard = canAccessAdminDashboard(state.identity?.email);
     const navLinks =
       state.identity?.kind === "internal"
         ? el(
             "nav",
             { class: "topbar-nav-links" },
-            ...NAV.map((n) =>
+            ...NAV.filter((n) => n.target !== "progress" || canSeeDashboard).map((n) =>
               el(
                 "button",
                 {
@@ -722,19 +735,22 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
     bar.append(el("div", { class: "topbar-left" }, navGroup, brand, navLinks));
     if (state.identity) {
       const right = el("div", { class: "topbar-right" });
-      // The counter is the door to the participant's stats page.
-      right.append(
-        el(
-          "button",
-          {
-            class: "progress-pill mono as-button",
-            type: "button",
-            title: "See your stats",
-            onclick: () => goto("progress"),
-          },
-          `${state.uploadedCount} submitted`
-        )
-      );
+      // Aggregate contribution and review metrics are admin-only. Trainers
+      // work from their task rows instead of seeing a performance scoreboard.
+      if (canSeeDashboard) {
+        right.append(
+          el(
+            "button",
+            {
+              class: "progress-pill mono as-button",
+              type: "button",
+              title: "Open admin dashboard",
+              onclick: () => goto("progress"),
+            },
+            "Dashboard"
+          )
+        );
+      }
       right.append(
         el(
           "span",
@@ -761,6 +777,7 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
       examples: renderExamples,
       progress: renderProgress,
       "my-tasks": renderMyTasks,
+      "my-task": renderMyTask,
       "review-queue": renderReviewQueue,
       "review-edit": renderReviewEdit,
       "trajectory-queue": renderTrajectoryQueue,
@@ -818,6 +835,8 @@ export function mountApp(root: HTMLElement, adapter: PlatformAdapter): void {
     if ((target === "compose" || target === "themes") && !state.historyLoaded) return "home";
     if (target === "review" && !state.mode) return "home";
     if (target === "guided" && !state.mode) return "home";
+    if (target === "progress" && !canAccessAdminDashboard(state.identity.email)) return "my-tasks";
+    if (target === "my-task" && !state.myTaskSelection) return "my-tasks";
     if (target === "review-edit" && !state.reviewClaim) return "review-queue";
     if (target === "trajectory-edit" && !state.trajectoryClaim) return "trajectory-queue";
     return target;

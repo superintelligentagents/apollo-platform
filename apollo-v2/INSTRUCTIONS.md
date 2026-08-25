@@ -75,34 +75,24 @@ Someone should still be able to do the task weeks or months from now. Use timing
 schedule, availability, ranking, or answer that will go out of date. Ask the agent to find current
 information when it does the task.
 
-### Make every task work *anywhere*
+### Make every task work anywhere
 
-Tasks are run from servers in another country, on a fresh, logged-out browser. Before you submit,
-open your pages in a private window while signed out and check the task does not need a local phone
-number or OTP, a national ID, a local payment method, a login to see the content, or a site that
-blocks visitors from other countries. Watch for anything that changes by location — prices,
-availability, catalogue, rankings. Same rule as above: ask the agent to find the value, don't write
-the value into the step.
+Tasks run from servers in another country on a fresh, logged-out browser. Before submitting, open
+the pages in a private window while signed out. The task must not need a local phone number or OTP,
+a national ID, a local payment method, a login to see the content, or a site that blocks other
+countries. If a value changes by location, ask the agent to find it rather than writing it into a
+step.
 
 ## About this task — the last two fields
 
-Below the request box you'll pick two things. They take a few seconds and they're what lets us
-keep the collection spread across places and topics rather than piling up in one corner of the
-web.
+Below the request box, make two quick picks so we can see whether the collection is balanced:
 
-- **Where is it anchored?** The country whose sites, services, or institutions the task depends on.
-  If the work would read the same for someone anywhere — comparing product specs, researching a
-  standard, planning a curriculum — pick **no specific country**. That's a real answer, not a
-  fallback, and we're short of them.
-- **What is it about?** One to three subjects. One is usually the honest answer. These are counted
-  for coverage, so a narrow truth beats a wide guess.
+- **Where is it anchored?** Pick the country whose sites or services the task depends on. If the
+  work reads the same anywhere, pick **no specific country**.
+- **What is it about?** Pick one to three subjects. One is usually enough.
 
-You are not asked which sites the task uses — that is worked out from the links and sites already
-in your task.
-
-Across all the tasks *you* write, aim for at most about a third anchored in your own country, at
-least about a third with no specific country, and no more than two tasks through any one site.
-Tasks about your own country are welcome and wanted — just not most of them.
+The sites themselves are derived from the links already in the task; authors do not need to label
+them again.
 
 ## Troubleshooting
 

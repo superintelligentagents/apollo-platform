@@ -5,10 +5,20 @@ import {
   GetObjectCommand,
   DeleteObjectCommand,
   HeadObjectCommand,
+  CopyObjectCommand,
 } from "@aws-sdk/client-s3";
 import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
+import {
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+  QueryCommand,
+  UpdateCommand,
+} from "@aws-sdk/lib-dynamodb";
 import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
+import { gzipSync, gunzipSync } from "node:zlib";
 
 const {
   S3_BUCKET,
@@ -20,11 +30,16 @@ const {
   REPORTING_KEY = "",
   REPORTING_KEYS = "",
   REVIEW_PREFIX = "v2-review/",
+  APP_SCOPE = "primary",
   LOCK_TTL_MS = String(30 * 60 * 1000),
   ADMIN_EMAILS = "",
+  DASHBOARD_TABLE = "",
 } = process.env;
 
 const s3 = new S3Client({ region: AWS_REGION });
+const dashboardDb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: AWS_REGION }), {
+  marshallOptions: { removeUndefinedValues: true },
+});
 const adminEmails = new Set(
   ADMIN_EMAILS.split(",").map((email) => email.trim().toLowerCase()).filter(Boolean)
 );
@@ -53,6 +68,110 @@ export async function tryConditionalWrite(write) {
   }
 }
 
+export function isMissingObjectError(error) {
+  const code = error?.$metadata?.httpStatusCode;
+  return code === 404 || error?.name === "NoSuchKey" || error?.name === "NotFound";
+}
+
+export function headErrorConfirmsAbsent(error) {
+  return isMissingObjectError(error);
+}
+
+export async function deleteIfPresent(remove) {
+  try {
+    await remove();
+    return true;
+  } catch (error) {
+    if (isMissingObjectError(error)) return false;
+    throw error;
+  }
+}
+
+// Credit withdrawal must complete before any done marker is removed. Once a
+// done marker is gone, a retry cannot rediscover its reviewer/outcome and
+// repair a transiently failed credit deletion.
+export async function withdrawReopenedOutcomeState(records, { deleteCredit, deleteLock = null, deleteDone }) {
+  for (const record of records ?? []) await deleteCredit(record);
+  if (deleteLock) {
+    for (const record of records ?? []) await deleteLock(record);
+  }
+  for (const record of records ?? []) await deleteDone(record);
+}
+
+// A conditional conflict is idempotent success only when the object already
+// at that key is the marker this request intended to create. Treating every
+// 409/412 as success can publish a revision behind a corrupt or unrelated
+// routing record.
+export async function ensureConditionalMarker({ putIfAbsent, readExisting, matches }) {
+  try {
+    await putIfAbsent();
+    return true;
+  } catch (error) {
+    if (!isConditionalConflict(error)) return false;
+  }
+  try {
+    return Boolean(matches(await readExisting()));
+  } catch {
+    return false;
+  }
+}
+
+export function appealMarkerMatches(actual, expected) {
+  if (!actual || !expected || typeof actual !== "object" || typeof expected !== "object") return false;
+  return ["sub_key", "appeal_of", "rejected_by_pid", "created_at"]
+    .every((field) => String(actual[field] ?? "") === String(expected[field] ?? ""));
+}
+
+export function inboxMarkerMatches(actual, expectedSubKey) {
+  return typeof actual === "string" && actual === String(expectedSubKey || "");
+}
+
+export function buildAppealMarkerForRevision(subKey, revision, rejectedByPid = "") {
+  if (!revision?.appeal_of_sub_key) return null;
+  return {
+    sub_key: subKey,
+    appeal_of: String(revision.appeal_of_sub_key),
+    rejected_by_pid: String(rejectedByPid || ""),
+    // Retry must reproduce the marker for the already-saved revision, not
+    // mint a new timestamp that makes a valid conditional conflict look bad.
+    created_at: String(revision.created_at || ""),
+  };
+}
+
+export function appealRevisionCanPublish(revision, rejectedByPid) {
+  return !revision?.appeal_of_sub_key || VALID_PID.test(String(rejectedByPid || "").trim().toLowerCase());
+}
+
+export function appealMarkerIsVerified(marker, subKey, revision) {
+  const rejectedByPid = rejectedByPidFromDocument(marker);
+  if (!revision?.appeal_of_sub_key || !rejectedByPid) return false;
+  return appealMarkerMatches(
+    marker,
+    buildAppealMarkerForRevision(subKey, revision, rejectedByPid),
+  );
+}
+
+// Publish routing state in dependency order. An appeal must be durably routed
+// away from its rejecter before its inbox marker makes it claimable. The old
+// marker remains until the new inbox object was created or verified, so any
+// failed step leaves the previous revision reachable and a retry is safe.
+export async function publishAuthorRevisionMarkers({
+  appealMarker = null,
+  ensureAppealMarker,
+  ensureInboxMarker,
+  deleteOldInboxMarker,
+}) {
+  let appealRouted = false;
+  if (appealMarker) {
+    appealRouted = Boolean(await ensureAppealMarker(appealMarker));
+    if (!appealRouted) return { markerWritten: false, appealRouted: false };
+  }
+  const markerWritten = Boolean(await ensureInboxMarker());
+  if (!markerWritten) return { markerWritten: false, appealRouted };
+  await deleteOldInboxMarker();
+  return { markerWritten: true, appealRouted };
+}
+
 export function pcAdminRevision(edit) {
   if (!edit) return 0;
   const explicit = Number(edit.revision_count);
@@ -63,6 +182,24 @@ export function pcAdminRevision(edit) {
 
 export function reviewContentHash(reviewed) {
   return createHash("sha256").update(JSON.stringify(reviewed)).digest("hex");
+}
+
+export function buildApprovedFinalGoldDocument({
+  reviewed,
+  contentHash,
+  reviewer,
+  reviewerPid,
+  claimedAt,
+  completedAt,
+}) {
+  return {
+    ...reviewed,
+    review_content_hash: contentHash,
+    reviewed_by: reviewer,
+    reviewer_pid: reviewerPid,
+    claimed_at: claimedAt,
+    finished_at: completedAt,
+  };
 }
 
 export function textContentHash(text) {
@@ -90,57 +227,98 @@ const respond = (statusCode, body, headers = {}) => ({
 const b64url = (s) => Buffer.from(s, "utf8").toString("base64url");
 const lockKeyFor = (subKey) => `${REVIEW_PREFIX}locks/${b64url(subKey)}.json`;
 const doneKeyFor = (subKey) => `${REVIEW_PREFIX}done/${b64url(subKey)}`;
-// The author's acknowledgement of an approved task: immutable, one per
-// submission, written whether they accepted the reviewer's version or amended it.
+// The author's latest acknowledgement of an approved task. The key is the
+// submission that produced final gold, so retries are naturally idempotent.
 const AUTHOR_SIGNOFF_PREFIX = `${REVIEW_PREFIX}author-signoffs/`;
 const authorSignoffKeyFor = (subKey) => `${AUTHOR_SIGNOFF_PREFIX}${b64url(subKey)}.json`;
-// Superseded final gold. finished/{task_id}.json must stay one object per task
-// (/review/status counts that prefix), so an amendment archives here first.
+// Self-contained final tasks that have passed the original author's last
+// look. Unlike the compact sign-off receipt, this prefix is directly usable
+// by downstream consumers that only want author-approved final gold.
+const AUTHOR_APPROVED_PREFIX = `${REVIEW_PREFIX}author-approved/`;
+export const authorApprovedKeyFor = (taskId) => {
+  const safeTaskId = String(taskId || "")
+    .replace(/[^A-Za-z0-9_-]/g, "_")
+    .slice(0, 300) || "task-unknown";
+  return `${AUTHOR_APPROVED_PREFIX}${safeTaskId}.json`;
+};
+const AUTHOR_MUTATION_LOCK_PREFIX = `${REVIEW_PREFIX}author-mutation-locks/`;
+export const authorMutationLockKeyFor = (subKey) =>
+  `${AUTHOR_MUTATION_LOCK_PREFIX}${b64url(reviewUnitForKey(subKey))}.json`;
+// Superseded final-gold revisions. `finished/` remains one object per task so
+// status counts and downstream consumers keep their existing contract.
 const finishedHistoryKeyFor = (taskId, revision) =>
   `${REVIEW_PREFIX}finished-history/${taskId}/${String(revision).padStart(3, "0")}.json`;
-// A revision an author submitted after a rejection. Small, separate prefix so
-// the claim path can route the appeal away from the reviewer who rejected it
-// without reading every candidate submission.
+// Small routing records keep an appeal away from the reviewer who rejected the
+// prior revision without requiring one task-body GET per claim candidate.
 const APPEAL_PREFIX = `${REVIEW_PREFIX}appeals/`;
 const appealKeyFor = (subKey) => `${APPEAL_PREFIX}${b64url(subKey)}.json`;
+export const UNVERIFIED_APPEAL_REJECTER = "__unverified_appeal__";
 const LLM_PASS_PREFIX = `${REVIEW_PREFIX}llm_pass/`;
 const LLM_FAIL_PREFIX = `${REVIEW_PREFIX}llm_fail/`;
 const LLM_PRE_QC_PASS_PREFIX = `${REVIEW_PREFIX}llm_pre_qc_pass/`;
 const LLM_PRE_QC_ATTENTION_PREFIX = `${REVIEW_PREFIX}llm_pre_qc_attention/`;
-const MIN_REVIEWER_LLM_PIPELINE_VERSION = 19;
-// A rejection an author can appeal has to say enough to act on. See the note at
-// the /review/reject validation for why this is no longer 3.
+// v22 is the first artifact contract that requires literal task-request
+// support for every step and fails closed on unrequested named apps/sources.
+const MIN_REVIEWER_LLM_PIPELINE_VERSION = 22;
 const MIN_REJECTION_REASON_LENGTH = 40;
+export const MIN_APPEAL_REASON_LENGTH = 20;
+const MAX_APPEAL_REASON_LENGTH = 2_000;
 const TRAJECTORY_RUNS_PREFIX = `${REVIEW_PREFIX}trajectory-runs/`;
 const TRAJECTORY_INBOX_PREFIX = `${REVIEW_PREFIX}trajectory-inbox/`;
 const TRAJECTORY_LOCKS_PREFIX = `${REVIEW_PREFIX}trajectory-locks/`;
 const TRAJECTORY_DONE_PREFIX = `${REVIEW_PREFIX}trajectory-done/`;
 const TRAJECTORY_JUDGMENTS_PREFIX = `${REVIEW_PREFIX}trajectory-judgments/`;
+const TRAJECTORY_EDIT_LINKS_PREFIX = `${REVIEW_PREFIX}trajectory-edit-links/`;
 const trajectoryLockKeyFor = (manifestKey) => `${TRAJECTORY_LOCKS_PREFIX}${b64url(manifestKey)}.json`;
 const trajectoryDoneKeyFor = (manifestKey) => `${TRAJECTORY_DONE_PREFIX}${b64url(manifestKey)}`;
 const trajectoryJudgmentKeyFor = (manifestKey) => `${TRAJECTORY_JUDGMENTS_PREFIX}${b64url(manifestKey)}.json`;
 
-export function taskIdFromTrajectoryManifestKey(key) {
-  const match = /^v2-review\/trajectory-runs\/([^/]+)\/[^/]+\/manifest\.json$/.exec(String(key));
-  if (!match) return null;
+export function taskIdFromTrajectoryManifestKey(key, reviewPrefix = REVIEW_PREFIX) {
+  const runsPrefix = `${String(reviewPrefix).replace(/\/*$/, "/")}trajectory-runs/`;
+  const raw = String(key);
+  if (!raw.startsWith(runsPrefix)) return null;
+  const parts = raw.slice(runsPrefix.length).split("/");
+  if (parts.length !== 3 || !parts[0] || !parts[1] || parts[2] !== "manifest.json") return null;
   try {
-    const decoded = fromB64url(match[1]);
-    return b64url(decoded) === match[1] ? decoded : null;
+    const decoded = fromB64url(parts[0]);
+    return b64url(decoded) === parts[0] ? decoded : null;
   } catch {
     return null;
   }
 }
 
-export function participantIdFromTrajectoryManifestKey(key) {
-  const taskId = taskIdFromTrajectoryManifestKey(key);
-  const match = /^v2\/([a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?)\//.exec(String(taskId || ""));
+export function participantIdFromTrajectoryTaskId(taskId) {
+  const match = /^(?:v2|pc)\/([a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?)\//.exec(String(taskId || ""));
   return match?.[1] ?? null;
 }
 
-export function excludeOwnTrajectoryRuns(keys, reviewerPid) {
+export function participantIdFromTrajectoryManifestKey(key) {
+  return participantIdFromTrajectoryTaskId(taskIdFromTrajectoryManifestKey(key));
+}
+
+// Trajectory grading is intentionally the inverse of task QC: a run belongs
+// to the expert who authored the task. This lets authors assess model behavior
+// on their own task without letting them approve the task's human-QC gold.
+export function trajectoryRunsForCreator(keys, reviewerPid, creatorByManifest = new Map()) {
   const pid = String(reviewerPid || "").trim().toLowerCase();
-  if (!VALID_PID.test(pid)) return keys;
-  return keys.filter((key) => participantIdFromTrajectoryManifestKey(key) !== pid);
+  if (!VALID_PID.test(pid)) return [];
+  return keys.filter((key) => {
+    const assigned = creatorByManifest instanceof Map
+      ? creatorByManifest.get(key)
+      : creatorByManifest?.[key];
+    return (assigned || participantIdFromTrajectoryManifestKey(key)) === pid;
+  });
+}
+
+// Kept as an exported compatibility alias for older imports. Its behavior now
+// follows the creator-only Grade policy.
+export const excludeOwnTrajectoryRuns = trajectoryRunsForCreator;
+
+export function uploadScopeAllows(scope, isV2, isPC) {
+  if (scope === "pc") return Boolean(isPC);
+  if (scope === "v2") return Boolean(isV2);
+  if (scope === "primary") return !isPC;
+  return false;
 }
 
 export function llmReviewKeyFor(taskId, disposition) {
@@ -238,14 +416,34 @@ export function isCompletedReviewerPreQcArtifact(artifact) {
   );
 }
 
-// Keyed by the exact key list rather than a single slot: the reviewer queue
-// asks about every pending unit while the author-facing my-tasks page asks
-// about one participant's, so one shared slot made each caller evict the
-// other's entry and turned every page load into a fresh scan of both pre-QC
-// prefixes.
-const reviewAuditGateCache = new Map(); // signature -> { checkedAt, ready }
+export function isCurrentIndexedPreQc(record, candidate, taskContentHash) {
+  return Boolean(
+    record
+    && candidate
+    && taskContentHash
+    && record.pre_qc_complete === true
+    && record.pre_qc_artifact_key === candidate.key
+    && record.pre_qc_task_content_hash === taskContentHash
+    && candidate.contentHash === taskContentHash
+  );
+}
+
+// The reviewer queue and author pages ask about different key sets. Cache by
+// exact set so they do not continuously evict one another and re-scan S3.
+const reviewAuditGateCache = new Map();
 const REVIEW_AUDIT_GATE_TTL_MS = 10_000;
 const REVIEW_AUDIT_GATE_CACHE_MAX = 8;
+
+function cacheReviewAuditGate(signature, checkedAt, ready) {
+  reviewAuditGateCache.delete(signature);
+  reviewAuditGateCache.set(signature, { checkedAt, ready: new Set(ready) });
+  for (const [key, entry] of reviewAuditGateCache) {
+    if (checkedAt - entry.checkedAt >= REVIEW_AUDIT_GATE_TTL_MS) reviewAuditGateCache.delete(key);
+  }
+  while (reviewAuditGateCache.size > REVIEW_AUDIT_GATE_CACHE_MAX) {
+    reviewAuditGateCache.delete(reviewAuditGateCache.keys().next().value);
+  }
+}
 
 async function completedPreQcSubmissionKeys(submissionKeys) {
   const keys = Array.isArray(submissionKeys) ? submissionKeys : [];
@@ -271,6 +469,31 @@ async function completedPreQcSubmissionKeys(submissionKeys) {
     }
   }
 
+  if (DASHBOARD_TABLE && dashboardIndexScope() === "v2") {
+    try {
+      const ready = await completedPreQcSubmissionKeysFromIndex(keys, candidates);
+      // The dashboard index is an optimization, not the source of truth. A
+      // submission can become visible in S3 before its index row exists (or an
+      // older row may be missing), so validate only unresolved keys directly
+      // from S3 instead of incorrectly keeping audited tasks behind the gate.
+      const unresolved = keys.filter((key) => !ready.has(key));
+      if (unresolved.length) {
+        const sourceReady = await completedPreQcSubmissionKeysFromSources(unresolved, candidates);
+        for (const key of sourceReady) ready.add(key);
+      }
+      cacheReviewAuditGate(signature, now, ready);
+      return new Set(ready);
+    } catch (error) {
+      console.error("Live-audit index failed; using S3 source-of-truth validation", error);
+    }
+  }
+
+  const ready = await completedPreQcSubmissionKeysFromSources(keys, candidates);
+  cacheReviewAuditGate(signature, now, ready);
+  return new Set(ready);
+}
+
+async function completedPreQcSubmissionKeysFromSources(keys, candidates) {
   const ready = new Set();
   await Promise.all(keys.map(async (subKey) => {
     try {
@@ -291,17 +514,7 @@ async function completedPreQcSubmissionKeys(submissionKeys) {
       // A task that cannot be read or fingerprinted is not ready for review.
     }
   }));
-  // Re-insert so map order tracks recency, then bound the map: drop expired
-  // entries first, and only then the least recently written.
-  reviewAuditGateCache.delete(signature);
-  reviewAuditGateCache.set(signature, { checkedAt: now, ready });
-  for (const [key, entry] of reviewAuditGateCache) {
-    if (now - entry.checkedAt >= REVIEW_AUDIT_GATE_TTL_MS) reviewAuditGateCache.delete(key);
-  }
-  while (reviewAuditGateCache.size > REVIEW_AUDIT_GATE_CACHE_MAX) {
-    reviewAuditGateCache.delete(reviewAuditGateCache.keys().next().value);
-  }
-  return new Set(ready);
+  return ready;
 }
 
 async function listAll(prefix) {
@@ -366,6 +579,26 @@ export function participantIdFromSubKey(subKey) {
 
 const VALID_PID = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/;
 
+export function rejectedByPidFromDocument(document) {
+  const explicit = String(document?.rejected_by_pid || "").trim().toLowerCase();
+  return VALID_PID.test(explicit) ? explicit : "";
+}
+
+// An appeal is safe only when the rejection carries a stable reviewer id. Old
+// rejection records stored only a free-text display name; without a verified
+// pid the queue cannot guarantee the second opinion goes to somebody else.
+export function rejectionCanAppeal(rejectionCount, rejectedDocument) {
+  return Number(rejectionCount) === 1 && Boolean(rejectedByPidFromDocument(rejectedDocument));
+}
+
+export function cleanAppealReason(value) {
+  return String(value ?? "").trim().slice(0, MAX_APPEAL_REASON_LENGTH);
+}
+
+export function appealReasonIsValid(value) {
+  return cleanAppealReason(value).length >= MIN_APPEAL_REASON_LENGTH;
+}
+
 // Reviewers must never review their own submissions. Given the caller's
 // participant id, keep only other people's tasks; with no (or an invalid) id
 // the list passes through unchanged — old clients keep working. Exported for
@@ -376,25 +609,22 @@ export function excludeOwnSubmissions(subKeys, reviewerPid) {
   return subKeys.filter((k) => participantIdFromSubKey(k) !== pid);
 }
 
-// Everything a reviewer must not be offered: their own submissions, and any
-// appeal of a task they themselves rejected. An appeal exists because the first
-// call is being questioned, so handing it back to the same reviewer makes it a
-// second ask rather than a second opinion. `appealRejecterByKey` maps a
-// submission key to the pid of the reviewer who rejected the version it
-// replaces. Exported so both rules are unit-testable without S3.
+// Exclude both self-review and an appeal of this reviewer's own rejection.
 export function excludeIneligible(subKeys, reviewerPid, appealRejecterByKey = new Map()) {
   const pid = String(reviewerPid || "").trim().toLowerCase();
-  if (!VALID_PID.test(pid)) return subKeys;
-  return subKeys.filter(
-    (k) => participantIdFromSubKey(k) !== pid && appealRejecterByKey.get(k) !== pid
+  const verified = subKeys.filter((key) => appealRejecterByKey.get(key) !== UNVERIFIED_APPEAL_REJECTER);
+  // Ordinary legacy clients may omit PID, but an appeal requires a valid PID
+  // to prove the claimant is not its rejecting reviewer.
+  if (!VALID_PID.test(pid)) return verified.filter((key) => !appealRejecterByKey.has(key));
+  return verified.filter(
+    (key) => participantIdFromSubKey(key) !== pid
+      && appealRejecterByKey.get(key) !== pid
   );
 }
 
-// Who may edit their own task, and why not when they may not. `outcome` is the
-// done-record outcome for the unit's newest file (null when it has not been
-// reviewed). Appeals are capped at one: a task rejected twice is finished.
-// Exported so the rule is testable without S3.
-export function authorEditEligibility(outcome, locked, rejectionCount = 0) {
+// A rejected task receives one author appeal. Approved tasks use the distinct
+// sign-off/amend flow; a task already held by a reviewer cannot be edited.
+export function authorEditEligibility(outcome, locked, rejectionCount = 0, appealInFlight = false) {
   if (locked) {
     return { allowed: false, reason: "A reviewer has claimed this task — it's locked for review." };
   }
@@ -412,15 +642,15 @@ export function authorEditEligibility(outcome, locked, rejectionCount = 0) {
           reason: "You have already appealed this rejection once. This task is finished.",
         };
   }
+  if (!outcome && appealInFlight) {
+    return {
+      allowed: false,
+      reason: "Your one appeal is already queued for Codex and reviewer re-check.",
+    };
+  }
   return { allowed: true, reason: "" };
 }
 
-// Minutes between two ISO timestamps, for the reporting layer. The client
-// supplies the start of an author-side stage, so a clock that is wrong, a tab
-// left open overnight, or a hand-edited payload must not become a stored
-// duration: anything negative or longer than a working day reads as no
-// measurement rather than a bogus one. Mirrors how the deployed reporting route
-// derives authoring_minutes and review_minutes from stored timestamps.
 const MAX_STAGE_MINUTES = 24 * 60;
 export function stageMinutes(startedAt, endedAt) {
   const start = Date.parse(startedAt ?? "");
@@ -429,6 +659,28 @@ export function stageMinutes(startedAt, endedAt) {
   const minutes = (end - start) / 60_000;
   if (minutes < 0 || minutes > MAX_STAGE_MINUTES) return null;
   return Math.round(minutes * 100) / 100;
+}
+
+// "Skip" means "not now", not "never": the claim endpoints accept the
+// caller's recently-skipped keys and serve everything else first, so skipping
+// a task never hands the same one straight back. Skipped keys stay at the END
+// of the order (never dropped) — when they are all that's left, the queue
+// still hands one out instead of dead-ending. Exported for unit tests.
+export function orderClaimCandidates(unlocked, locked, skipKeys) {
+  const skips = new Set(
+    (Array.isArray(skipKeys) ? skipKeys : [])
+      .slice(0, 100)
+      .map((key) => cleanText(key, 2_000))
+      .filter(Boolean)
+  );
+  if (!skips.size) return [...unlocked, ...locked];
+  const partition = (keys, skipped) => keys.filter((key) => skips.has(key) === skipped);
+  return [
+    ...partition(unlocked, false),
+    ...partition(locked, false),
+    ...partition(unlocked, true),
+    ...partition(locked, true),
+  ];
 }
 const fromB64url = (s) => Buffer.from(s, "base64url").toString("utf8");
 const reviewerKeyFor = (reviewer) =>
@@ -468,6 +720,56 @@ async function readJson(key) {
   return { json: JSON.parse(text), etag: res.ETag, text };
 }
 
+async function ensureAuthorInboxMarker(subKey) {
+  return await ensureConditionalMarker({
+    putIfAbsent: () => s3.send(new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: inboxKeyFor(subKey),
+      Body: subKey,
+      ContentType: "text/plain",
+      IfNoneMatch: "*",
+    })),
+    readExisting: async () => {
+      const response = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: inboxKeyFor(subKey) }));
+      return await response.Body.transformToString();
+    },
+    matches: (existing) => inboxMarkerMatches(existing, subKey),
+  });
+}
+
+async function ensureAuthorAppealMarker(subKey, marker) {
+  return await ensureConditionalMarker({
+    putIfAbsent: () => s3.send(new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: appealKeyFor(subKey),
+      Body: JSON.stringify(marker),
+      ContentType: "application/json",
+      IfNoneMatch: "*",
+    })),
+    readExisting: () => readJson(appealKeyFor(subKey)).then(({ json }) => json),
+    matches: (existing) => appealMarkerMatches(existing, marker),
+  });
+}
+
+async function publishStoredAuthorRevision({ subKey, revision, previousSubKey, rejectedByPid }) {
+  if (!appealRevisionCanPublish(revision, rejectedByPid)) {
+    return { markerWritten: false, appealRouted: false };
+  }
+  const appealMarker = buildAppealMarkerForRevision(subKey, revision, rejectedByPid);
+  return await publishAuthorRevisionMarkers({
+    appealMarker,
+    ensureAppealMarker: (marker) => ensureAuthorAppealMarker(subKey, marker),
+    ensureInboxMarker: () => ensureAuthorInboxMarker(subKey),
+    deleteOldInboxMarker: async () => {
+      if (!previousSubKey || previousSubKey === subKey) return;
+      await s3.send(new DeleteObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: inboxKeyFor(previousSubKey),
+      })).catch(() => {});
+    },
+  });
+}
+
 export function reviewUnitForKey(key) {
   const dir = key.slice(0, key.lastIndexOf("/"));
   if (key.includes("/pc/") && /_review_task_[A-Za-z0-9_-]{1,120}\.json$/.test(key)) {
@@ -505,11 +807,6 @@ function cleanSteps(value) {
     : [];
 }
 
-// Distribution metadata for a dashboard row. Deliberately NOT part of
-// cleanTaskSnapshot: reportingTaskContentHash hashes the snapshot object
-// wholesale, so a field added there would restate the content hash of every
-// task in the bucket and drop them all out of the pre-QC audit gate as stale.
-// It rides beside the snapshots instead.
 export function taskMetadataForReporting(task) {
   const raw = task?.metadata;
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
@@ -987,6 +1284,10 @@ export function cleanTrajectoryManifest(manifest) {
   const taskId = cleanText(manifest.task_id, 300);
   const taskPrompt = cleanText(manifest.task_prompt, 200_000);
   if (!runId || !taskId || !taskPrompt) return null;
+  const requestedCreatorPid = cleanText(manifest.creator_pid, 80).toLowerCase();
+  const creatorPid = VALID_PID.test(requestedCreatorPid)
+    ? requestedCreatorPid
+    : participantIdFromTrajectoryTaskId(taskId);
   const rubrics = manifest.rubrics.map((rubric) => {
     const rawStatus = cleanText(rubric?.llm_status, 20).toUpperCase();
     const llmStatus = ["SUCCESS", "FAILURE", "ERROR"].includes(rawStatus)
@@ -1022,6 +1323,7 @@ export function cleanTrajectoryManifest(manifest) {
     schema_version: "apollo-trajectory-review-package-v1",
     run_id: runId,
     task_id: taskId,
+    creator_pid: creatorPid || null,
     task_prompt: taskPrompt,
     created_at_utc: cleanText(manifest.created_at_utc, 80) || null,
     source: {
@@ -1065,6 +1367,139 @@ export function trajectoryManifestForHuman(manifest) {
       verification: rubric.verification,
     })),
   };
+}
+
+// The Grade stage is creator-assigned: the author grades a run of their OWN
+// task. Reviewers may have edited the title/request/rubrics before the run,
+// so the grader shows those edits inline (original vs what actually ran).
+// Pure shaping of an admin item (see buildAdminItemFromDocuments) into the
+// minimal, provenance-free lineage the grader needs.
+export function trajectoryTaskLineageForHuman(item) {
+  if (!item || typeof item !== "object" || !item.original) return null;
+  const original = item.original;
+  const final = item.final ?? null;
+  const field = (before, after) => {
+    const from = String(before ?? "");
+    const to = final ? String(after ?? "") : from;
+    return { original: from, final: to, changed: from !== to };
+  };
+  const title = field(original.title, final?.title);
+  const request = field(original.request, final?.request);
+  const rubrics = (Array.isArray(item.rubrics) ? item.rubrics : []).map((rubric) => {
+    const before = rubric?.original == null ? null : String(rubric.original);
+    const after = String(rubric?.final ?? "");
+    return {
+      rubric_id: cleanText(rubric?.rubric_id, 100),
+      title: rubric?.title == null ? null : cleanText(rubric.title, 200),
+      original: before,
+      final: after,
+      changed: Boolean(final) && Boolean(rubric?.changed) && before !== after,
+    };
+  });
+  const changed = title.changed || request.changed || rubrics.some((rubric) => rubric.changed);
+  return {
+    task_id: cleanText(item.task_id, 300),
+    status: cleanText(item.status, 30) || "pending",
+    reviewer: cleanText(item.reviewer, 160),
+    reviewed_at: cleanText(item.reviewed_at, 60),
+    revision_of_task_id: cleanText(item.revision_of_task_id, 300) || null,
+    changed,
+    title,
+    request,
+    rubrics,
+  };
+}
+
+// Locate the authored source + reviewed outcome for a trajectory's task:
+// Dynamo index first, then the S3 submission directory (newest long_task.json
+// is the one the queue considered, mirroring task-directory dedupe).
+export async function trajectoryTaskLineage(taskId) {
+  const cleanId = cleanText(taskId, 300);
+  if (!cleanId) return null;
+  try {
+    const indexed = await indexedAdminDetail(cleanId);
+    if (indexed) return trajectoryTaskLineageForHuman(await withRevisionLink(indexed));
+  } catch (error) {
+    console.error("Trajectory lineage index lookup failed; falling back to S3", error);
+  }
+  const pid = participantIdFromTrajectoryTaskId(cleanId);
+  if (!pid) return null;
+  const candidates = (await listAllObjects(`${UPLOAD_PREFIX}${pid}/${cleanId}/`))
+    .filter((object) => /(^|\/)[^/]*long_task\.json$/.test(object.Key))
+    .sort((a, b) => new Date(b.LastModified).getTime() - new Date(a.LastModified).getTime());
+  const sourceKey = candidates[0]?.Key;
+  if (!sourceKey) return null;
+  const source = await readJson(sourceKey).then(({ json }) => json).catch(() => null);
+  if (!source) return null;
+  const finishedKey = `${REVIEW_PREFIX}finished/${cleanId.replace(/[^A-Za-z0-9_-]/g, "_")}.json`;
+  const outcome = await readJson(finishedKey).then(({ json }) => json).catch(() => null);
+  const done = outcome
+    ? { target: finishedKey, outcome: "approved", reviewer: outcome.reviewed_by, completed_at: outcome.finished_at, task_id: cleanId }
+    : null;
+  const item = buildAdminItemFromDocuments({ source, sourceKey, done, lock: null, outcome });
+  return trajectoryTaskLineageForHuman(await withRevisionLink(item, source));
+}
+
+// Earlier graded runs of the same task (and of the task it revises), so the
+// creator can see how the previous trajectory was graded against the rubric
+// as it read then. Pure shaping, unit-tested; the S3 walk is below.
+export function priorTrajectoryGradeForHuman(manifest, judgment) {
+  const clean = cleanTrajectoryManifest(manifest);
+  if (!clean || !judgment || typeof judgment !== "object") return null;
+  const verdictById = new Map((Array.isArray(judgment.rubrics) ? judgment.rubrics : [])
+    .map((rubric) => [String(rubric?.rubric_id || ""), rubric]));
+  return {
+    run_id: clean.run_id,
+    task_id: clean.task_id,
+    created_at_utc: clean.created_at_utc,
+    agent: clean.source.agent,
+    model: clean.source.model,
+    task_prompt: clean.task_prompt,
+    graded_by: cleanText(judgment.reviewed_by, 160),
+    graded_at: cleanText(judgment.reviewed_at, 60),
+    overall_outcome: trajectoryOverallOutcome(judgment.trajectory),
+    notes: cleanText(judgment.trajectory?.notes, 20_000),
+    rubrics: clean.rubrics.map((rubric) => {
+      const human = verdictById.get(rubric.rubric_id);
+      return {
+        rubric_id: rubric.rubric_id,
+        requirement: rubric.requirement,
+        verification: rubric.verification,
+        human_verdict: cleanText(human?.human_verdict, 30).toUpperCase() || "",
+        notes: cleanText(human?.notes, 20_000),
+      };
+    }),
+  };
+}
+
+async function priorTrajectoryGrades(run, lineage, limit = 3) {
+  const taskIds = [...new Set([run?.task_id, lineage?.revision_of_task_id].filter(Boolean))];
+  const found = [];
+  for (const taskId of taskIds) {
+    const prefix = `${TRAJECTORY_RUNS_PREFIX}${b64url(taskId)}/`;
+    const manifestKeys = (await listAll(prefix)).filter((key) => key.endsWith("/manifest.json") && key.split("/").length === prefix.split("/").length + 1);
+    await Promise.all(manifestKeys.map(async (manifestKey) => {
+      const done = await readDoneRecord(manifestKey, trajectoryDoneKeyFor);
+      if (!done?.target) return;
+      const [manifest, judgment] = await Promise.all([
+        readJson(manifestKey).then(({ json }) => json).catch(() => null),
+        readJson(done.target).then(({ json }) => json).catch(() => null),
+      ]);
+      const shaped = priorTrajectoryGradeForHuman(manifest, judgment);
+      if (shaped && shaped.run_id !== run?.run_id) found.push(shaped);
+    }));
+  }
+  found.sort((a, b) => String(b.graded_at).localeCompare(String(a.graded_at)));
+  return found.slice(0, limit);
+}
+
+async function withRevisionLink(item, source = null) {
+  if (!item) return item;
+  const workflow = source?.workflow
+    ?? (item.source_key ? await readJson(item.source_key).then(({ json }) => json?.workflow).catch(() => null) : null);
+  return workflow?.kind === "trajectory_edit"
+    ? { ...item, revision_of_task_id: workflow.revision_of_task_id }
+    : item;
 }
 
 export function sanitizeHumanTrajectoryJudgment(input, manifest) {
@@ -1118,6 +1553,99 @@ export function sanitizeHumanTrajectoryJudgment(input, manifest) {
   };
 }
 
+export function trajectoryEditReviewSeed(manifestKey, manifest, judgment, createdAt = new Date().toISOString()) {
+  const cleanManifest = cleanTrajectoryManifest(manifest);
+  const outcome = trajectoryOverallOutcome(judgment?.trajectory);
+  if (!cleanManifest || outcome !== "EDIT_NEEDED" || !cleanManifest.creator_pid) return null;
+  const suffix = createHash("sha256").update(String(manifestKey)).digest("hex").slice(0, 16);
+  const isPc = REVIEW_PREFIX.startsWith("pc-review/");
+  const taskId = isPc
+    ? `pc_task-${suffix}`
+    : `v2/${cleanManifest.creator_pid}/internal/task-${suffix}-trajectory-edit`;
+  const sourceKey = isPc
+    ? `${UPLOAD_PREFIX}${cleanManifest.creator_pid}/pc/${cleanManifest.creator_pid}/internal/bundle-${suffix}/trajectory_rework_review_task_task-${suffix}.json`
+    : `${UPLOAD_PREFIX}${cleanManifest.creator_pid}/${taskId}/trajectory_rework_long_task.json`;
+  return {
+    taskId,
+    sourceKey,
+    source: {
+      schema_version: "odyssey_long_task_v2",
+      task_id: taskId,
+      mode: isPc ? "pc" : "guided",
+      created_at: createdAt,
+      participant: {
+        kind: "internal",
+        participant_id: cleanManifest.creator_pid,
+        session_id: null,
+        name: null,
+        email: null,
+        consent: { version: "trajectory-edit-v1", accepted_at: createdAt },
+      },
+      task: {
+        task_title: "Trajectory feedback revision",
+        agent_request: cleanManifest.task_prompt,
+        difficulty: "high",
+        site_scope: [],
+        success_criteria: [],
+        must_visit_or_reach: [],
+        required_outputs: [],
+        notes: null,
+        steps: cleanManifest.rubrics.map((rubric, index) => ({
+          order: index + 1,
+          title: `Step ${index + 1}`,
+          description: rubric.requirement,
+        })),
+      },
+      workflow: {
+        kind: "trajectory_edit",
+        revision_of_task_id: cleanManifest.task_id,
+        source_manifest_key: String(manifestKey),
+        run_id: cleanManifest.run_id,
+        requested_by: "trajectory_creator_grade",
+        reason: cleanText(judgment?.trajectory?.notes, 20_000),
+      },
+    },
+  };
+}
+
+async function enqueueTrajectoryEditReview(manifestKey, manifest, judgment, judgmentKey, createdAt) {
+  const seed = trajectoryEditReviewSeed(manifestKey, manifest, judgment, createdAt);
+  if (!seed) return null;
+  const created = await tryConditionalWrite(() => s3.send(new PutObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: seed.sourceKey,
+    Body: JSON.stringify(seed.source, null, 2),
+    ContentType: "application/json",
+    IfNoneMatch: "*",
+  })));
+  if (!created) {
+    const existing = await readJson(seed.sourceKey).then(({ json }) => json).catch(() => null);
+    if (!existing || existing.workflow?.source_manifest_key !== manifestKey) {
+      throw new Error("A different trajectory edit request already uses this revision key");
+    }
+  }
+  await s3.send(new PutObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: inboxKeyFor(seed.sourceKey),
+    Body: seed.sourceKey,
+    ContentType: "text/plain",
+  }));
+  await tryConditionalWrite(() => s3.send(new PutObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: `${TRAJECTORY_EDIT_LINKS_PREFIX}${b64url(manifestKey)}.json`,
+    Body: JSON.stringify({
+      source_manifest_key: manifestKey,
+      judgment_key: judgmentKey,
+      revision_task_id: seed.taskId,
+      revision_source_key: seed.sourceKey,
+      created_at: createdAt,
+    }, null, 2),
+    ContentType: "application/json",
+    IfNoneMatch: "*",
+  })));
+  return { task_id: seed.taskId, source_key: seed.sourceKey };
+}
+
 export function summarizeAdminUsers(items) {
   const users = new Map();
   for (const item of items) {
@@ -1131,12 +1659,409 @@ export function summarizeAdminUsers(items) {
       in_review: 0,
       approved: 0,
       rejected: 0,
+      decided: 0,
+      approval_rate: null,
+      qc_edited_approvals: 0,
+      qc_edit_rate: null,
+      qc_edited_author_accepted: 0,
+      qc_edited_author_amended: 0,
+      qc_edited_awaiting_signoff: 0,
+      author_accepted_approvals: 0,
+      author_amended_approvals: 0,
+      awaiting_signoff: 0,
+      author_amend_rate: null,
+      appealed: 0,
+      double_rejected: 0,
+      author_requeues: 0,
     };
     current.submitted += 1;
     if (item.status in current) current[item.status] += 1;
+    if (item.status === "approved") {
+      const changedInQc = item.changed_in_qc == null ? Boolean(item.changed) : Boolean(item.changed_in_qc);
+      if (changedInQc) current.qc_edited_approvals += 1;
+      if (item.signoff_action === "accepted") {
+        current.author_accepted_approvals += 1;
+        if (changedInQc) current.qc_edited_author_accepted += 1;
+      } else if (item.signoff_action === "amended") {
+        current.author_amended_approvals += 1;
+        if (changedInQc) current.qc_edited_author_amended += 1;
+      } else {
+        current.awaiting_signoff += 1;
+        if (changedInQc) current.qc_edited_awaiting_signoff += 1;
+      }
+    }
+    const appealNumber = Math.max(0, Math.floor(Number(item.appeal_number) || 0));
+    if (appealNumber > 0) current.appealed += 1;
+    if (appealNumber > 0 && item.status === "rejected") current.double_rejected += 1;
+    current.author_requeues += Math.max(0, Math.floor(Number(item.author_requeue_count) || 0));
     users.set(key, current);
   }
-  return [...users.values()].sort((a, b) => b.submitted - a.submitted || a.name.localeCompare(b.name));
+  return [...users.values()]
+    .map((user) => {
+      const decided = user.approved + user.rejected;
+      const signedOff = user.author_accepted_approvals + user.author_amended_approvals;
+      return {
+        ...user,
+        decided,
+        approval_rate: decided ? Number((user.approved / decided).toFixed(3)) : null,
+        qc_edit_rate: user.approved ? Number((user.qc_edited_approvals / user.approved).toFixed(3)) : null,
+        author_amend_rate: signedOff ? Number((user.author_amended_approvals / signedOff).toFixed(3)) : null,
+      };
+    })
+    .sort((a, b) => b.submitted - a.submitted || a.name.localeCompare(b.name));
+}
+
+export function dashboardIndexScope(reviewPrefix = REVIEW_PREFIX) {
+  const prefix = String(reviewPrefix || "").replace(/^\/+|\/+$/g, "");
+  if (prefix === "v2-review") return "v2";
+  if (prefix === "pc-review") return "pc";
+  return prefix.replace(/[^a-z0-9_-]/gi, "-").toLowerCase() || "unknown";
+}
+
+export function taskIdFromSubmissionKey(subKey) {
+  const raw = String(subKey || "");
+  const match = /\/(v2\/[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?\/internal\/task-[A-Za-z0-9-]{8,80})\//.exec(raw);
+  return match?.[1] ?? null;
+}
+
+function effectiveIndexedStatus(record, now = Date.now()) {
+  if (record?.status !== "in_review") return record?.status || "pending";
+  const expiresAt = Date.parse(String(record.lock_expires_at || ""));
+  return Number.isFinite(expiresAt) && expiresAt > now ? "in_review" : "pending";
+}
+
+export function buildDashboardIndexRecord(item, scope = dashboardIndexScope(), indexedAt = new Date().toISOString()) {
+  if (!item?.task_id || !item?.source_key) return null;
+  return {
+    scope,
+    entity_key: `TASK#${item.task_id}`,
+    entity_type: "TASK",
+    task_id: item.task_id,
+    source_key: item.source_key,
+    review_unit: item.review_unit || reviewUnitForKey(item.source_key),
+    done_target: item.done_target || null,
+    participant_id: item.participant_id || "unknown",
+    participant_name: item.participant_name || item.participant_id || "Unknown",
+    participant_email: item.participant_email || "",
+    mode: item.mode || "unknown",
+    submitted_at: item.submitted_at || "",
+    status: item.status || "pending",
+    reviewer: item.reviewer || "",
+    reviewed_at: item.reviewed_at || "",
+    claimed_at: item.claimed_at || "",
+    rejection_reason: item.rejection_reason || "",
+    trajectory_count: Number(item.trajectory_count) || 0,
+    visit_count: Number(item.visit_count) || 0,
+    changed: Boolean(item.changed),
+    changed_in_qc: item.changed_in_qc == null ? Boolean(item.changed) : Boolean(item.changed_in_qc),
+    amended_by: item.amended_by || "",
+    amended_at: item.amended_at || "",
+    final_gold_revision: Number(item.final_gold_revision) || 0,
+    signoff_at: item.signoff_at || "",
+    signoff_action: item.signoff_action || "",
+    signoff_opened_at: item.signoff_opened_at || "",
+    appeal_number: Math.max(0, Math.floor(Number(item.appeal_number) || 0)),
+    author_revision_number: Math.max(0, Math.floor(Number(item.author_revision_number) || 0)),
+    author_requeue_count: Math.max(0, Math.floor(Number(item.author_requeue_count) || 0)),
+    author_requeued_at: item.author_requeued_at || "",
+    original_title: item.original?.title || "",
+    original_difficulty: item.original?.difficulty || "high",
+    original_region: item.original?.metadata?.region || "",
+    original_subjects: Array.isArray(item.original?.metadata?.subjects) ? item.original.metadata.subjects.slice(0, 3) : [],
+    final_title: item.final?.title || "",
+    final_difficulty: item.final?.difficulty || "",
+    final_region: item.final?.metadata?.region || "",
+    final_subjects: Array.isArray(item.final?.metadata?.subjects) ? item.final.metadata.subjects.slice(0, 3) : [],
+    task_content_hash: item.task_content_hash || "",
+    lock_expires_at: item.lock_expires_at || null,
+    indexed_at: indexedAt,
+  };
+}
+
+export function dashboardSubmissionFromIndexRecord(record, now = Date.now()) {
+  const status = effectiveIndexedStatus(record, now);
+  const inReview = status === "in_review";
+  return {
+    task_id: record.task_id,
+    participant_id: record.participant_id || "unknown",
+    participant_name: record.participant_name || record.participant_id || "Unknown",
+    participant_email: record.participant_email || "",
+    mode: record.mode || "unknown",
+    submitted_at: record.submitted_at || "",
+    status,
+    reviewer: inReview || status === "approved" || status === "rejected" ? record.reviewer || "" : "",
+    reviewed_at: record.reviewed_at || "",
+    claimed_at: record.claimed_at || "",
+    rejection_reason: status === "rejected" ? record.rejection_reason || "" : "",
+    trajectory_count: Number(record.trajectory_count) || 0,
+    visit_count: Number(record.visit_count) || 0,
+    changed: Boolean(record.changed),
+    changed_in_qc: record.changed_in_qc == null ? Boolean(record.changed) : Boolean(record.changed_in_qc),
+    amended_by: record.amended_by || "",
+    amended_at: record.amended_at || "",
+    final_gold_revision: Number(record.final_gold_revision) || 0,
+    signoff_at: record.signoff_at || "",
+    signoff_action: record.signoff_action || "",
+    signoff_opened_at: record.signoff_opened_at || "",
+    appeal_number: Math.max(0, Math.floor(Number(record.appeal_number) || 0)),
+    author_revision_number: Math.max(0, Math.floor(Number(record.author_revision_number) || 0)),
+    author_requeue_count: Math.max(0, Math.floor(Number(record.author_requeue_count) || 0)),
+    author_requeued_at: record.author_requeued_at || "",
+    source_key: record.source_key,
+    review_unit: record.review_unit,
+    done_target: record.done_target || null,
+    lock_expires_at: inReview ? record.lock_expires_at || null : null,
+    original: {
+      title: record.original_title || "",
+      request: "",
+      difficulty: record.original_difficulty || "high",
+      criteria: [],
+      steps: [],
+      ...((record.original_region || record.original_subjects?.length)
+        ? {
+            metadata: {
+              region: record.original_region || "",
+              subjects: Array.isArray(record.original_subjects) ? record.original_subjects : [],
+            },
+          }
+        : {}),
+    },
+    final: record.final_title || record.final_difficulty ? {
+      title: record.final_title || "",
+      request: "",
+      difficulty: record.final_difficulty || record.original_difficulty || "high",
+      criteria: [],
+      steps: [],
+      ...((record.final_region || record.final_subjects?.length || record.original_region || record.original_subjects?.length)
+        ? {
+            metadata: {
+              region: record.final_region || record.original_region || "",
+              subjects: Array.isArray(record.final_subjects) && record.final_subjects.length
+                ? record.final_subjects
+                : Array.isArray(record.original_subjects) ? record.original_subjects : [],
+            },
+          }
+        : {}),
+    } : null,
+  };
+}
+
+export function dashboardFromIndexRecords(records, now = Date.now()) {
+  const items = (Array.isArray(records) ? records : [])
+    .filter((record) => record?.entity_type === "TASK")
+    .map((record) => dashboardSubmissionFromIndexRecord(record, now))
+    .sort((a, b) => String(b.submitted_at).localeCompare(String(a.submitted_at)) || a.task_id.localeCompare(b.task_id));
+  return {
+    items,
+    users: summarizeAdminUsers(items),
+    truncated: false,
+    total: items.length,
+    index_source: "dynamodb",
+  };
+}
+
+// Reviewer-quality rollup for the executive dashboard. A reviewer who approves
+// everything untouched, or moves implausibly fast, is flagged so their
+// approvals can be re-queued for a second opinion (see reopenReviewOutcome).
+export const REVIEWER_FLAG_MIN_REVIEWS = 10;
+export const REVIEWER_FAST_REVIEW_MINUTES = 3;
+export function summarizeAdminReviewers(items, now = Date.now()) {
+  const byReviewer = new Map();
+  for (const item of items ?? []) {
+    if (!["approved", "rejected"].includes(item?.status) || !item.reviewer) continue;
+    const key = String(item.reviewer).trim();
+    if (!key) continue;
+    const current = byReviewer.get(key) ?? {
+      reviewer: key,
+      reviewed: 0,
+      approved: 0,
+      rejected: 0,
+      edited_approvals: 0,
+      unedited_approvals: 0,
+      reviewed_at: [],
+      first_reviewed_at: "",
+      last_reviewed_at: "",
+    };
+    current.reviewed += 1;
+    if (item.status === "approved") {
+      current.approved += 1;
+      if (item.changed_in_qc == null ? item.changed : item.changed_in_qc) current.edited_approvals += 1;
+      else current.unedited_approvals += 1;
+    } else {
+      current.rejected += 1;
+    }
+    const at = Date.parse(String(item.reviewed_at || ""));
+    if (Number.isFinite(at)) {
+      current.reviewed_at.push(at);
+      if (!current.first_reviewed_at || at < Date.parse(current.first_reviewed_at)) current.first_reviewed_at = new Date(at).toISOString();
+      if (!current.last_reviewed_at || at > Date.parse(current.last_reviewed_at)) current.last_reviewed_at = new Date(at).toISOString();
+    }
+    byReviewer.set(key, current);
+  }
+  const out = [...byReviewer.values()].map((entry) => {
+    // Gap between consecutive decisions within one sitting (<2h) approximates
+    // time spent per task; the claim time itself is not persisted.
+    const times = entry.reviewed_at.sort((a, b) => a - b);
+    const gaps = [];
+    for (let index = 1; index < times.length; index += 1) {
+      const minutes = (times[index] - times[index - 1]) / 60_000;
+      if (minutes >= 0 && minutes < 120) gaps.push(minutes);
+    }
+    const sorted = [...gaps].sort((a, b) => a - b);
+    const medianGap = sorted.length
+      ? sorted.length % 2 ? sorted[(sorted.length - 1) / 2] : (sorted[sorted.length / 2 - 1] + sorted[sorted.length / 2]) / 2
+      : null;
+    const fastShare = gaps.length ? gaps.filter((gap) => gap < REVIEWER_FAST_REVIEW_MINUTES).length / gaps.length : null;
+    const rejectRate = entry.reviewed ? entry.rejected / entry.reviewed : 0;
+    const editRate = entry.approved ? entry.edited_approvals / entry.approved : 0;
+    const flags = [];
+    if (entry.reviewed >= REVIEWER_FLAG_MIN_REVIEWS) {
+      if (entry.rejected === 0) flags.push("no_rejections");
+      if (entry.approved >= REVIEWER_FLAG_MIN_REVIEWS && editRate < 0.25) flags.push("rarely_edits");
+      if (gaps.length >= 5 && medianGap !== null && medianGap < REVIEWER_FAST_REVIEW_MINUTES) flags.push("fast");
+    }
+    const { reviewed_at: _times, ...rest } = entry;
+    return {
+      ...rest,
+      reject_rate: Number(rejectRate.toFixed(3)),
+      edit_rate: Number(editRate.toFixed(3)),
+      median_gap_minutes: medianGap === null ? null : Number(medianGap.toFixed(1)),
+      fast_share: fastShare === null ? null : Number(fastShare.toFixed(3)),
+      flags,
+      suspicious: flags.length >= 2 || flags.includes("fast"),
+    };
+  });
+  out.sort((a, b) => Number(b.suspicious) - Number(a.suspicious) || b.reviewed - a.reviewed || a.reviewer.localeCompare(b.reviewer));
+  return out;
+}
+
+// Re-queue markers: `reopen/{b64url(reviewUnit)}/{b64url(reviewer lowercased)}`
+// (zero-byte). A task re-queued by an admin is never handed back to the
+// reviewer whose decision was revoked.
+const REVIEW_SKIPS_PREFIX = `${REVIEW_PREFIX}skips/`;
+const reviewSkipMarkerKeyFor = (subKey, reviewer, at = Date.now()) =>
+  `${REVIEW_SKIPS_PREFIX}${b64url(reviewUnitForKey(subKey))}/${at}-${b64url(normalizeReviewerName(reviewer) || "unknown")}`;
+export function reviewSkipCountsFromKeys(keys, prefix = REVIEW_SKIPS_PREFIX) {
+  const counts = new Map(); // review unit -> { count, reviewers[] }
+  for (const key of keys ?? []) {
+    if (!String(key).startsWith(prefix)) continue;
+    const [unitPart, markerPart] = String(key).slice(prefix.length).split("/");
+    if (!unitPart || !markerPart) continue;
+    try {
+      const unit = fromB64url(unitPart);
+      const reviewer = fromB64url(markerPart.slice(markerPart.indexOf("-") + 1));
+      const entry = counts.get(unit) ?? { count: 0, reviewers: [] };
+      entry.count += 1;
+      if (reviewer && !entry.reviewers.includes(reviewer)) entry.reviewers.push(reviewer);
+      counts.set(unit, entry);
+    } catch {
+      /* malformed marker */
+    }
+  }
+  return counts;
+}
+let reviewSkipCache = { counts: null, checkedAt: 0 };
+async function reviewSkipCounts() {
+  if (reviewSkipCache.counts && Date.now() - reviewSkipCache.checkedAt < 15_000) return reviewSkipCache.counts;
+  const counts = reviewSkipCountsFromKeys(await listAll(REVIEW_SKIPS_PREFIX).catch(() => []));
+  reviewSkipCache = { counts, checkedAt: Date.now() };
+  return counts;
+}
+const REOPEN_PREFIX = `${REVIEW_PREFIX}reopen/`;
+const REOPEN_ARCHIVE_PREFIX = `${REVIEW_PREFIX}reopened/`;
+export const normalizeReviewerName = (name) => String(name || "").trim().toLowerCase();
+const reopenMarkerKeyFor = (unit, reviewer) => `${REOPEN_PREFIX}${b64url(unit)}/${b64url(normalizeReviewerName(reviewer))}`;
+export function reopenExclusionsFromKeys(keys, reopenPrefix = REOPEN_PREFIX) {
+  const excluded = new Map(); // review unit -> Set(lowercased reviewer names)
+  for (const key of keys ?? []) {
+    if (!String(key).startsWith(reopenPrefix)) continue;
+    const [unitPart, reviewerPart] = String(key).slice(reopenPrefix.length).split("/");
+    if (!unitPart || !reviewerPart) continue;
+    try {
+      const unit = fromB64url(unitPart);
+      const reviewer = fromB64url(reviewerPart);
+      if (!excluded.has(unit)) excluded.set(unit, new Set());
+      excluded.get(unit).add(reviewer);
+    } catch {
+      /* malformed marker — ignore */
+    }
+  }
+  return excluded;
+}
+export function excludeReopenedForReviewer(subKeys, reviewer, exclusions) {
+  const name = normalizeReviewerName(reviewer);
+  if (!name || !exclusions?.size) return subKeys;
+  return subKeys.filter((key) => !exclusions.get(reviewUnitForKey(key))?.has(name));
+}
+
+export function pageAdminDashboard(dashboard, options = {}) {
+  const query = cleanText(options.query, 240).trim().toLowerCase();
+  const participantId = cleanText(options.participant_id, 80).trim().toLowerCase();
+  const status = ["pending", "in_review", "approved", "rejected"].includes(options.status)
+    ? options.status
+    : "";
+  const filtered = (dashboard.items ?? []).filter((item) => {
+    if (participantId && String(item.participant_id || "").toLowerCase() !== participantId) return false;
+    if (status && item.status !== status) return false;
+    if (!query) return true;
+    return [
+      item.task_id,
+      item.participant_name,
+      item.participant_email,
+      item.participant_id,
+      item.original?.title,
+      item.original?.request,
+      item.reviewer,
+    ].some((value) => String(value || "").toLowerCase().includes(query));
+  });
+  const requestedLimit = Math.floor(Number(options.limit) || 50);
+  const limit = Math.max(1, Math.min(50, requestedLimit));
+  const offset = Math.max(0, Math.min(filtered.length, Math.floor(Number(options.offset) || 0)));
+  const items = filtered.slice(offset, offset + limit);
+  return {
+    ...dashboard,
+    reviewers: summarizeAdminReviewers(dashboard.items ?? []),
+    distribution_items: (dashboard.items ?? []).map((item) => item.final?.metadata ?? item.original?.metadata ?? {}),
+    // List requests should stay small as task prompts and step sets grow.
+    // Complete authored content is returned only by the explicit admin detail
+    // action when a reviewer opens one row.
+    items: items.map((item) => ({
+      task_id: item.task_id,
+      participant_id: item.participant_id,
+      participant_name: item.participant_name,
+      participant_email: item.participant_email,
+      mode: item.mode,
+      submitted_at: item.submitted_at,
+      status: item.status,
+      reviewer: item.reviewer,
+      reviewed_at: item.reviewed_at,
+      rejection_reason: item.rejection_reason,
+      trajectory_count: item.trajectory_count,
+      visit_count: item.visit_count,
+      changed: item.changed,
+      detail_loaded: false,
+      original: {
+        title: item.original?.title ?? "",
+        request: "",
+        difficulty: item.original?.difficulty ?? "",
+        criteria: [],
+        steps: [],
+        ...(item.original?.metadata ? { metadata: item.original.metadata } : {}),
+      },
+      final: item.final ? {
+        title: item.final.title ?? "",
+        request: "",
+        difficulty: item.final.difficulty ?? "",
+        criteria: [],
+        steps: [],
+        ...(item.final.metadata ? { metadata: item.final.metadata } : {}),
+      } : null,
+    })),
+    filtered_total: filtered.length,
+    offset,
+    limit,
+    next_offset: offset + items.length < filtered.length ? offset + items.length : null,
+  };
 }
 
 export function summarizePCBundles(bundles) {
@@ -1417,7 +2342,176 @@ async function pcAdminSave(body) {
   return { status: 200, body: { ok: true, edited_at: editedAt, revision_count: document.revision_count } };
 }
 
+export function buildAdminItemFromDocuments({
+  source,
+  sourceKey,
+  submittedAt = "",
+  done = null,
+  lock = null,
+  outcome = null,
+  llmCandidates = [],
+}) {
+  if (!source || !sourceKey) return null;
+  const sourceTask = source.task ?? source;
+  const finalTask = done?.outcome === "approved" ? outcome?.task ?? null : null;
+  const isRedacted = source.participant?.participant_id === "redacted" || sourceKey.includes("/pc/");
+  const participantId = isRedacted
+    ? "redacted"
+    : cleanText(source.participant?.participant_id || participantIdFromSubKey(sourceKey) || "unknown", 80);
+  const original = cleanTaskSnapshot(sourceTask);
+  const final = cleanTaskSnapshot(finalTask);
+  const originalMetadata = taskMetadataForReporting(sourceTask);
+  const finalMetadata = taskMetadataForReporting(finalTask) ?? (final ? originalMetadata : null);
+  const humanReview = done?.outcome === "approved" && outcome?.review && typeof outcome.review === "object"
+    ? {
+        evergreen_verified: Boolean(outcome.review.evergreen_verified),
+        title_edited: Boolean(outcome.review.title_edited),
+        request_edited: Boolean(outcome.review.request_edited),
+      }
+    : null;
+  const rubrics = cleanRubrics(outcome?.review, original, final);
+  const taskContentHash = reportingTaskContentHash(original, final, rubrics);
+  const changed = Boolean(final && JSON.stringify(original) !== JSON.stringify(final));
+  const changedInQc = outcome ? reviewerChangedTask(outcome) : false;
+  const sourceJourneys = Array.isArray(source.provenance?.source_journeys) ? source.provenance.source_journeys : [];
+  const visitCount = sourceJourneys.reduce(
+    (sum, journey) => sum + (Array.isArray(journey?.visits) ? journey.visits.length : 0),
+    0
+  );
+  const status = done?.outcome === "approved" ? "approved" : done?.outcome === "rejected" ? "rejected" : lock ? "in_review" : "pending";
+  const taskId = cleanText(source.task_id || done?.task_id || "unknown", 160);
+  const llmMeta = selectLlmReviewArtifact(applicableLlmReviewCandidates(llmCandidates, status), taskContentHash);
+  const llmReviewStale = Boolean(llmMeta?.contentHash && llmMeta.contentHash !== taskContentHash);
+  // The PRE_QC finding stays reportable after the human decision (it was the
+  // lead the reviewer worked from). Staleness is judged against the content
+  // the draft had when submitted, not the edited final gold.
+  const originalContentHash = final ? reportingTaskContentHash(original, null, cleanRubrics(null, original, null)) : taskContentHash;
+  const preQcMeta = selectLlmReviewArtifact(
+    (Array.isArray(llmCandidates) ? llmCandidates : []).filter((candidate) => candidate?.stage === "PRE_QC"),
+    originalContentHash
+  );
+  const preQcStale = Boolean(preQcMeta?.contentHash && preQcMeta.contentHash !== originalContentHash);
+  const claimedAt = Date.parse(String(lock?.claimed_at || ""));
+  const lockExpiresAt = lock && Number.isFinite(claimedAt)
+    ? new Date(claimedAt + Number(LOCK_TTL_MS)).toISOString()
+    : null;
+  const appealNumber = Math.max(0, Math.floor(Number(source.appeal_number) || 0));
+  const authorRevisionNumber = Math.max(
+    0,
+    Math.floor(Number(source.author_revision_number) || 0),
+    appealNumber > 0 || source.edit_started_at ? 1 : 0,
+  );
+  const authorRequeueCount = Math.max(
+    0,
+    Math.floor(Number(source.author_requeue_count) || 0),
+    source.edit_started_at ? 1 : 0,
+  );
+  return {
+    task_id: taskId,
+    participant_id: participantId,
+    participant_name: isRedacted ? "Anonymous / redacted" : cleanText(source.participant?.name || participantId, 160),
+    participant_email: isRedacted ? "" : cleanText(source.participant?.email, 240),
+    mode: cleanText(source.mode || (sourceKey.includes("/pc/") ? "pc" : "unknown"), 40),
+    submitted_at: cleanText(source.created_at || submittedAt, 60),
+    status,
+    reviewer: cleanText(done?.reviewer || lock?.reviewer, 160),
+    reviewed_at: cleanText(done?.completed_at, 60),
+    claimed_at: cleanText(done?.claimed_at, 60),
+    authoring_started_at: cleanText(source.authoring?.started_at, 60),
+    rejection_reason: status === "rejected" ? cleanText(outcome?.reason, 500) : "",
+    trajectory_count: sourceJourneys.length,
+    visit_count: visitCount,
+    changed,
+    changed_in_qc: changedInQc,
+    source_key: sourceKey,
+    review_unit: reviewUnitForKey(sourceKey),
+    done_target: done?.target || null,
+    lock_expires_at: lockExpiresAt,
+    original: original && originalMetadata ? { ...original, metadata: originalMetadata } : original,
+    final: final && finalMetadata ? { ...final, metadata: finalMetadata } : final,
+    rubrics,
+    human_review: humanReview,
+    task_content_hash: taskContentHash,
+    llm_review_status: llmReviewStale ? "stale" : llmMeta?.status ?? "not_reviewed",
+    llm_review_key: llmMeta?.key ?? null,
+    llm_review_stage: llmMeta?.stage ?? null,
+    llm_review_stale: llmReviewStale,
+    llm_pre_qc_status: preQcStale ? "stale" : preQcMeta?.status ?? "not_reviewed",
+    llm_pre_qc_key: preQcMeta?.key ?? null,
+    edit_started_at: cleanText(source.edit_started_at, 60),
+    appeal_started_at: cleanText(source.appeal_started_at, 60),
+    appeal_number: appealNumber,
+    author_revision_number: authorRevisionNumber,
+    author_requeue_count: authorRequeueCount,
+    author_requeued_at: cleanText(source.author_requeued_at, 60),
+    final_gold_revision: status === "approved" ? finalGoldRevision(outcome) : 0,
+    amended_by: cleanText(outcome?.amended_by, 80),
+    amended_at: cleanText(outcome?.amended_at, 60),
+    signoff_at: "",
+    signoff_action: "",
+    signoff_opened_at: "",
+  };
+}
+
+let adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
+
+// The full S3-built dashboard (every source doc + outcome) takes ~25s at
+// ~1.8k tasks — right under API Gateway's 30s cut-off and growing with the
+// corpus. A scheduled invocation (EventBridge, every 5 min) rebuilds it and
+// stores a gzipped snapshot; request paths serve the snapshot (≈2s) and only
+// fall back to a live build when the snapshot is missing or older than
+// SNAPSHOT_MAX_AGE_MS. Reporting therefore lags real-time by ≤5 min.
+const ADMIN_SNAPSHOT_KEY = `${REVIEW_PREFIX}cache/admin_dashboard.json.gz`;
+const SNAPSHOT_MAX_AGE_MS = 10 * 60 * 1000;
+
+export async function refreshAdminDashboardSnapshot() {
+  const startedAt = Date.now();
+  const dashboard = await loadAdminDashboard();
+  const builtAt = new Date().toISOString();
+  const body = gzipSync(Buffer.from(JSON.stringify({ built_at: builtAt, dashboard }), "utf8"));
+  await s3.send(new PutObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: ADMIN_SNAPSHOT_KEY,
+    Body: body,
+    ContentType: "application/json",
+    ContentEncoding: "gzip",
+  }));
+  adminDashboardCache = { dashboard: { ...dashboard, snapshot_built_at: builtAt }, checkedAt: Date.now(), pending: null };
+  return { built_at: builtAt, items: dashboard.items?.length ?? 0, bytes: body.length, build_ms: Date.now() - startedAt };
+}
+
+async function readAdminDashboardSnapshot() {
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: S3_BUCKET, Key: ADMIN_SNAPSHOT_KEY }));
+    const raw = Buffer.from(await res.Body.transformToByteArray());
+    const parsed = JSON.parse(gunzipSync(raw).toString("utf8"));
+    const builtAt = Date.parse(String(parsed?.built_at || ""));
+    if (!parsed?.dashboard || !Number.isFinite(builtAt) || Date.now() - builtAt > SNAPSHOT_MAX_AGE_MS) return null;
+    return { ...parsed.dashboard, snapshot_built_at: parsed.built_at };
+  } catch {
+    return null;
+  }
+}
+
 export async function adminDashboard() {
+  const now = Date.now();
+  if (adminDashboardCache.dashboard && now - adminDashboardCache.checkedAt < 15_000) {
+    return adminDashboardCache.dashboard;
+  }
+  if (!adminDashboardCache.pending) {
+    adminDashboardCache.pending = (async () => (await readAdminDashboardSnapshot()) ?? (await loadAdminDashboard()))();
+  }
+  try {
+    const dashboard = await adminDashboardCache.pending;
+    adminDashboardCache = { dashboard, checkedAt: Date.now(), pending: null };
+    return dashboard;
+  } catch (error) {
+    adminDashboardCache.pending = null;
+    throw error;
+  }
+}
+
+export async function loadAdminDashboard() {
   const [
     inbox,
     doneObjects,
@@ -1492,112 +2586,38 @@ export async function adminDashboard() {
   }));
 
   const units = [...byUnit.values()]
-    .sort((a, b) => (markerTime.get(b.newest) || "").localeCompare(markerTime.get(a.newest) || ""))
-    .slice(0, 1000);
+    .sort((a, b) => (markerTime.get(b.newest) || "").localeCompare(markerTime.get(a.newest) || ""));
   const items = [];
   // Bound concurrent S3 reads. Admin views can cover hundreds of submissions,
   // and one unbounded Promise.all would create avoidable throttling spikes.
   for (let offset = 0; offset < units.length; offset += 25) {
-    const batch = await Promise.all(units.slice(offset, offset + 25).map(async ({ newest, files }) => {
+    const batch = await Promise.all(units.slice(offset, offset + 25).map(async ({ newest }) => {
       const source = await readJson(newest).then(({ json }) => json).catch(() => null);
       if (!source) return null;
-      // The unit's NEWEST file, matching pendingReviewUnits. Taking the first
-      // done record from any file made a revised task keep its old outcome, so
-      // an appeal read as "rejected" to the PRE_QC exporter and never got the
-      // artifact its new content hash needs to become claimable.
+      // Resolve the same newest revision the reviewer queue uses. An earlier
+      // rejection/return must not mask a later appeal or revision.
       const done = doneByEncodedKey.get(b64url(newest)) ?? null;
       const lock = !done ? locks.get(b64url(newest)) ?? null : null;
       let outcome = null;
       if (done?.target) outcome = await readJson(done.target).then(({ json }) => json).catch(() => null);
 
-      const sourceTask = source.task ?? source;
-      const finalTask = done?.outcome === "approved" ? outcome?.task ?? null : null;
-      const isRedacted = source.participant?.participant_id === "redacted" || newest.includes("/pc/");
-      const participantId = isRedacted
-        ? "redacted"
-        : cleanText(source.participant?.participant_id || participantIdFromSubKey(newest) || "unknown", 80);
-      const original = cleanTaskSnapshot(sourceTask);
-      const final = cleanTaskSnapshot(finalTask);
-      const originalMetadata = taskMetadataForReporting(sourceTask);
-      const finalMetadata = taskMetadataForReporting(finalTask) ?? (final ? originalMetadata : null);
-      // One resolved value for the team-spread panel: a reviewer may correct the
-      // author's pick during QC, so final gold wins where it exists.
-      const taskMetadata = finalMetadata ?? originalMetadata;
-      const humanReview = done?.outcome === "approved" && outcome?.review && typeof outcome.review === "object"
-        ? {
-            evergreen_verified: Boolean(outcome.review.evergreen_verified),
-            title_edited: Boolean(outcome.review.title_edited),
-            request_edited: Boolean(outcome.review.request_edited),
-          }
-        : null;
-      const rubrics = cleanRubrics(outcome?.review, original, final);
-      const taskContentHash = reportingTaskContentHash(original, final, rubrics);
-      // "Gold differs from the submission" — true whoever made the difference.
-      const changed = Boolean(final && JSON.stringify(original) !== JSON.stringify(final));
-      // "The reviewer changed it during QC" — reviewer-only, so an author
-      // amendment cannot inflate it. These were one value until amendments
-      // existed, and changed_in_qc is the metric the cohort is steered on.
-      const changedInQc = outcome ? reviewerChangedTask(outcome) : false;
-      const sourceJourneys = Array.isArray(source.provenance?.source_journeys) ? source.provenance.source_journeys : [];
-      const visitCount = sourceJourneys.reduce((sum, journey) => sum + (Array.isArray(journey?.visits) ? journey.visits.length : 0), 0);
-      const status = done?.outcome === "approved" ? "approved" : done?.outcome === "rejected" ? "rejected" : lock ? "in_review" : "pending";
       const taskId = cleanText(source.task_id || done?.task_id || "unknown", 160);
-      const llmCandidates = applicableLlmReviewCandidates(llmCandidatesByTaskId.get(taskId), status);
-      const llmMeta = selectLlmReviewArtifact(llmCandidates, taskContentHash);
-      const llmReviewStale = Boolean(llmMeta?.contentHash && llmMeta.contentHash !== taskContentHash);
-      return {
-        task_id: taskId,
-        participant_id: participantId,
-        participant_name: isRedacted ? "Anonymous / redacted" : cleanText(source.participant?.name || participantId, 160),
-        participant_email: isRedacted ? "" : cleanText(source.participant?.email, 240),
-        mode: cleanText(source.mode || (newest.includes("/pc/") ? "pc" : "unknown"), 40),
-        submitted_at: cleanText(source.created_at || markerTime.get(newest), 60),
-        status,
-        reviewer: cleanText(done?.reviewer || lock?.reviewer, 160),
-        reviewed_at: cleanText(done?.completed_at, 60),
-        claimed_at: cleanText(done?.claimed_at || lock?.claimed_at, 60),
-        // How long the human review actually took. Recorded from this release
-        // onward; rows finished before it read null rather than zero.
-        review_minutes: stageMinutes(done?.claimed_at, done?.completed_at),
-        rejection_reason: status === "rejected" ? cleanText(outcome?.reason, 500) : "",
-        trajectory_count: sourceJourneys.length,
-        visit_count: visitCount,
-        changed,
-        changed_in_qc: changedInQc,
-        original: original && originalMetadata ? { ...original, metadata: originalMetadata } : original,
-        final: final && finalMetadata ? { ...final, metadata: finalMetadata } : final,
-        rubrics,
-        task_metadata: taskMetadata,
-        human_review: humanReview,
-        task_content_hash: taskContentHash,
-        llm_review_status: llmReviewStale ? "stale" : llmMeta?.status ?? "not_reviewed",
-        llm_review_key: llmMeta?.key ?? null,
-        llm_review_stage: llmMeta?.stage ?? null,
-        llm_review_stale: llmReviewStale,
-        // Author-side stage stamps, read straight off the submission the row is
-        // built from. The reporting layer turns each pair into minutes.
-        sub_key: newest,
-        edit_started_at: cleanText(source.edit_started_at, 60),
-        appeal_started_at: cleanText(source.appeal_started_at, 60),
-        appeal_number: Number(source.appeal_number) || 0,
-        final_gold_revision: status === "approved" ? finalGoldRevision(outcome) : 0,
-        amended_by: cleanText(outcome?.amended_by, 80),
-        amended_at: cleanText(outcome?.amended_at, 60),
-        signoff_at: "",
-        signoff_action: "",
-        signoff_opened_at: "",
-      };
+      return buildAdminItemFromDocuments({
+        source,
+        sourceKey: newest,
+        submittedAt: markerTime.get(newest),
+        done,
+        lock,
+        outcome,
+        llmCandidates: llmCandidatesByTaskId.get(taskId) ?? [],
+      });
     }));
     items.push(...batch.filter(Boolean));
   }
   await attachAuthorSignoffs(items);
-  return { items, users: summarizeAdminUsers(items), truncated: byUnit.size > units.length, total: byUnit.size };
+  return { items, users: summarizeAdminUsers(items), truncated: false, total: byUnit.size };
 }
 
-// Stamp each approved row with its author sign-off, if one exists. The prefix
-// is listed once and only rows that actually have a receipt are read, so this
-// costs nothing until authors start signing off and stays proportional to the
-// number who have.
 async function attachAuthorSignoffs(items) {
   const objects = await listAllObjects(AUTHOR_SIGNOFF_PREFIX).catch(() => []);
   if (!objects.length) return;
@@ -1607,13 +2627,13 @@ async function attachAuthorSignoffs(items) {
     try {
       have.add(fromB64url(encoded));
     } catch {
-      /* malformed receipt key */
+      // Malformed receipts are not addressable and cannot match a row.
     }
   }
-  const signed = items.filter((item) => item.sub_key && have.has(item.sub_key));
-  for (let i = 0; i < signed.length; i += 25) {
-    await Promise.all(signed.slice(i, i + 25).map(async (item) => {
-      const receipt = await readJson(authorSignoffKeyFor(item.sub_key))
+  const signed = items.filter((item) => item.source_key && have.has(item.source_key));
+  for (let offset = 0; offset < signed.length; offset += 25) {
+    await Promise.all(signed.slice(offset, offset + 25).map(async (item) => {
+      const receipt = await readJson(authorSignoffKeyFor(item.source_key))
         .then(({ json }) => json)
         .catch(() => null);
       if (!receipt) return;
@@ -1622,6 +2642,607 @@ async function attachAuthorSignoffs(items) {
       item.signoff_opened_at = cleanText(receipt.opened_at, 60);
     }));
   }
+}
+
+async function refreshAuthorDashboardIndex(subKey, done, outcome, receipt = null) {
+  if (!DASHBOARD_TABLE) return false;
+  const source = await readJson(subKey).then(({ json }) => json).catch(() => null);
+  if (!source) return false;
+  const item = buildAdminItemFromDocuments({ source, sourceKey: subKey, done, outcome });
+  if (!item) return false;
+  if (receipt) {
+    item.signoff_at = cleanText(receipt.signed_off_at, 60);
+    item.signoff_action = cleanText(receipt.action, 20);
+    item.signoff_opened_at = cleanText(receipt.opened_at, 60);
+  }
+  return await putDashboardIndexItem(item, { refreshDurable: true });
+}
+
+function invalidateDashboardIndexCache() {
+  dashboardIndexCache = { dashboard: null, checkedAt: 0, pending: null };
+}
+
+export async function putDashboardIndexItem(item, options = {}) {
+  if (!DASHBOARD_TABLE) return false;
+  const record = buildDashboardIndexRecord(item);
+  if (!record) return false;
+  const existing = await dashboardDb.send(new GetCommand({
+    TableName: DASHBOARD_TABLE,
+    Key: { scope: record.scope, entity_key: record.entity_key },
+    ConsistentRead: true,
+  })).then((response) => response.Item ?? null);
+  // A delayed registration must never roll a reviewed task back to pending.
+  const existingStatus = existing ? effectiveIndexedStatus(existing) : "pending";
+  const matchingAudit = existing && existing.task_content_hash === record.task_content_hash
+    ? {
+        pre_qc_artifact_key: existing.pre_qc_artifact_key,
+        pre_qc_task_content_hash: existing.pre_qc_task_content_hash,
+        pre_qc_pipeline_version: existing.pre_qc_pipeline_version,
+        pre_qc_status: existing.pre_qc_status,
+        pre_qc_complete: existing.pre_qc_complete,
+        pre_qc_indexed_at: existing.pre_qc_indexed_at,
+      }
+    : {};
+  // Preserve a durable outcome only for the same submitted revision. A newer
+  // author revision intentionally resets a rejected/returned unit to pending.
+  // `refreshDurable` is used after an in-place final-gold amendment.
+  const preserveDurable = existing
+    && existingStatus !== "pending"
+    && existing.source_key === record.source_key
+    && !options.refreshDurable;
+  const durable = preserveDurable
+    ? {
+        ...record,
+        ...matchingAudit,
+        status: existingStatus,
+        reviewer: existing.reviewer,
+        reviewed_at: existing.reviewed_at,
+        claimed_at: existing.claimed_at || "",
+        rejection_reason: existing.rejection_reason,
+        done_target: existing.done_target,
+        changed: existing.changed,
+        changed_in_qc: existing.changed_in_qc == null ? Boolean(existing.changed) : Boolean(existing.changed_in_qc),
+        amended_by: existing.amended_by || "",
+        amended_at: existing.amended_at || "",
+        final_gold_revision: Number(existing.final_gold_revision) || 0,
+        signoff_at: existing.signoff_at || "",
+        signoff_action: existing.signoff_action || "",
+        signoff_opened_at: existing.signoff_opened_at || "",
+        final_title: existing.final_title,
+        final_difficulty: existing.final_difficulty,
+        final_region: existing.final_region || "",
+        final_subjects: Array.isArray(existing.final_subjects) ? existing.final_subjects : [],
+        lock_expires_at: existing.lock_expires_at,
+      }
+    : { ...record, ...matchingAudit };
+  await dashboardDb.send(new PutCommand({ TableName: DASHBOARD_TABLE, Item: durable }));
+  invalidateDashboardIndexCache();
+  return true;
+}
+
+export async function markDashboardIndexReady(expectedCount, backfilledAt = new Date().toISOString()) {
+  if (!DASHBOARD_TABLE) return false;
+  const scope = dashboardIndexScope();
+  await dashboardDb.send(new PutCommand({
+    TableName: DASHBOARD_TABLE,
+    Item: {
+      scope,
+      entity_key: "META",
+      entity_type: "META",
+      ready: true,
+      expected_count: Math.max(0, Number(expectedCount) || 0),
+      backfilled_at: backfilledAt,
+      indexed_at: backfilledAt,
+    },
+  }));
+  invalidateDashboardIndexCache();
+  return true;
+}
+
+async function dashboardIndexMetadata() {
+  if (!DASHBOARD_TABLE) return null;
+  const response = await dashboardDb.send(new GetCommand({
+    TableName: DASHBOARD_TABLE,
+    Key: { scope: dashboardIndexScope(), entity_key: "META" },
+    ConsistentRead: true,
+  }));
+  return response.Item ?? null;
+}
+
+export async function loadDashboardIndexRecords() {
+  if (!DASHBOARD_TABLE) return [];
+  const records = [];
+  let ExclusiveStartKey;
+  do {
+    const response = await dashboardDb.send(new QueryCommand({
+      TableName: DASHBOARD_TABLE,
+      KeyConditionExpression: "#scope = :scope AND begins_with(#entity, :task)",
+      ExpressionAttributeNames: { "#scope": "scope", "#entity": "entity_key" },
+      ExpressionAttributeValues: { ":scope": dashboardIndexScope(), ":task": "TASK#" },
+      ExclusiveStartKey,
+      ConsistentRead: true,
+    }));
+    records.push(...(response.Items ?? []));
+    ExclusiveStartKey = response.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return records;
+}
+
+async function updateDashboardPreQcIndex(record, taskContentHash, candidate = null, artifact = null) {
+  if (!DASHBOARD_TABLE || !record?.task_id || !record?.source_key || !taskContentHash) return false;
+  const complete = candidate ? isCompletedReviewerPreQcArtifact(artifact) : false;
+  const values = {
+    ":hash": taskContentHash,
+    ":artifact": candidate?.key || null,
+    ":reviewHash": candidate?.contentHash || null,
+    ":version": Number(candidate?.pipelineVersion) || 0,
+    ":status": cleanText(artifact?.status, 80),
+    ":complete": complete,
+    ":indexed": new Date().toISOString(),
+  };
+  const sourceCondition = dashboardSourceCondition(record.source_key);
+  try {
+    await dashboardDb.send(new UpdateCommand({
+      TableName: DASHBOARD_TABLE,
+      Key: { scope: dashboardIndexScope(), entity_key: `TASK#${record.task_id}` },
+      ConditionExpression: sourceCondition.ConditionExpression,
+      UpdateExpression: "SET task_content_hash = :hash, pre_qc_artifact_key = :artifact, pre_qc_task_content_hash = :reviewHash, pre_qc_pipeline_version = :version, pre_qc_status = :status, pre_qc_complete = :complete, pre_qc_indexed_at = :indexed",
+      ExpressionAttributeNames: sourceCondition.ExpressionAttributeNames,
+      ExpressionAttributeValues: { ...values, ...sourceCondition.ExpressionAttributeValues },
+    }));
+    return complete;
+  } catch (error) {
+    if (error?.name === "ConditionalCheckFailedException") return false;
+    throw error;
+  }
+}
+
+export function dashboardRecordMatchesSource(record, sourceKey) {
+  return Boolean(record?.source_key && sourceKey && record.source_key === sourceKey);
+}
+
+export function dashboardSourceCondition(expectedSourceKey) {
+  if (!expectedSourceKey) return null;
+  return {
+    ConditionExpression: "attribute_exists(#entity) AND #source = :expectedSource",
+    ExpressionAttributeNames: { "#entity": "entity_key", "#source": "source_key" },
+    ExpressionAttributeValues: { ":expectedSource": expectedSourceKey },
+  };
+}
+
+async function taskContentHashForIndexRecord(record) {
+  if (record?.task_content_hash) return record.task_content_hash;
+  if (!record?.source_key) return "";
+  const source = await readJson(record.source_key).then(({ json }) => json).catch(() => null);
+  const original = cleanTaskSnapshot(source?.task ?? source);
+  if (!original) return "";
+  const rubrics = cleanRubrics(null, original, null);
+  const taskContentHash = reportingTaskContentHash(original, null, rubrics);
+  await updateDashboardPreQcIndex(record, taskContentHash);
+  record.task_content_hash = taskContentHash;
+  return taskContentHash;
+}
+
+async function completedPreQcSubmissionKeysFromIndex(submissionKeys, candidates) {
+  const records = await loadDashboardIndexRecords();
+  const byTaskId = new Map(records.map((record) => [record.task_id, record]));
+  const candidatesByTaskId = new Map();
+  for (const candidate of currentReviewerLlmCandidates(candidates)) {
+    const list = candidatesByTaskId.get(candidate.taskId) ?? [];
+    list.push(candidate);
+    candidatesByTaskId.set(candidate.taskId, list);
+  }
+
+  const ready = new Set();
+  const verify = [];
+  for (const subKey of submissionKeys) {
+    const taskId = taskIdFromSubmissionKey(subKey);
+    const record = taskId ? byTaskId.get(taskId) : null;
+    // A task id is stable across author revisions. A row for the previous
+    // source must not unlock the newest S3 submission; leave it unresolved so
+    // the caller performs the normal source-of-truth fallback.
+    if (!dashboardRecordMatchesSource(record, subKey)) continue;
+    const taskContentHash = await taskContentHashForIndexRecord(record);
+    if (!taskContentHash) continue;
+    const selected = selectLlmReviewArtifact(candidatesByTaskId.get(taskId) ?? [], taskContentHash);
+    if (!selected || selected.contentHash !== taskContentHash) continue;
+    if (isCurrentIndexedPreQc(record, selected, taskContentHash)) {
+      ready.add(subKey);
+      continue;
+    }
+    const indexedCandidate = record.pre_qc_artifact_key === selected.key
+      && record.pre_qc_task_content_hash === taskContentHash;
+    if (indexedCandidate && record.pre_qc_complete === false) continue;
+    verify.push({ subKey, record, taskContentHash, selected });
+  }
+
+  for (let offset = 0; offset < verify.length; offset += 25) {
+    const checked = await Promise.all(verify.slice(offset, offset + 25).map(async (item) => {
+      const artifact = await readJson(item.selected.key).then(({ json }) => json).catch(() => null);
+      const complete = await updateDashboardPreQcIndex(
+        item.record,
+        item.taskContentHash,
+        item.selected,
+        artifact,
+      );
+      return complete ? item.subKey : null;
+    }));
+    for (const subKey of checked) if (subKey) ready.add(subKey);
+  }
+  return ready;
+}
+
+export async function reconcileDashboardIndex(records) {
+  const inbox = await listAllObjects(`${REVIEW_PREFIX}inbox/`);
+  const newestByUnit = new Map();
+  for (const marker of inbox) {
+    try {
+      const sourceKey = fromB64url(marker.Key.slice(`${REVIEW_PREFIX}inbox/`.length));
+      if (!isReviewSubmissionKey(sourceKey)) continue;
+      const unit = reviewUnitForKey(sourceKey);
+      const current = newestByUnit.get(unit);
+      if (!current || sourceKey > current.sourceKey) {
+        newestByUnit.set(unit, {
+          sourceKey,
+          submittedAt: marker.LastModified?.toISOString() || "",
+        });
+      }
+    } catch {
+      // Invalid legacy marker: leave the source of truth untouched and ignore.
+    }
+  }
+  const indexedByUnit = new Map(records.map((record) => [record.review_unit, record.source_key]));
+  const missingOrNewer = [...newestByUnit.entries()]
+    .filter(([unit, marker]) => indexedByUnit.get(unit) !== marker.sourceKey)
+    .map(([, marker]) => marker);
+  let indexed = 0;
+  for (let offset = 0; offset < missingOrNewer.length; offset += 10) {
+    const batch = await Promise.all(missingOrNewer.slice(offset, offset + 10).map(async ({ sourceKey, submittedAt }) => {
+      const source = await readJson(sourceKey).then(({ json }) => json).catch(() => null);
+      if (!source) return false; // Presigned marker exists, upload has not landed.
+      const item = buildAdminItemFromDocuments({ source, sourceKey, submittedAt });
+      return item ? await putDashboardIndexItem(item) : false;
+    }));
+    indexed += batch.filter(Boolean).length;
+  }
+  return { indexed, candidates: missingOrNewer.length, inbox_units: newestByUnit.size };
+}
+
+let dashboardIndexCache = { dashboard: null, checkedAt: 0, pending: null };
+
+export async function indexedAdminDashboard() {
+  if (!DASHBOARD_TABLE) return null;
+  const now = Date.now();
+  if (dashboardIndexCache.dashboard && now - dashboardIndexCache.checkedAt < 15_000) {
+    return dashboardIndexCache.dashboard;
+  }
+  if (!dashboardIndexCache.pending) {
+    dashboardIndexCache.pending = (async () => {
+      const meta = await dashboardIndexMetadata();
+      if (!meta?.ready) return null;
+      let records = await loadDashboardIndexRecords();
+      const reconciliation = await reconcileDashboardIndex(records);
+      if (reconciliation.indexed) records = await loadDashboardIndexRecords();
+      return dashboardFromIndexRecords(records);
+    })();
+  }
+  try {
+    const dashboard = await dashboardIndexCache.pending;
+    dashboardIndexCache = { dashboard, checkedAt: Date.now(), pending: null };
+    return dashboard;
+  } catch (error) {
+    dashboardIndexCache.pending = null;
+    throw error;
+  }
+}
+
+// Admin "throw it back into the pool": revoke an approval/rejection so the
+// task is reviewed again by someone else. Everything revoked is archived under
+// reopened/ (never deleted outright), the previous reviewer's credit receipt
+// is withdrawn, and a reopen marker keeps the task away from that reviewer.
+async function reopenReviewOutcome(taskId, adminEmail, reason = "") {
+  const cleanId = cleanText(taskId, 300);
+  if (!cleanId) return { status: 400, body: { error: "task_id required" } };
+  let item = null;
+  try {
+    item = await indexedAdminDetail(cleanId);
+  } catch (error) {
+    console.error("Reopen: index detail failed; using S3 source of truth", error);
+  }
+  if (!item) item = (await adminDashboard()).items.find((candidate) => candidate.task_id === cleanId) ?? null;
+  if (!item) return { status: 404, body: { error: "Task not found" } };
+  if (!["approved", "rejected"].includes(item.status)) {
+    return { status: 409, body: { error: `Only approved or rejected tasks can be re-queued (status: ${item.status})` } };
+  }
+  const subKey = item.source_key;
+  const mutationLock = await acquireAuthorMutationLock(subKey, `admin:${cleanText(adminEmail, 120) || "reopen"}`);
+  if (!mutationLock) {
+    return { status: 409, body: { error: "This task is being accepted, amended, or reopened. Retry in a moment." } };
+  }
+  try {
+  // The dashboard detail was read before acquiring the mutex. Resolve the
+  // unit's actual newest stored revision and revalidate its completion record
+  // inside the lock. A failed best-effort index refresh must never let an old
+  // rejected row reopen historical state after a newer author edit exists.
+  const unit = reviewUnitForKey(subKey);
+  const dir = subKey.slice(0, subKey.lastIndexOf("/") + 1);
+  const files = (await listAll(dir))
+    .filter((key) => isReviewSubmissionKey(key) && reviewUnitForKey(key) === unit)
+    .sort();
+  const newest = newestReviewRevision(files, unit);
+  if (!newest || newest !== subKey) {
+    adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
+    invalidateDashboardIndexCache();
+    return { status: 409, body: { error: "Dashboard state is stale; refresh before reopening this task." } };
+  }
+  const currentDone = await readDoneRecord(newest);
+  const currentOutcome = doneOutcome(currentDone);
+  if (!["approved", "rejected"].includes(currentOutcome)) {
+    return { status: 409, body: { error: "This task is no longer approved or rejected." } };
+  }
+  item = {
+    ...item,
+    status: currentOutcome,
+    done_target: currentDone.target || item.done_target,
+    reviewer: currentDone.reviewer || item.reviewer,
+    reviewed_at: currentDone.completed_at || item.reviewed_at,
+  };
+  const listedDoneKeys = new Set(
+    (await listAllObjects(`${REVIEW_PREFIX}done/`))
+      .map((object) => object.Key.slice(`${REVIEW_PREFIX}done/`.length)),
+  );
+  const doneRecords = await resolveDoneRecordsForReopen({
+    files,
+    newest,
+    currentDone,
+    listedDoneKeys,
+    readDone: readDoneRecord,
+  });
+  const reviewLockEtags = new Map();
+  for (const key of files) {
+    try {
+      const { etag } = await readJson(lockKeyFor(key));
+      if (etag) reviewLockEtags.set(key, etag);
+    } catch (error) {
+      if (!isMissingObjectError(error)) throw error;
+    }
+  }
+  const reopenedAt = new Date().toISOString();
+  const stamp = reopenedAt.replace(/[:.]/g, "-");
+  const archiveBase = `${REOPEN_ARCHIVE_PREFIX}${b64url(unit)}/${stamp}_`;
+  const archived = [];
+  const targets = new Set([item.done_target, ...doneRecords.map((entry) => entry.done?.target)].filter(Boolean));
+  for (const target of targets) {
+    const archiveKey = `${archiveBase}${target.slice(target.lastIndexOf("/") + 1)}`;
+    try {
+      await s3.send(new CopyObjectCommand({ Bucket: S3_BUCKET, CopySource: `/${S3_BUCKET}/${encodeURIComponent(target).replace(/%2F/g, "/")}`, Key: archiveKey }));
+      await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: target }));
+      archived.push({ from: target, to: archiveKey });
+    } catch (error) {
+      if (error?.$metadata?.httpStatusCode !== 404 && error?.name !== "NoSuchKey") throw error;
+    }
+  }
+  // A new approval is a new version for the author to inspect. Archive and
+  // clear any receipt for the revoked approval so it cannot silently satisfy
+  // the next sign-off queue entry under the same submission key.
+  const signoffKey = authorSignoffKeyFor(subKey);
+  try {
+    const archiveKey = `${archiveBase}author-signoff.json`;
+    await s3.send(new CopyObjectCommand({
+      Bucket: S3_BUCKET,
+      CopySource: `/${S3_BUCKET}/${encodeURIComponent(signoffKey).replace(/%2F/g, "/")}`,
+      Key: archiveKey,
+    }));
+    await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: signoffKey }));
+    archived.push({ from: signoffKey, to: archiveKey });
+  } catch (error) {
+    if (error?.$metadata?.httpStatusCode !== 404 && error?.name !== "NoSuchKey") throw error;
+  }
+  const previousReviewers = [...new Set([item.reviewer, ...doneRecords.map((entry) => entry.done?.reviewer)].filter(Boolean))];
+  const previousOutcome = item.status;
+  await s3.send(new PutObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: `${archiveBase}reopen.json`,
+    Body: JSON.stringify({
+      task_id: cleanId,
+      source_key: subKey,
+      review_unit: unit,
+      previous_outcome: previousOutcome,
+      previous_reviewers: previousReviewers,
+      previous_reviewed_at: item.reviewed_at || "",
+      reopened_by: cleanText(adminEmail, 240),
+      reopened_at: reopenedAt,
+      reason: cleanText(reason, 500),
+      archived,
+      done_records: doneRecords.map((entry) => ({ key: entry.key, done: entry.done })),
+    }, null, 2),
+    ContentType: "application/json",
+  }));
+  for (const reviewer of previousReviewers) {
+    await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: reopenMarkerKeyFor(unit, reviewer), Body: "", ContentType: "text/plain" }));
+  }
+  // Withdraw credit receipts, then the done markers (order matters: a crash
+  // between the two leaves a still-done task, never a double-credited one).
+  await withdrawReopenedOutcomeState(doneRecords, {
+    deleteCredit: async ({ key, done }) => {
+      const reviewer = done?.reviewer || item.reviewer;
+      const outcome = done?.outcome || previousOutcome;
+      if (!reviewer || !outcome) return;
+      await deleteIfPresent(() => s3.send(new DeleteObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: reviewerCreditKeyFor(reviewer, outcome, key),
+      })));
+    },
+    deleteLock: async ({ key }) => {
+      const etag = reviewLockEtags.get(key);
+      if (!etag) return;
+      if (!(await deleteLockIfUnchanged(key, etag))) {
+        throw new Error("Review lock changed while reopening; retry before deleting completion state");
+      }
+    },
+    deleteDone: ({ key }) => s3.send(new DeleteObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: doneKeyFor(key),
+    })),
+  });
+  // Make sure the newest file is in the inbox (it normally still is — inbox
+  // markers are not removed on completion — so position in the FIFO is kept).
+  try {
+    await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: inboxKeyFor(newest) }));
+  } catch {
+    await s3.send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: inboxKeyFor(newest), Body: newest, ContentType: "text/plain" }));
+  }
+  await setDashboardIndexStatus(cleanId, "pending", { expected_source_key: subKey })
+    .catch((error) => console.error("Reopen index update failed", error));
+  adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      task_id: cleanId,
+      previous_outcome: previousOutcome,
+      previous_reviewers: previousReviewers,
+      archived: archived.length,
+      reopened_at: reopenedAt,
+    },
+  };
+  } finally {
+    await releaseAuthorMutationLock(subKey, mutationLock);
+  }
+}
+
+async function adminListDashboard() {
+  try {
+    const indexed = await indexedAdminDashboard();
+    if (indexed) return indexed;
+  } catch (error) {
+    console.error("Dashboard index read failed; using S3 source of truth", error);
+  }
+  return await adminDashboard();
+}
+
+async function dashboardIndexRecord(taskId) {
+  if (!DASHBOARD_TABLE || !taskId) return null;
+  const response = await dashboardDb.send(new GetCommand({
+    TableName: DASHBOARD_TABLE,
+    Key: { scope: dashboardIndexScope(), entity_key: `TASK#${taskId}` },
+    ConsistentRead: true,
+  }));
+  return response.Item ?? null;
+}
+
+async function indexedAdminDetail(taskId) {
+  const record = await dashboardIndexRecord(taskId);
+  if (!record?.source_key) return null;
+  const source = await readJson(record.source_key).then(({ json }) => json);
+  const status = effectiveIndexedStatus(record);
+  const done = ["approved", "rejected"].includes(status)
+    ? {
+        target: record.done_target,
+        outcome: status,
+        reviewer: record.reviewer,
+        completed_at: record.reviewed_at,
+        claimed_at: record.claimed_at,
+        task_id: record.task_id,
+      }
+    : null;
+  const outcome = record.done_target
+    ? await readJson(record.done_target).then(({ json }) => json).catch(() => null)
+    : null;
+  const expiresAt = Date.parse(String(record.lock_expires_at || ""));
+  const lock = status === "in_review" && Number.isFinite(expiresAt)
+    ? {
+        reviewer: record.reviewer,
+        claimed_at: new Date(expiresAt - Number(LOCK_TTL_MS)).toISOString(),
+      }
+    : null;
+  return buildAdminItemFromDocuments({ source, sourceKey: record.source_key, done, lock, outcome });
+}
+
+export function buildDashboardStatusUpdateRequest({
+  tableName,
+  scope,
+  taskId,
+  status,
+  expectedSourceKey,
+  details = {},
+  indexedAt = new Date().toISOString(),
+}) {
+  if (!tableName || !scope || !taskId || !expectedSourceKey) return null;
+  const values = {
+    ":status": status,
+    ":reviewer": details.reviewer || "",
+    ":reviewed": details.reviewed_at || "",
+    ":reason": details.rejection_reason || "",
+    ":target": details.done_target || null,
+    ":expires": details.lock_expires_at || null,
+    ":changed": Boolean(details.changed),
+    ":changedInQc": details.changed_in_qc == null ? Boolean(details.changed) : Boolean(details.changed_in_qc),
+    ":finalTitle": details.final_title || "",
+    ":finalDifficulty": details.final_difficulty || "",
+    ":finalRegion": details.final_metadata?.region || "",
+    ":finalSubjects": Array.isArray(details.final_metadata?.subjects) ? details.final_metadata.subjects.slice(0, 3) : [],
+    ":claimedAt": details.claimed_at || "",
+    ":amendedBy": details.amended_by || "",
+    ":amendedAt": details.amended_at || "",
+    ":revision": Number(details.final_gold_revision) || 0,
+    ":indexed": indexedAt,
+    ":expectedSource": expectedSourceKey,
+  };
+  const clearSignoff = status === "pending"
+    ? " REMOVE signoff_at, signoff_action, signoff_opened_at"
+    : "";
+  return {
+    TableName: tableName,
+    Key: { scope, entity_key: `TASK#${taskId}` },
+    ConditionExpression: "attribute_exists(#entity) AND #source = :expectedSource",
+    UpdateExpression: `SET #status = :status, reviewer = :reviewer, reviewed_at = :reviewed, rejection_reason = :reason, done_target = :target, lock_expires_at = :expires, changed = :changed, changed_in_qc = :changedInQc, final_title = :finalTitle, final_difficulty = :finalDifficulty, final_region = :finalRegion, final_subjects = :finalSubjects, claimed_at = :claimedAt, amended_by = :amendedBy, amended_at = :amendedAt, final_gold_revision = :revision, indexed_at = :indexed${clearSignoff}`,
+    ExpressionAttributeNames: { "#entity": "entity_key", "#status": "status", "#source": "source_key" },
+    ExpressionAttributeValues: values,
+  };
+}
+
+async function setDashboardIndexStatus(taskId, status, details = {}) {
+  if (!DASHBOARD_TABLE || !taskId || !details.expected_source_key) return false;
+  const request = buildDashboardStatusUpdateRequest({
+    tableName: DASHBOARD_TABLE,
+    scope: dashboardIndexScope(),
+    taskId,
+    status,
+    expectedSourceKey: details.expected_source_key,
+    details,
+  });
+  try {
+    await dashboardDb.send(new UpdateCommand(request));
+    invalidateDashboardIndexCache();
+    return true;
+  } catch (error) {
+    if (error?.name === "ConditionalCheckFailedException") return false;
+    throw error;
+  }
+}
+
+async function registerDashboardSubmission(taskId, participantId) {
+  if (!DASHBOARD_TABLE) return { indexed: false, reason: "disabled" };
+  const scope = dashboardIndexScope();
+  if (scope !== "v2") return { indexed: false, reason: "unsupported_scope" };
+  const pid = cleanText(participantId, 80).trim().toLowerCase();
+  const expectedTask = `v2/${pid}/internal/`;
+  if (!VALID_PID.test(pid) || !String(taskId).startsWith(expectedTask)) {
+    return { indexed: false, reason: "invalid_task" };
+  }
+  const objects = await listAllObjects(`${UPLOAD_PREFIX}${pid}/${taskId}/`);
+  const sourceKey = objects
+    .map((object) => object.Key)
+    .filter((key) => isReviewSubmissionKey(key))
+    .sort()
+    .at(-1);
+  if (!sourceKey) return { indexed: false, reason: "upload_not_found" };
+  const source = await readJson(sourceKey).then(({ json }) => json);
+  if (source?.task_id !== taskId) return { indexed: false, reason: "task_mismatch" };
+  const item = buildAdminItemFromDocuments({ source, sourceKey });
+  await putDashboardIndexItem(item);
+  return { indexed: true, task_id: taskId };
 }
 
 export function selectReportingPage(dashboard, options = {}) {
@@ -1637,7 +3258,12 @@ export function selectReportingPage(dashboard, options = {}) {
   );
   const offset = requestedTaskId ? 0 : Math.max(0, Number(options.offset) || 0);
   const requestedLimit = Number(options.limit);
-  const maxPageSize = includeContent ? 1 : includeLlmReviews ? 25 : 1_000;
+  // Metadata rows are small: one page can hold the whole corpus. Content rows
+  // carry prompts + rubrics (a few KB each); LLM artifacts are ~30KB each and
+  // stay tightly paged. llm_flags reads the artifact too but emits only a
+  // compact summary, so it gets a middle-sized page.
+  const includeLlmFlags = Boolean(options.includeLlmFlags);
+  const maxPageSize = includeLlmReviews ? 25 : includeLlmFlags ? 200 : includeContent ? 150 : 5_000;
   const limit = requestedTaskId
     ? filteredItems.length || 1
     : Number.isFinite(requestedLimit) && requestedLimit > 0
@@ -1661,32 +3287,143 @@ export async function hydrateReportingLlmReviews(dashboard, options = {}, loadRe
   return dashboard;
 }
 
+// Compact "which Codex checks fired" summary from a review artifact, so
+// reporting rows can carry more than passed/attention without shipping the
+// whole artifact. Checks: website feasibility (any rubric not POSSIBLE),
+// step alignment (any rubric quality check not PASS), task quality/coherence,
+// overall public-web feasibility (manager disposition).
+export function llmFlagSummary(review) {
+  if (!review || typeof review !== "object") return null;
+  const human = review.rubrics && review.status ? review : llmReviewForHuman(review);
+  if (!human) return null;
+  const flags = [];
+  const rubrics = Array.isArray(human.rubrics) ? human.rubrics : [];
+  const infeasible = rubrics.filter((rubric) => rubric.verdict && rubric.verdict !== "POSSIBLE");
+  const misaligned = rubrics.filter((rubric) => rubric.quality_verdict && rubric.quality_verdict !== "PASS");
+  if (infeasible.length) flags.push("website_feasibility");
+  if (misaligned.length) flags.push("step_alignment");
+  const coherence = human.quality?.task_coherence?.verdict ?? human.quality?.overall_verdict ?? null;
+  if (coherence && coherence !== "PASS") flags.push("task_quality");
+  if (human.manager_disposition && human.manager_disposition !== "FEASIBLE") flags.push("overall_feasibility");
+  return {
+    llm_flag_count: flags.length,
+    llm_flags: flags,
+    llm_result: cleanText(human.status, 40) || null,
+    llm_rubrics_infeasible: infeasible.map((rubric) => rubric.rubric_id),
+    llm_rubrics_misaligned: misaligned.map((rubric) => rubric.rubric_id),
+    llm_has_repair_plan: Boolean(human.task_repair || human.repair_plan),
+  };
+}
+
+export async function hydrateReportingLlmFlags(dashboard, options = {}, loadReview = async (key) => (
+  readJson(key).then(({ json }) => json).catch(() => null)
+)) {
+  const { sourceItems } = selectReportingPage(dashboard, options);
+  for (let offset = 0; offset < sourceItems.length; offset += 25) {
+    await Promise.all(sourceItems.slice(offset, offset + 25).map(async (item) => {
+      const key = item.llm_review_key ?? item.llm_pre_qc_key ?? null;
+      if (item.llm_flags_loaded_for === key) return;
+      const review = key ? await loadReview(key) : null;
+      item.llm_flags = review ? { ...llmFlagSummary(review), llm_flags_stage: key === item.llm_review_key ? item.llm_review_stage ?? "PRE_QC" : "PRE_QC" } : null;
+      item.llm_flags_loaded_for = key;
+    }));
+  }
+  return dashboard;
+}
+
+// Reporting identity hygiene: one display name per participant_id (the most
+// frequent spelling, ties broken toward the one with capital letters), plus
+// an optional admin-maintained alias map that pins duplicate accounts to a
+// canonical id ({review-root}config/participant_aliases.json: {alias: canonical}).
+export function canonicalParticipantNames(items) {
+  const tally = new Map(); // pid -> Map(name -> count)
+  for (const item of items ?? []) {
+    const pid = item?.participant_id || "";
+    const name = String(item?.participant_name || "").trim();
+    if (!pid || !name) continue;
+    if (!tally.has(pid)) tally.set(pid, new Map());
+    const names = tally.get(pid);
+    names.set(name, (names.get(name) ?? 0) + 1);
+  }
+  const out = new Map();
+  for (const [pid, names] of tally) {
+    const ranked = [...names.entries()].sort((a, b) =>
+      b[1] - a[1] ||
+      Number(/[A-Z]/.test(b[0])) - Number(/[A-Z]/.test(a[0])) ||
+      a[0].localeCompare(b[0]));
+    out.set(pid, ranked[0][0]);
+  }
+  return out;
+}
+
+export function applyParticipantAliases(pid, aliases) {
+  const map = aliases && typeof aliases === "object" ? aliases : {};
+  let current = String(pid || "");
+  for (let hop = 0; hop < 5 && map[current] && map[current] !== current; hop += 1) current = String(map[current]);
+  return current;
+}
+
+let participantAliasCache = { aliases: null, checkedAt: 0 };
+async function participantAliases() {
+  if (participantAliasCache.aliases && Date.now() - participantAliasCache.checkedAt < 60_000) return participantAliasCache.aliases;
+  const aliases = await readJson(`${REVIEW_PREFIX}config/participant_aliases.json`)
+    .then(({ json }) => (json && typeof json === "object" && !Array.isArray(json) ? json : {}))
+    .catch(() => ({}));
+  participantAliasCache = { aliases, checkedAt: Date.now() };
+  return aliases;
+}
+
+// Upload time is the server-minted timestamp in the S3 key
+// ({ts}-{nonce}_long_task.json); the payload's created_at is when the draft
+// was first assembled for submission on the client.
+export function uploadedAtFromSourceKey(sourceKey) {
+  const match = /\/(\d{13})-[A-Za-z0-9]+_[^/]*$/.exec(String(sourceKey || ""));
+  return match ? new Date(Number(match[1])).toISOString() : "";
+}
+
+export function reviewMinutes(claimedAt, reviewedAt) {
+  return stageMinutes(claimedAt, reviewedAt);
+}
+
 export function buildReportingReport(dashboard, generatedAt = new Date().toISOString(), options = {}) {
   const includeContent = Boolean(options.includeContent);
   const includeLlmReviews = Boolean(options.includeLlmReviews);
+  const includeLlmFlags = Boolean(options.includeLlmFlags);
+  const aliases = options.participantAliases ?? {};
+  const skipCounts = options.skipCounts instanceof Map ? options.skipCounts : new Map();
+  const canonicalNames = canonicalParticipantNames(dashboard.items ?? []);
   const { filteredItems, sourceItems, offset, limit } = selectReportingPage(dashboard, options);
-  const items = sourceItems.map((item) => ({
+  const items = sourceItems.map((item) => {
+    const effective = item.final ?? item.original ?? {};
+    const metadata = effective.metadata ?? item.original?.metadata ?? {};
+    const rubrics = Array.isArray(item.rubrics) ? item.rubrics : [];
+    const editedRubrics = rubrics.filter((rubric) => rubric.changed);
+    const canonicalId = applyParticipantAliases(item.participant_id, aliases);
+    const skips = skipCounts.get(item.review_unit || reviewUnitForKey(item.source_key || "")) ?? null;
+    const changedInQc = item.changed_in_qc == null ? Boolean(item.changed) : Boolean(item.changed_in_qc);
+    return {
     task_id: item.task_id,
     participant_id: item.participant_id,
-    participant_name: item.participant_name,
+    canonical_participant_id: canonicalId,
+    participant_name: canonicalNames.get(canonicalId) ?? canonicalNames.get(item.participant_id) ?? item.participant_name,
+    participant_name_raw: item.participant_name,
     participant_email: item.participant_email,
     mode: item.mode,
+    authoring_started_at: item.authoring_started_at || "",
+    created_at: item.submitted_at,
     submitted_at: item.submitted_at,
+    uploaded_at: uploadedAtFromSourceKey(item.source_key),
+    authoring_minutes: reviewMinutes(item.authoring_started_at, item.submitted_at),
     status: item.status,
     qc_completed: item.status === "approved" || item.status === "rejected",
     reviewer: item.reviewer,
+    claimed_at: item.claimed_at || "",
     reviewed_at: item.reviewed_at,
-    changed_in_qc: Boolean(item.changed_in_qc),
-    // Kept separate: gold can now differ from the submission because the AUTHOR
-    // amended it after approval, which is not a QC edit.
-    changed_after_approval: Boolean(item.changed && !item.changed_in_qc),
+    review_minutes: reviewMinutes(item.claimed_at, item.reviewed_at),
+    changed_in_qc: changedInQc,
+    changed_after_approval: Boolean(item.changed && !changedInQc),
     amended_by: item.amended_by ?? "",
     amended_at: item.amended_at ?? "",
-    // Author-side stage durations, derived from stored timestamp pairs the same
-    // way the deployed route derives authoring_minutes and review_minutes.
-    // Added as new keys: the existing row shape is not touched.
-    claimed_at: item.claimed_at ?? "",
-    review_minutes: item.review_minutes ?? null,
     signoff_at: item.signoff_at ?? "",
     signoff_action: item.signoff_action ?? "",
     signoff_minutes: stageMinutes(item.signoff_opened_at, item.signoff_at),
@@ -1694,11 +3431,33 @@ export function buildReportingReport(dashboard, generatedAt = new Date().toISOSt
     appeal_minutes: stageMinutes(item.appeal_started_at, item.submitted_at),
     appeal_number: item.appeal_number ?? 0,
     final_gold_revision: item.final_gold_revision ?? 0,
+    title_edited: Boolean(item.human_review?.title_edited),
+    request_edited: Boolean(item.human_review?.request_edited),
+    rubric_count: rubrics.length,
+    rubrics_edited: editedRubrics.length,
+    rubrics_edited_ids: editedRubrics.map((rubric) => rubric.rubric_id),
+    skip_count: skips ? skips.count : 0,
+    skipped_by: skips ? skips.reviewers : [],
+    anchored_country: cleanText(metadata.region, 120) || "",
+    subjects: Array.isArray(metadata.subjects) ? metadata.subjects.slice(0, 10) : [],
     rejection_reason: item.rejection_reason,
     trajectory_count: item.trajectory_count,
     visit_count: item.visit_count,
     llm_review_status: item.llm_review_status ?? "not_reviewed",
     llm_review_stage: item.llm_review_stage ?? null,
+    // Pre-QC outcome regardless of workflow state — approved/rejected tasks
+    // keep the Codex lead their reviewer saw (llm_review_status switches to
+    // the POST_QC artifact once a task is decided).
+    llm_pre_qc_status: item.llm_pre_qc_status ?? "not_reviewed",
+    ...(includeLlmFlags ? {
+      llm_flag_count: item.llm_flags?.llm_flag_count ?? null,
+      llm_flags: item.llm_flags?.llm_flags ?? null,
+      llm_result: item.llm_flags?.llm_result ?? null,
+      llm_rubrics_infeasible: item.llm_flags?.llm_rubrics_infeasible ?? null,
+      llm_rubrics_misaligned: item.llm_flags?.llm_rubrics_misaligned ?? null,
+      llm_has_repair_plan: item.llm_flags?.llm_has_repair_plan ?? null,
+      llm_flags_stage: item.llm_flags?.llm_flags_stage ?? null,
+    } : {}),
     ...(includeContent ? {
       content: {
         task_content_hash: item.task_content_hash,
@@ -1724,7 +3483,8 @@ export function buildReportingReport(dashboard, generatedAt = new Date().toISOSt
       llm_evergreen_review: llmEvergreenReviewFromReview(item.llm_review),
       llm_quality_review: llmQualityReviewFromReview(item.llm_review),
     } : {}),
-  }));
+    };
+  });
   const totals = { submitted: filteredItems.length, pending: 0, in_review: 0, approved: 0, rejected: 0, qc_completed: 0 };
   for (const item of filteredItems) {
     if (item.status in totals) totals[item.status] += 1;
@@ -1744,8 +3504,13 @@ export function buildReportingReport(dashboard, generatedAt = new Date().toISOSt
       next_offset: nextOffset,
       filtered_total: filteredItems.length,
     },
-    truncated: Boolean(dashboard.truncated),
+    // True whenever this response does not contain every matching row —
+    // either the source listing was capped or this is one page of several.
+    truncated: Boolean(dashboard.truncated) || nextOffset !== null,
     source_total: dashboard.total ?? filteredItems.length,
+    // When served from the scheduled snapshot: when that snapshot was built
+    // (reporting lags live state by up to ~5 minutes). Null = built live.
+    snapshot_built_at: dashboard.snapshot_built_at ?? null,
   };
 }
 
@@ -1755,18 +3520,15 @@ export function sortPendingReviewUnits(units) {
     .map((unit) => unit.newest);
 }
 
-// The review index: inbox markers, done records, and fresh locks, grouped
-// into task-directory units (the reviewable entity). Shared by the reviewer
-// queue and the author-facing endpoints so they see the same grouping. Done
-// records are only read when a caller needs outcomes (my-tasks, author-edit);
-// the reviewer queue just needs membership, so it skips the extra reads.
-// `doneRecordFilter(subKey)` narrows those reads to the records the caller
-// will look at — without it an author-facing call reads the whole bucket.
+// Shared index for the reviewer queue and author-facing task pages. Done
+// records are fetched only when a caller needs their contents and may be
+// narrowed to one author/unit to keep page loads proportional.
 async function loadReviewIndex({ readDoneRecords = false, doneRecordFilter = null } = {}) {
-  const [inbox, doneObjects, lockObjects] = await Promise.all([
+  const [inbox, doneObjects, lockObjects, reopenKeys] = await Promise.all([
     listAllObjects(`${REVIEW_PREFIX}inbox/`),
     listAllObjects(`${REVIEW_PREFIX}done/`),
     listAllObjects(`${REVIEW_PREFIX}locks/`),
+    listAll(REOPEN_PREFIX),
   ]);
   const inboxAge = new Map(); // submission key -> marker LastModified ms
   const submissions = [];
@@ -1782,15 +3544,10 @@ async function loadReviewIndex({ readDoneRecords = false, doneRecordFilter = nul
     }
   }
   submissions.sort(); // deterministic grouping; queue order is assigned below from marker time
-  const doneSet = new Set(doneObjects.map((o) => o.Key.slice(`${REVIEW_PREFIX}done/`.length)));
+  const doneSet = new Set(doneObjects.map((object) => object.Key.slice(`${REVIEW_PREFIX}done/`.length)));
   let doneByEncodedKey = null;
   if (readDoneRecords) {
     doneByEncodedKey = new Map();
-    // Only the records the caller will actually read. Reading every done
-    // record costs one GET per completed review platform-wide — O(all
-    // history) on an author-facing page load — so callers pass a filter that
-    // narrows this to their own tasks. Batched like the admin dashboard:
-    // one unbounded Promise.all creates avoidable throttling spikes.
     const wanted = [];
     for (const object of doneObjects) {
       const encoded = object.Key.slice(`${REVIEW_PREFIX}done/`.length);
@@ -1798,7 +3555,7 @@ async function loadReviewIndex({ readDoneRecords = false, doneRecordFilter = nul
       try {
         subKey = fromB64url(encoded);
       } catch {
-        continue; // malformed done key — not addressable by any caller
+        continue;
       }
       if (doneRecordFilter && !doneRecordFilter(subKey)) continue;
       wanted.push({ encoded, subKey });
@@ -1812,20 +3569,25 @@ async function loadReviewIndex({ readDoneRecords = false, doneRecordFilter = nul
   }
   // Only fresh locks suppress the claim button. Stale or malformed locks are
   // deliberately treated as claimable; tryLock() atomically takes them over.
-  const lockReads = await Promise.all(
-    lockObjects.map((o) =>
-      readJson(o.Key)
-        .then(({ json }) => {
-          const claimedAt = Date.parse(json.claimed_at);
-          const age = Number.isFinite(claimedAt) ? Date.now() - claimedAt : Infinity;
-          return age <= Number(LOCK_TTL_MS)
-            ? o.Key.slice(`${REVIEW_PREFIX}locks/`.length, -".json".length)
-            : null;
-        })
-        .catch(() => null)
-    )
+  const lockReads = await Promise.all(lockObjects.map(async (o) => {
+    const encoded = o.Key.slice(`${REVIEW_PREFIX}locks/`.length, -".json".length);
+    try {
+      const { json } = await readJson(o.Key);
+      return {
+        encoded,
+        active: reviewLockIsActiveForQueue(json),
+        finalizing: Boolean(json?.finalizing),
+        unresolved: false,
+      };
+    } catch {
+      return { encoded, active: false, finalizing: false, unresolved: true };
+    }
+  }));
+  const lockSet = new Set(lockReads.filter((entry) => entry.active).map((entry) => entry.encoded));
+  const finalizingSet = new Set(
+    lockReads.filter((entry) => entry.active && entry.finalizing).map((entry) => entry.encoded),
   );
-  const lockSet = new Set(lockReads.filter(Boolean));
+  const unresolvedLockSet = new Set(lockReads.filter((entry) => entry.unresolved).map((entry) => entry.encoded));
   const byTaskDir = new Map(); // unit -> { newest, files, oldestAt }
   for (const k of submissions) {
     const unit = reviewUnitForKey(k);
@@ -1839,41 +3601,138 @@ async function loadReviewIndex({ readDoneRecords = false, doneRecordFilter = nul
   return {
     byTaskDir,
     lockSet,
+    finalizingSet,
+    unresolvedLockSet,
     doneSet,
     doneByEncodedKey,
     inboxAge,
+    reopenExclusions: reopenExclusionsFromKeys(reopenKeys),
     counts: { submitted: byTaskDir.size, finished: doneSet.size, locked: lockSet.size },
   };
 }
 
-// A unit is pending iff its NEWEST file is not done. The previous rule (pending
-// unless ANY file was done) kept a returned task out of the queue forever once
-// the author revised it: the old returned file stayed done, so the fresh
-// revision never re-entered review. Backward compatible for single-file units,
-// where newest === the only file. Exported so the rule is unit-testable sans S3.
-export function pendingReviewUnits(units, doneSet) {
+// A completed older revision must not hide a newer returned-task edit or
+// appeal. The newest file alone determines whether the unit is pending.
+export function pendingReviewUnits(units, doneSet, finalizingSet = new Set()) {
   const pendingUnits = [];
   for (const { newest, oldestAt } of units) {
-    if (!doneSet.has(b64url(newest))) pendingUnits.push({ newest, oldestAt });
+    const encoded = b64url(newest);
+    // A finalizing lock is also the durable retry trigger for crash recovery.
+    // Keep it reachable even when recovery already reconstructed the done
+    // record but a later credit/index side effect failed.
+    if (!doneSet.has(encoded) || finalizingSet.has(encoded)) pendingUnits.push({ newest, oldestAt });
   }
   return pendingUnits;
 }
 
-// The queue state: task submissions minus finished ones minus freshly locked ones.
-// Upload retries of the SAME task land in the same directory (the client keeps
-// a stable task id) with different timestamped filenames — so the reviewable
-// unit is the task DIRECTORY, represented by its newest file. Without this,
-// one retried upload would be claimable twice and the second approval would
-// clobber the first reviewer's finished record.
-async function queueState() {
-  const { byTaskDir, lockSet, doneSet, inboxAge, counts } = await loadReviewIndex();
-  const pending = sortPendingReviewUnits(pendingReviewUnits([...byTaskDir.values()], doneSet));
-  return { pending, lockSet, inboxAge, counts };
+export function reviewQueueAvailability(subKeys, lockSet, finalizingSet) {
+  let claimable = 0;
+  let locked = 0;
+  for (const key of subKeys ?? []) {
+    const encoded = b64url(key);
+    const activeLock = lockSet?.has(encoded);
+    const recoverableFinalization = finalizingSet?.has(encoded);
+    if (!activeLock || recoverableFinalization) claimable += 1;
+    else locked += 1;
+  }
+  return { claimable, locked };
 }
 
-// Rejection records are keyed `{task_id}_{sha256(sub_key)[0:16]}.json`, and a
-// sanitized task id may itself contain underscores, so the hash is everything
-// after the LAST one. Exported so the de-duplication is testable.
+export function durableDoneStateIsReadable(doneSet, doneByEncodedKey, subKey) {
+  const encoded = b64url(subKey);
+  return !doneSet?.has(encoded) || Boolean(doneByEncodedKey?.has(encoded));
+}
+
+export function listedLockStateAllowsEdit(lockSet, unresolvedLockSet, subKey) {
+  const encoded = b64url(subKey);
+  return !lockSet?.has(encoded) && !unresolvedLockSet?.has(encoded);
+}
+
+export async function resolveDoneRecordsForReopen({ files, newest, currentDone, listedDoneKeys, readDone }) {
+  const records = [{ key: newest, done: currentDone }];
+  for (const key of files ?? []) {
+    if (key === newest || !listedDoneKeys?.has(b64url(key))) continue;
+    const done = await readDone(key);
+    if (!done) throw new Error(`Listed completion state is unreadable for ${key}`);
+    records.push({ key, done });
+  }
+  return records;
+}
+
+export function newestReviewRevision(keys, unit) {
+  return (keys ?? [])
+    .filter((key) => isReviewSubmissionKey(key) && reviewUnitForKey(key) === unit)
+    .sort()
+    .at(-1) ?? null;
+}
+
+export function claimCandidateIsCurrent(subKey, storedSubKeys, hasDone = false, inboxMarkerExists = true) {
+  if (hasDone || !inboxMarkerExists) return false;
+  return newestReviewRevision(storedSubKeys, reviewUnitForKey(subKey)) === subKey;
+}
+
+async function revalidateClaimCandidate(subKey) {
+  const unit = reviewUnitForKey(subKey);
+  const dir = subKey.slice(0, subKey.lastIndexOf("/") + 1);
+  const storedSubKeys = (await listAll(dir))
+    .filter((key) => isReviewSubmissionKey(key) && reviewUnitForKey(key) === unit);
+  const inboxMarkerExists = await s3.send(new HeadObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: inboxKeyFor(subKey),
+  })).then(() => true).catch(() => false);
+  const doneDefinitelyAbsent = await s3.send(new HeadObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: doneKeyFor(subKey),
+  })).then(() => false).catch((error) => headErrorConfirmsAbsent(error));
+  if (!doneDefinitelyAbsent) return false;
+  if (!claimCandidateIsCurrent(subKey, storedSubKeys, false, inboxMarkerExists)) return false;
+  const revision = await readJson(subKey).then(({ json }) => json).catch(() => null);
+  if (!revision) return false;
+  if (revision.appeal_of_sub_key) {
+    const marker = await readJson(appealKeyFor(subKey)).then(({ json }) => json).catch(() => null);
+    if (!appealMarkerIsVerified(marker, subKey, revision)) return false;
+  }
+  return true;
+}
+
+// The queue state: task submissions minus finished ones minus fresh locks.
+async function queueState() {
+  const state = await loadReviewIndex();
+  // Real FIFO across participants. Sorting full S3 keys put participant names
+  // before timestamps, which could starve later-alphabet users as volume grew.
+  const pending = sortPendingReviewUnits(
+    pendingReviewUnits([...state.byTaskDir.values()], state.doneSet, state.finalizingSet),
+  );
+  return {
+    pending,
+    lockSet: state.lockSet,
+    finalizingSet: state.finalizingSet,
+    inboxAge: state.inboxAge,
+    reopenExclusions: state.reopenExclusions,
+    counts: state.counts,
+  };
+}
+
+// Status tiles tolerate a few seconds of staleness; claims must not (a stale
+// done-set could hand out a just-finished task). Cache the queue listing for
+// the status path only.
+let queueStateCache = { state: null, checkedAt: 0, pending: null };
+async function cachedQueueState() {
+  const now = Date.now();
+  if (queueStateCache.state && now - queueStateCache.checkedAt < 10_000) return queueStateCache.state;
+  if (!queueStateCache.pending) queueStateCache.pending = queueState();
+  try {
+    const state = await queueStateCache.pending;
+    queueStateCache = { state, checkedAt: Date.now(), pending: null };
+    return state;
+  } catch (error) {
+    queueStateCache.pending = null;
+    throw error;
+  }
+}
+
+// Rejection keys end in `_<sha256-prefix>.json`; task ids may themselves
+// contain underscores, so split on the final underscore only.
 export function distinctRejectedTaskIds(rejectedKeys) {
   const ids = new Set();
   for (const key of rejectedKeys) {
@@ -1884,49 +3743,38 @@ export function distinctRejectedTaskIds(rejectedKeys) {
   return ids;
 }
 
-// Final gold is keyed by the sanitized task id, which for Apollo v2 embeds the
-// author: "v2/{pid}/internal/task-..." becomes "v2_{pid}_internal_task-...".
-// Exported because recovering the author from a key without reading the object
-// is the thing that keeps the sign-off count off the hot path.
 export function participantIdFromFinishedKey(key) {
   const name = String(key).slice(String(key).lastIndexOf("/") + 1).replace(/\.json$/, "");
-  const m = /^v2_([a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?)_internal_/.exec(name);
-  return m ? m[1] : null;
+  const match = /^v2_([a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?)_internal_/.exec(name);
+  return match?.[1] ?? null;
 }
 
-// The caller's approved tasks that carry no sign-off receipt yet. Deliberately
-// counts every approval rather than only the ones a reviewer edited: 94% are
-// edited in practice, and the exact rule has to match what /review/my-tasks
-// shows or the badge and the list disagree.
+export function sortFinishedExamples(items, limit = 30) {
+  return (items ?? [])
+    .filter(Boolean)
+    .sort((a, b) => String(b.finished_at || "").localeCompare(String(a.finished_at || "")))
+    .slice(0, Math.max(0, Number(limit) || 0));
+}
+
 async function ownAwaitingSignoff(finishedKeys, reviewerPid) {
   const pid = String(reviewerPid || "").trim().toLowerCase();
   if (!VALID_PID.test(pid)) return 0;
   const own = finishedKeys.filter((key) => participantIdFromFinishedKey(key) === pid);
   if (!own.length) return 0;
-  const signedOff = await listAllObjects(AUTHOR_SIGNOFF_PREFIX);
-  const signedTaskIds = new Set();
-  for (const object of signedOff) {
+  const signoffs = await listAllObjects(AUTHOR_SIGNOFF_PREFIX);
+  let signed = 0;
+  for (const object of signoffs) {
     const encoded = object.Key.slice(AUTHOR_SIGNOFF_PREFIX.length).replace(/\.json$/, "");
     try {
       const subKey = fromB64url(encoded);
-      // Match the same population `own` counts: v2 tasks belonging to this
-      // author. Counting their PC receipts here too would subtract sign-offs
-      // that were never in the total and undercount the badge.
-      if (participantIdFromSubKey(subKey) === pid && subKey.includes("/v2/")) {
-        signedTaskIds.add(subKey);
-      }
+      if (participantIdFromSubKey(subKey) === pid && subKey.includes("/v2/")) signed += 1;
     } catch {
-      /* malformed receipt key — not addressable by any caller */
+      // Ignore malformed receipt keys.
     }
   }
-  // Receipts are per submission and final gold is per task, so compare counts
-  // rather than trying to map one key shape onto the other.
-  return Math.max(0, own.length - signedTaskIds.size);
+  return Math.max(0, own.length - signed);
 }
 
-// Order a task's events for the author. Pure so the ordering and the identity
-// rules are testable without S3: `by` is carried on approvals and returns and
-// on the author's own actions, and is never set for a rejection.
 export function buildAuthorHistory({ revisions, doneRecords, finalGoldHistory, currentAmendment, signoff }) {
   const entries = [];
   for (const revision of revisions ?? []) {
@@ -1946,32 +3794,30 @@ export function buildAuthorHistory({ revisions, doneRecords, finalGoldHistory, c
     entries.push({
       at: done.completed_at ?? "",
       event: outcome,
-      // Only a rejection is anonymous. An approval and a return both leave the
-      // author with someone to talk to — a return especially, since it is a
-      // request to change something and they may need to ask what was meant.
-      // The API already returned returned_by; the history said otherwise.
-      by: outcome === "rejected" ? "" : done.reviewer ?? "",
+      // Reviewer identity is never part of an author-facing history entry.
+      by: "",
       minutes: null,
       note: "",
     });
   }
-  // Superseded versions the author wrote. The reviewer's own approval is
-  // already covered by the done record, so it is skipped here.
   for (const record of finalGoldHistory ?? []) {
     if (record.source !== "author") continue;
-    entries.push({ at: record.at ?? "", event: "amended", by: record.by ?? "", minutes: null, note: "" });
+    entries.push({ at: record.at ?? "", event: "amended", by: "", minutes: null, note: "" });
   }
-  // The amendment currently standing as final gold. It is not in the history
-  // array — that array holds what has been replaced — so without this the
-  // author's most recent edit is the one thing missing from their timeline.
   if (signoff?.signed_off_at && signoff.action === "accepted") {
-    entries.push({ at: signoff.signed_off_at, event: "accepted", by: "", minutes: stageMinutes(signoff.opened_at, signoff.signed_off_at), note: "" });
+    entries.push({
+      at: signoff.signed_off_at,
+      event: "accepted",
+      by: "",
+      minutes: stageMinutes(signoff.opened_at, signoff.signed_off_at),
+      note: "",
+    });
   }
   if (currentAmendment?.amended_at) {
     entries.push({
       at: currentAmendment.amended_at,
       event: "amended",
-      by: currentAmendment.amended_by ?? "",
+      by: "",
       minutes: null,
       note: "",
     });
@@ -1981,41 +3827,34 @@ export function buildAuthorHistory({ revisions, doneRecords, finalGoldHistory, c
     .sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || a.event.localeCompare(b.event));
 }
 
-// Gather the pieces buildAuthorHistory orders: every revision file in the task
-// directory, every done record for the unit, and the amendments recorded inside
-// final gold. Submissions are never deleted, so the directory listing is the
-// durable revision chain even after an edit removed an old inbox marker.
 async function authorTaskHistory(subKey) {
   const unit = reviewUnitForKey(subKey);
-  // Deliberately not loadReviewIndex: this runs every time an author expands a
-  // row, and the index lists inbox/, done/ and locks/ in full. Only this unit's
-  // done records are needed, and their keys decode to the submission they belong
-  // to, so the done/ listing alone answers it. That listing is still whole-bucket
-  // and is the remaining cost on this path.
   const [objects, doneObjects] = await Promise.all([
     listAllObjects(`${unit}/`),
     listAllObjects(`${REVIEW_PREFIX}done/`),
   ]);
   const keys = objects.map((object) => object.Key).filter(isReviewSubmissionKey).sort();
   const revisions = [];
-  for (let i = 0; i < keys.length; i += 25) {
-    const page = await Promise.all(keys.slice(i, i + 25).map((key) =>
+  for (let offset = 0; offset < keys.length; offset += 25) {
+    const page = await Promise.all(keys.slice(offset, offset + 25).map((key) =>
       readJson(key).then(({ json }) => json).catch(() => null)
     ));
     revisions.push(...page.filter(Boolean));
   }
-  revisions.forEach((revision, index_) => { revision.first = index_ === 0; });
+  revisions.forEach((revision, index) => { revision.first = index === 0; });
   const wanted = [];
   for (const object of doneObjects) {
     try {
       const key = fromB64url(object.Key.slice(`${REVIEW_PREFIX}done/`.length));
       if (reviewUnitForKey(key) === unit) wanted.push(key);
     } catch {
-      /* malformed done key */
+      // Ignore malformed done keys.
     }
   }
   const doneRecords = (await Promise.all(wanted.map((key) => readDoneRecord(key)))).filter(Boolean);
-  const approved = doneRecords.find((record) => doneOutcome(record) === "approved");
+  const approved = [...doneRecords]
+    .filter((record) => doneOutcome(record) === "approved")
+    .sort((a, b) => String(b.completed_at || "").localeCompare(String(a.completed_at || "")))[0];
   const finished = approved?.target
     ? await readJson(approved.target).then(({ json }) => json).catch(() => null)
     : null;
@@ -2028,12 +3867,6 @@ async function authorTaskHistory(subKey) {
   });
 }
 
-// The author's acknowledgement of an approved task. Records their LATEST
-// disposition rather than only their first: an author may accept a task and
-// later amend it, and a receipt still saying "accepted" would describe a
-// version that no longer exists. The durable per-event trail is elsewhere —
-// finished-history/ holds every superseded version and the gold doc's history
-// holds who wrote each one — so this object is free to move forward.
 async function writeAuthorSignoff({ subKey, taskId, participantId, action, contentHash, openedAt, at }) {
   const receipt = {
     sub_key: subKey,
@@ -2053,34 +3886,137 @@ async function writeAuthorSignoff({ subKey, taskId, participantId, action, conte
     IfNoneMatch: "*",
   })));
   if (created) return { receipt, created: true };
-  const existing = await readJson(key).then((r) => r).catch(() => null);
+  const existing = await readJson(key).catch(() => null);
   if (!existing) return { receipt: null, created: false };
-  // An accept is not allowed to overwrite anything: re-clicking it must be
-  // idempotent. An amendment supersedes whatever came before it.
   if (action !== "amended") return { receipt: existing.json, created: false };
-  await tryConditionalWrite(() => s3.send(new PutObjectCommand({
+  const replaced = await tryConditionalWrite(() => s3.send(new PutObjectCommand({
     Bucket: S3_BUCKET,
     Key: key,
     Body: JSON.stringify(receipt, null, 2),
     ContentType: "application/json",
     IfMatch: existing.etag,
   })));
-  return { receipt, created: false };
+  return replaced ? { receipt, created: false } : { receipt: existing.json, created: false };
 }
 
-// Submission key -> pid of the reviewer whose rejection that submission is
-// appealing. Its own prefix rather than a field inside each task: routing an
-// appeal must not cost one GET per candidate on every claim. Appeals are rare,
-// so the whole (small) prefix is read and batched like the done records.
+export function buildAuthorApprovedFinal({
+  finished,
+  finalGoldKey,
+  subKey,
+  taskId,
+  participantId,
+  action,
+  approvedAt,
+}) {
+  if (!finished || typeof finished !== "object" || Array.isArray(finished)) return null;
+  return {
+    ...finished,
+    author_approval: {
+      schema_version: "apollo-author-approval-v1",
+      participant_id: String(participantId || "").trim().toLowerCase(),
+      action: action === "amended" ? "amended" : "accepted",
+      approved_at: String(approvedAt || ""),
+      acknowledged_content_hash: String(finished.review_content_hash || ""),
+      source_key: String(subKey || ""),
+      final_gold_key: String(finalGoldKey || ""),
+      task_id: String(taskId || ""),
+    },
+  };
+}
+
+export function authorApprovedFinalMatches(actual, expected) {
+  if (!actual || !expected) return false;
+  const left = actual.author_approval ?? {};
+  const right = expected.author_approval ?? {};
+  return String(actual.review_content_hash || "") === String(expected.review_content_hash || "")
+    && String(actual.task_id || "") === String(expected.task_id || "")
+    && ["participant_id", "action", "approved_at", "acknowledged_content_hash", "source_key", "final_gold_key", "task_id"]
+      .every((field) => String(left[field] || "") === String(right[field] || ""));
+}
+
+async function writeAuthorApprovedFinal(args) {
+  const document = buildAuthorApprovedFinal(args);
+  if (!document || !VALID_PID.test(document.author_approval.participant_id)) {
+    throw new Error("Cannot store author-approved final without a valid author and final document");
+  }
+  const key = authorApprovedKeyFor(args.taskId);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    let current = null;
+    try {
+      current = await readJson(key);
+    } catch (error) {
+      if (!isMissingObjectError(error)) throw error;
+    }
+    if (current && authorApprovedFinalMatches(current.json, document)) {
+      return { key, document: current.json, created: false };
+    }
+    if (current) {
+      const currentAuthor = String(current.json?.author_approval?.participant_id || "");
+      if (currentAuthor && currentAuthor !== document.author_approval.participant_id) {
+        throw new Error("Author-approved final belongs to a different participant");
+      }
+      const replaced = await tryConditionalWrite(() => s3.send(new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: key,
+        Body: JSON.stringify(document, null, 2),
+        ContentType: "application/json",
+        IfMatch: current.etag,
+      })));
+      if (replaced) return { key, document, created: false };
+      continue;
+    }
+    const created = await tryConditionalWrite(() => s3.send(new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: key,
+      Body: JSON.stringify(document, null, 2),
+      ContentType: "application/json",
+      IfNoneMatch: "*",
+    })));
+    if (created) return { key, document, created: true };
+  }
+  const latest = await readJson(key).then(({ json }) => json).catch(() => null);
+  if (authorApprovedFinalMatches(latest, document)) {
+    return { key, document: latest, created: false };
+  }
+  throw new Error("Author-approved final changed concurrently");
+}
+
+async function rejectedByPidForAppeal(subKey, appealOfSubKey, doneByEncodedKey = null) {
+  if (appealOfSubKey) {
+    const priorDone = doneByEncodedKey?.get(b64url(appealOfSubKey)) ?? await readDoneRecord(appealOfSubKey);
+    const fromRejection = doneOutcome(priorDone) === "rejected" && priorDone?.target
+      ? await readJson(priorDone.target)
+        .then(({ json }) => rejectedByPidFromDocument(json))
+        .catch(() => "")
+      : "";
+    if (fromRejection) return fromRejection;
+  }
+  // Legacy rejection records may not carry reviewer_pid. Preserve a verified
+  // existing route in that case, but never let it override authoritative
+  // rejection provenance when that provenance exists.
+  return await readJson(appealKeyFor(subKey))
+    .then(({ json }) => rejectedByPidFromDocument(json))
+    .catch(() => "");
+}
+
 async function appealRejecters() {
   const objects = await listAllObjects(APPEAL_PREFIX);
   const byKey = new Map();
   for (let offset = 0; offset < objects.length; offset += 25) {
     await Promise.all(objects.slice(offset, offset + 25).map(async (object) => {
-      const record = await readJson(object.Key).then(({ json }) => json).catch(() => null);
-      if (record?.sub_key && record.rejected_by_pid) {
-        byKey.set(String(record.sub_key), String(record.rejected_by_pid).toLowerCase());
+      let subKey;
+      try {
+        const encoded = object.Key.slice(APPEAL_PREFIX.length).replace(/\.json$/, "");
+        subKey = fromB64url(encoded);
+      } catch {
+        return;
       }
+      const record = await readJson(object.Key).then(({ json }) => json).catch(() => null);
+      const rejectedByPid = rejectedByPidFromDocument(record);
+      byKey.set(
+        subKey,
+        record?.sub_key === subKey && rejectedByPid ? rejectedByPid : UNVERIFIED_APPEAL_REJECTER,
+      );
     }));
   }
   return byKey;
@@ -2089,9 +4025,15 @@ async function appealRejecters() {
 // Atomically claim: create the lock with If-None-Match (first writer wins).
 // A stale lock (crashed reviewer) is taken over with If-Match on its ETag, so
 // two takeover attempts can't both win.
-async function tryLock(subKey, reviewer, scopedLockKeyFor = lockKeyFor) {
+async function tryLock(subKey, reviewer, scopedLockKeyFor = lockKeyFor, reviewerPid = "") {
   const token = randomUUID();
-  const lockBody = JSON.stringify({ reviewer, token, claimed_at: new Date().toISOString() });
+  const normalizedReviewerPid = String(reviewerPid || "").trim().toLowerCase();
+  const lockBody = JSON.stringify({
+    reviewer,
+    ...(VALID_PID.test(normalizedReviewerPid) ? { reviewer_pid: normalizedReviewerPid } : {}),
+    token,
+    claimed_at: new Date().toISOString(),
+  });
   const lockKey = scopedLockKeyFor(subKey);
   try {
     await s3.send(
@@ -2117,6 +4059,10 @@ async function tryLock(subKey, reviewer, scopedLockKeyFor = lockKeyFor) {
   // Lock exists — is it stale?
   try {
     const { json: existing, etag } = await readJson(lockKey);
+    // A finalization marker is a durable in-flight decision, not an abandoned
+    // claim. Never overwrite it on TTL: the same reviewer may safely resume it
+    // and reconstruct done, while author edits must remain blocked.
+    if (existing?.finalizing) return null;
     // Unparseable claimed_at reads as age=Infinity (stale, reclaimable) —
     // never as an eternally held lock.
     const claimedAt = Date.parse(existing.claimed_at);
@@ -2140,6 +4086,18 @@ async function tryLock(subKey, reviewer, scopedLockKeyFor = lockKeyFor) {
 // Returns the lock's ETag when the caller's token matches, else null. The
 // ETag lets release/submit delete the lock CONDITIONALLY, so a takeover that
 // lands between verify and delete is never clobbered.
+// When the lock was taken — read before it is deleted at finalization so the
+// done record can carry review duration (claimed_at → completed_at).
+async function lockClaimedAt(subKey, scopedLockKeyFor = lockKeyFor) {
+  try {
+    const { json } = await readJson(scopedLockKeyFor(subKey));
+    const at = Date.parse(String(json?.claimed_at || ""));
+    return Number.isFinite(at) ? new Date(at).toISOString() : "";
+  } catch {
+    return "";
+  }
+}
+
 async function verifyLock(subKey, token, scopedLockKeyFor = lockKeyFor) {
   try {
     const { json, etag } = await readJson(scopedLockKeyFor(subKey));
@@ -2149,13 +4107,197 @@ async function verifyLock(subKey, token, scopedLockKeyFor = lockKeyFor) {
   }
 }
 
-// When the reviewer claimed the task. The lock is deleted the moment a review
-// finalizes, so how long a review took is unrecoverable afterwards unless the
-// stamp is copied onto the done record while the lock still exists.
-async function lockClaimedAt(subKey, scopedLockKeyFor = lockKeyFor) {
+export function decisionReviewerPid(suppliedPid, lock, token) {
+  const fromLock = lock?.token === token
+    ? String(lock?.reviewer_pid || "").trim().toLowerCase()
+    : "";
+  if (VALID_PID.test(fromLock)) return fromLock;
+  const supplied = String(suppliedPid || "").trim().toLowerCase();
+  return VALID_PID.test(supplied) ? supplied : "";
+}
+
+async function reviewerPidForDecision(subKey, token, suppliedPid) {
+  const lock = await readJson(lockKeyFor(subKey)).then(({ json }) => json).catch(() => null);
+  return decisionReviewerPid(suppliedPid, lock, token);
+}
+
+export function reviewLockCanRelease(lock, token) {
+  return Boolean(lock && lock.token === token && !lock.finalizing);
+}
+
+export function reviewLockIsActiveForQueue(lock, now = Date.now(), ttlMs = Number(LOCK_TTL_MS)) {
+  if (lock?.finalizing) return true;
+  const claimedAt = Date.parse(String(lock?.claimed_at || ""));
+  return Number.isFinite(claimedAt) && now - claimedAt <= Number(ttlMs);
+}
+
+export function reviewDecisionIsCurrent({ subKey, storedSubKeys, lock, token, now = Date.now(), ttlMs = Number(LOCK_TTL_MS) }) {
+  return newestReviewRevision(storedSubKeys, reviewUnitForKey(subKey)) === subKey
+    && lock?.token === token
+    && reviewLockIsActiveForQueue(lock, now, ttlMs);
+}
+
+export function finalizingOutcomeDescriptor(subKey, source, lock) {
+  const rawTaskId = String(source?.task_id || "");
+  if (!rawTaskId || !lock?.finalizing || !lock?.content_hash) return null;
+  const taskId = rawTaskId.replace(/[^A-Za-z0-9_-]/g, "_");
+  if (lock.outcome === "approved") {
+    return { outcome: "approved", target: `${REVIEW_PREFIX}finished/${taskId}.json`, hashField: "review_content_hash", taskId };
+  }
+  if (lock.outcome === "rejected") {
+    return {
+      outcome: "rejected",
+      target: `${REVIEW_PREFIX}rejected/${taskId}_${createHash("sha256").update(subKey).digest("hex").slice(0, 16)}.json`,
+      hashField: "review_content_hash",
+      taskId,
+    };
+  }
+  if (lock.outcome === "returned") {
+    return { outcome: "returned", target: `${REVIEW_PREFIX}returned/${b64url(subKey)}.json`, hashField: "content_hash", taskId };
+  }
+  return null;
+}
+
+export function finalizingOutcomeMatches(document, descriptor, lock) {
+  return Boolean(document && descriptor && lock?.content_hash
+    && document[descriptor.hashField] === lock.content_hash);
+}
+
+export function finalizingRecoveryPlan(outcome) {
+  if (!["approved", "rejected", "returned"].includes(outcome)) return null;
+  return {
+    creditOutcome: ["approved", "rejected"].includes(outcome) ? outcome : null,
+    dashboardStatus: outcome === "returned" ? "pending" : outcome,
+    deleteFinalizingLock: true,
+    leaveDoneNonclaimable: true,
+  };
+}
+
+export async function applyFinalizingRecoverySideEffects({ recordCredit, repairDashboard, deleteLock }) {
+  if (recordCredit) await recordCredit();
+  await repairDashboard();
+  return await deleteLock();
+}
+
+async function recoverStaleFinalizingReview(subKey) {
+  let lockRecord;
   try {
-    const { json } = await readJson(scopedLockKeyFor(subKey));
-    return cleanText(json?.claimed_at, 60) || null;
+    lockRecord = await readJson(lockKeyFor(subKey));
+  } catch (error) {
+    return isMissingObjectError(error);
+  }
+  if (!lockRecord.json?.finalizing) return true;
+  let source;
+  try {
+    source = (await readJson(subKey)).json;
+  } catch {
+    return false;
+  }
+  const descriptor = finalizingOutcomeDescriptor(subKey, source, lockRecord.json);
+  if (!descriptor) return false;
+  let outcomeDocument;
+  try {
+    outcomeDocument = (await readJson(descriptor.target)).json;
+  } catch (error) {
+    if (!isMissingObjectError(error)) return false;
+    // No durable result exists. Under the unit mutex, conditionally clear the
+    // abandoned finalization so a reviewer can reclaim the current revision.
+    return await deleteLockIfUnchanged(subKey, lockRecord.etag);
+  }
+  if (!finalizingOutcomeMatches(outcomeDocument, descriptor, lockRecord.json)) return false;
+  const completedAt = String(
+    outcomeDocument.finished_at || outcomeDocument.rejected_at || outcomeDocument.returned_at || lockRecord.json.finalizing_at || ""
+  );
+  const reviewer = String(
+    outcomeDocument.reviewed_by || outcomeDocument.rejected_by || outcomeDocument.returned_by || lockRecord.json.reviewer || ""
+  );
+  const reviewerPid = String(
+    outcomeDocument.reviewer_pid || outcomeDocument.rejected_by_pid || outcomeDocument.returned_by_pid || ""
+  );
+  const done = await writeDoneRecord(subKey, {
+    target: descriptor.target,
+    outcome: descriptor.outcome,
+    reviewer,
+    reviewer_pid: reviewerPid,
+    task_id: descriptor.taskId,
+    completed_at: completedAt,
+    claimed_at: cleanText(lockRecord.json.claimed_at, 60),
+    content_hash: lockRecord.json.content_hash,
+  });
+  const reconstructed = done?.target === descriptor.target
+    && doneOutcome(done) === descriptor.outcome
+    && (!done.content_hash || done.content_hash === lockRecord.json.content_hash);
+  if (!reconstructed) return false;
+  const recoveryPlan = finalizingRecoveryPlan(descriptor.outcome);
+  if (!recoveryPlan) return false;
+  const creditedReviewer = String(done.reviewer || reviewer);
+  const finalCompletedAt = String(done.completed_at || completedAt);
+  const rawTaskId = String(source.task_id);
+  const repaired = await applyFinalizingRecoverySideEffects({
+    recordCredit: recoveryPlan.creditOutcome
+      ? () => recordReviewerCredit(
+        creditedReviewer,
+        recoveryPlan.creditOutcome,
+        subKey,
+        descriptor.taskId,
+        finalCompletedAt,
+      )
+      : null,
+    repairDashboard: async () => {
+      if (descriptor.outcome === "approved") {
+        const changed = reviewerChangedTask(outcomeDocument);
+        await setDashboardIndexStatus(rawTaskId, "approved", {
+          expected_source_key: subKey,
+          reviewer: creditedReviewer,
+          reviewed_at: finalCompletedAt,
+          claimed_at: String(done.claimed_at || lockRecord.json.claimed_at || ""),
+          done_target: descriptor.target,
+          changed,
+          changed_in_qc: changed,
+          final_title: outcomeDocument.task?.task_title,
+          final_difficulty: outcomeDocument.task?.difficulty,
+          final_metadata: outcomeDocument.task?.metadata,
+          final_gold_revision: finalGoldRevision(outcomeDocument),
+        });
+      } else if (descriptor.outcome === "rejected") {
+        await setDashboardIndexStatus(rawTaskId, "rejected", {
+          expected_source_key: subKey,
+          reviewer: creditedReviewer,
+          reviewed_at: finalCompletedAt,
+          claimed_at: String(done.claimed_at || lockRecord.json.claimed_at || ""),
+          rejection_reason: cleanText(outcomeDocument.reason, 500),
+          done_target: descriptor.target,
+        });
+      } else {
+        await setDashboardIndexStatus(rawTaskId, "pending", { expected_source_key: subKey });
+      }
+    },
+    // This must remain last: the finalizing lock is the durable retry trigger
+    // when a credit or Dynamo repair fails transiently.
+    deleteLock: () => deleteLockIfUnchanged(subKey, lockRecord.etag),
+  });
+  if (!repaired) return false;
+  adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
+  return true;
+}
+
+async function verifyCurrentReviewDecision(subKey, token) {
+  const unit = reviewUnitForKey(subKey);
+  const dir = subKey.slice(0, subKey.lastIndexOf("/") + 1);
+  const storedSubKeys = (await listAll(dir))
+    .filter((key) => isReviewSubmissionKey(key) && reviewUnitForKey(key) === unit);
+  try {
+    const { json, etag } = await readJson(lockKeyFor(subKey));
+    return reviewDecisionIsCurrent({ subKey, storedSubKeys, lock: json, token }) ? etag : null;
+  } catch {
+    return null;
+  }
+}
+
+async function verifyReleasableLock(subKey, token) {
+  try {
+    const { json, etag } = await readJson(lockKeyFor(subKey));
+    return reviewLockCanRelease(json, token) ? etag : null;
   } catch {
     return null;
   }
@@ -2206,9 +4348,23 @@ async function beginFinalization(subKey, token, reviewer, outcome, contentHash, 
 async function deleteLockIfUnchanged(subKey, etag, scopedLockKeyFor = lockKeyFor) {
   try {
     await s3.send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: scopedLockKeyFor(subKey), IfMatch: etag }));
+    return true;
   } catch {
     // 412: someone took the lock over mid-flight — it's theirs now, leave it.
+    return false;
   }
+}
+
+async function acquireAuthorMutationLock(subKey, actor) {
+  const token = await tryLock(subKey, actor, authorMutationLockKeyFor);
+  if (!token) return null;
+  const etag = await verifyLock(subKey, token, authorMutationLockKeyFor);
+  return etag ? { token, etag } : null;
+}
+
+async function releaseAuthorMutationLock(subKey, lock) {
+  if (!lock?.etag) return false;
+  return await deleteLockIfUnchanged(subKey, lock.etag, authorMutationLockKeyFor);
 }
 
 async function readDoneRecord(subKey, scopedDoneKeyFor = doneKeyFor) {
@@ -2283,7 +4439,15 @@ async function reviewerCreditCount(reviewer) {
   return Number(legacy?.approved || 0) + Number(legacy?.rejected || 0);
 }
 
+let reviewerTotalsCache = { totals: null, checkedAt: 0 };
+
 async function reviewerTotals() {
+  // Display-only rollup behind the queue tiles. Credit receipts are
+  // append-only, so 60s of staleness is invisible; without this every
+  // /review/status call costs 2 LIST requests per reviewer.
+  if (reviewerTotalsCache.totals && Date.now() - reviewerTotalsCache.checkedAt < 60_000) {
+    return reviewerTotalsCache.totals;
+  }
   const [creditRoots, legacyKeys] = await Promise.all([
     listCommonPrefixes(`${REVIEW_PREFIX}credits/`),
     listAll(`${REVIEW_PREFIX}reviewers/`),
@@ -2313,6 +4477,7 @@ async function reviewerTotals() {
   }
   const out = [...byReviewer.values()];
   out.sort((a, b) => (b.approved || 0) + (b.rejected || 0) - (a.approved || 0) - (a.rejected || 0));
+  reviewerTotalsCache = { totals: out, checkedAt: Date.now() };
   return out;
 }
 
@@ -2342,22 +4507,27 @@ async function handleReporting(event) {
   const includes = new Set(String(params.include || "").split(",").map((value) => value.trim()).filter(Boolean));
   const includeContent = includes.has("content") || includes.has("full");
   const includeLlmReviews = includes.has("llm_reviews") || includes.has("full");
+  const includeLlmFlags = includes.has("llm_flags") || includeLlmReviews;
   const taskId = cleanText(params.task_id, 160);
   const status = cleanText(params.status, 20);
-  const defaultLimit = includeContent ? 1 : includeLlmReviews ? 10 : 1_000;
-  const maxLimit = includeContent ? 1 : includeLlmReviews ? 25 : 1_000;
+  const defaultLimit = includeLlmReviews ? 10 : includeLlmFlags ? 200 : includeContent ? 100 : 5_000;
+  const maxLimit = includeLlmReviews ? 25 : includeLlmFlags ? 200 : includeContent ? 150 : 5_000;
   const limit = Math.min(maxLimit, Math.max(1, Number(params.limit) || defaultLimit));
   const offset = Math.max(0, Number(params.offset) || 0);
+  const [dashboard, aliases, skipCounts] = await Promise.all([adminDashboard(), participantAliases(), reviewSkipCounts()]);
   const options = {
     includeContent,
     includeLlmReviews,
+    includeLlmFlags,
     taskId,
     status,
     limit,
     offset,
+    participantAliases: aliases,
+    skipCounts,
   };
-  const dashboard = await adminDashboard();
   if (includeLlmReviews) await hydrateReportingLlmReviews(dashboard, options);
+  if (includeLlmFlags) await hydrateReportingLlmFlags(dashboard, options);
   return respond(200, buildReportingReport(dashboard, new Date().toISOString(), options), { "Cache-Control": "no-store" });
 }
 
@@ -2402,11 +4572,18 @@ async function trajectoryQueueState() {
     listAllObjects(TRAJECTORY_LOCKS_PREFIX),
   ]);
   const markerAge = new Map();
+  const creatorByManifest = new Map();
   for (const marker of markers) {
     try {
-      const manifestKey = fromB64url(marker.Key.slice(TRAJECTORY_INBOX_PREFIX.length));
+      const suffix = marker.Key.slice(TRAJECTORY_INBOX_PREFIX.length);
+      const parts = suffix.split("/");
+      const encodedManifestKey = parts.length === 2 ? parts[1] : parts[0];
+      const markerCreator = parts.length === 2 && VALID_PID.test(parts[0]) ? parts[0] : null;
+      const manifestKey = fromB64url(encodedManifestKey);
       if (!manifestKey.startsWith(TRAJECTORY_RUNS_PREFIX) || !taskIdFromTrajectoryManifestKey(manifestKey)) continue;
       markerAge.set(manifestKey, marker.LastModified?.getTime() ?? 0);
+      const inferredCreator = markerCreator || participantIdFromTrajectoryManifestKey(manifestKey);
+      if (inferredCreator) creatorByManifest.set(manifestKey, inferredCreator);
     } catch {
       /* malformed marker */
     }
@@ -2427,10 +4604,12 @@ async function trajectoryQueueState() {
     pending,
     lockSet,
     markerAge,
+    creatorByManifest,
     counts: {
       submitted: manifests.length,
       finished: manifests.filter((key) => doneSet.has(b64url(key))).length,
       locked: pending.filter((key) => lockSet.has(b64url(key))).length,
+      unassigned: pending.filter((key) => !creatorByManifest.has(key)).length,
     },
   };
 }
@@ -2457,23 +4636,26 @@ async function handleTrajectoryReview(path, body) {
 
   if (path === "/trajectory/status") {
     const state = await trajectoryQueueState();
-    const eligible = excludeOwnTrajectoryRuns(state.pending, reviewerPid);
+    const eligible = trajectoryRunsForCreator(state.pending, reviewerPid, state.creatorByManifest);
     return respond(200, {
       ...state.counts,
+      locked: eligible.filter((key) => state.lockSet.has(b64url(key))).length,
       pending: eligible.length,
       claimable: eligible.filter((key) => !state.lockSet.has(b64url(key))).length,
-      own_pending: state.pending.length - eligible.length,
+      assigned_to_you: eligible.length,
+      assigned_to_others: Math.max(0, state.pending.length - eligible.length - state.counts.unassigned),
     });
   }
 
   if (path === "/trajectory/claim") {
     if (!reviewer) return respond(400, { error: "reviewer required" });
+    if (!VALID_PID.test(reviewerPid)) return respond(400, { error: "reviewer_pid required for creator-assigned trajectory grading" });
     const state = await trajectoryQueueState();
-    const eligible = excludeOwnTrajectoryRuns(state.pending, reviewerPid);
+    const eligible = trajectoryRunsForCreator(state.pending, reviewerPid, state.creatorByManifest);
     const unlocked = eligible.filter((key) => !state.lockSet.has(b64url(key)));
     const locked = eligible.filter((key) => state.lockSet.has(b64url(key)));
     let attempts = 0;
-    for (const manifestKey of [...unlocked, ...locked]) {
+    for (const manifestKey of orderClaimCandidates(unlocked, locked, body.skip_keys)) {
       if (attempts++ >= 25) break;
       try {
         await s3.send(new HeadObjectCommand({ Bucket: S3_BUCKET, Key: manifestKey }));
@@ -2483,17 +4665,28 @@ async function handleTrajectoryReview(path, body) {
       const token = await tryLock(manifestKey, reviewer, trajectoryLockKeyFor);
       if (!token) continue;
       const run = await signedTrajectoryManifest(manifestKey).catch(() => null);
-      if (!run) {
+      if (!run || run.creator_pid !== reviewerPid) {
         const etag = await verifyLock(manifestKey, token, trajectoryLockKeyFor);
         if (etag) await deleteLockIfUnchanged(manifestKey, etag, trajectoryLockKeyFor);
         continue;
       }
+      // Best-effort: the grade must still work if lineage lookup fails.
+      const taskLineage = await trajectoryTaskLineage(run.task_id).catch((error) => {
+        console.error("Trajectory task lineage lookup failed", error);
+        return null;
+      });
+      const priorGrades = await priorTrajectoryGrades(run, taskLineage).catch((error) => {
+        console.error("Prior trajectory grade lookup failed", error);
+        return [];
+      });
       return respond(200, {
         manifest_key: manifestKey,
         token,
         lock_ttl_ms: Number(LOCK_TTL_MS),
         remaining: Math.max(0, eligible.length - 1),
         run,
+        task_lineage: taskLineage,
+        prior_grades: priorGrades,
       });
     }
     return respond(200, { manifest_key: null, remaining: 0 });
@@ -2520,6 +4713,9 @@ async function handleTrajectoryReview(path, body) {
     if (!cleanManifest || taskIdFromTrajectoryManifestKey(manifestKey) !== cleanManifest.task_id) {
       return respond(400, { error: "Trajectory manifest is invalid" });
     }
+    if (!VALID_PID.test(reviewerPid) || cleanManifest.creator_pid !== reviewerPid) {
+      return respond(403, { error: "Only the task creator can grade this trajectory" });
+    }
     let safeJudgment;
     try {
       safeJudgment = sanitizeHumanTrajectoryJudgment(body.judgment, cleanManifest);
@@ -2533,7 +4729,17 @@ async function handleTrajectoryReview(path, body) {
       if (existingDone.target !== target || (existingDone.content_hash && existingDone.content_hash !== contentHash)) {
         return respond(409, { error: "This trajectory was already judged by another reviewer" });
       }
-      return respond(200, { ok: true, judgment_key: target, idempotent: true });
+      const completedAt = String(existingDone.completed_at || new Date().toISOString());
+      const editReview = safeJudgment.trajectory.overall_outcome === "EDIT_NEEDED"
+        ? await enqueueTrajectoryEditReview(manifestKey, cleanManifest, safeJudgment, target, completedAt)
+        : null;
+      return respond(200, {
+        ok: true,
+        judgment_key: target,
+        overall_outcome: safeJudgment.trajectory.overall_outcome,
+        edit_review_task_id: editReview?.task_id ?? existingDone.edit_review_task_id ?? null,
+        idempotent: true,
+      });
     }
     let etag = await verifyLock(manifestKey, token, trajectoryLockKeyFor);
     if (!etag) return respond(409, { error: "Lock not held by you (it may have expired)" });
@@ -2560,12 +4766,17 @@ async function handleTrajectoryReview(path, body) {
         return respond(409, { error: "A different judgment was already submitted" });
       }
     }
+    const editReview = safeJudgment.trajectory.overall_outcome === "EDIT_NEEDED"
+      ? await enqueueTrajectoryEditReview(manifestKey, cleanManifest, safeJudgment, target, reviewedAt)
+      : null;
     const done = await writeDoneRecord(manifestKey, {
       target,
       outcome: "judged",
       reviewer,
       task_id: cleanManifest.task_id,
       run_id: cleanManifest.run_id,
+      overall_outcome: safeJudgment.trajectory.overall_outcome,
+      edit_review_task_id: editReview?.task_id ?? null,
       completed_at: reviewedAt,
       content_hash: contentHash,
     }, trajectoryDoneKeyFor);
@@ -2573,10 +4784,172 @@ async function handleTrajectoryReview(path, body) {
       return respond(409, { error: "This trajectory was already judged by another reviewer" });
     }
     await deleteLockIfUnchanged(manifestKey, etag, trajectoryLockKeyFor);
-    return respond(200, { ok: true, judgment_key: target });
+    return respond(200, {
+      ok: true,
+      judgment_key: target,
+      overall_outcome: safeJudgment.trajectory.overall_outcome,
+      edit_review_task_id: editReview?.task_id ?? null,
+    });
   }
 
   return respond(404, { error: `Unknown trajectory route ${path}` });
+}
+
+
+// ---- OSWorld-style task view -------------------------------------------
+// Server-side twin of scripts/trajectory_review/export_osworld.py so the
+// reporting API can hand teammates the original task in stock OSWorld shape
+// without a checkout. Keep the two in lockstep (test_export_osworld.py pins
+// the Python side; lambda_presign.test.js pins this side).
+export const OSWORLD_EXPORT_SCHEMA_VERSION = "apollo-osworld-export-v1";
+const APOLLO_OSWORLD_NAMESPACE = "7aa8f833-8ea6-4a38-a64f-2d56a9db9de5";
+
+export function uuidV5(namespaceUuid, name) {
+  const ns = Buffer.from(String(namespaceUuid).replace(/-/g, ""), "hex");
+  const hash = createHash("sha1").update(Buffer.concat([ns, Buffer.from(String(name), "utf8")])).digest();
+  const bytes = Buffer.from(hash.subarray(0, 16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+export function osworldTaskIdFor(taskId) {
+  return uuidV5(APOLLO_OSWORLD_NAMESPACE, String(taskId));
+}
+
+// True only for a complete, affirmative human grade: reviewed, YES overall,
+// and every manifest rubric human-marked SUCCESS (mirrors accepted_human_pass).
+export function acceptedHumanPass(item) {
+  if (item?.status !== "reviewed" || item?.human_final_grade !== "YES") return false;
+  const manifest = item.manifest;
+  const judgment = item.human_judgment;
+  if (!manifest || typeof manifest !== "object" || !judgment || typeof judgment !== "object") return false;
+  const manifestIds = new Set((manifest.rubrics || []).map((rubric) => cleanText(rubric?.rubric_id, 100)).filter(Boolean));
+  const verdicts = new Map((judgment.rubrics || [])
+    .map((rubric) => [cleanText(rubric?.rubric_id, 100), cleanText(rubric?.human_verdict, 30).toUpperCase()])
+    .filter(([id]) => id));
+  if (!manifestIds.size || verdicts.size !== manifestIds.size) return false;
+  for (const id of manifestIds) if (verdicts.get(id) !== "SUCCESS") return false;
+  return true;
+}
+
+function inertOsworldEvaluator() {
+  return {
+    func: "is_expected_url_pattern_match",
+    result: { type: "active_url_from_accessTree" },
+    expected: { type: "rule", rules: { expected: ["^apollo-external-human-qc-only$"] } },
+  };
+}
+
+// Stock OSWorld task config for one trajectory row. Works for any grade
+// status; `apollo.human_pass` says whether this run is an accepted pass.
+export function osworldTaskForItem(item, snapshot = "chrome") {
+  const manifest = item?.manifest;
+  if (!manifest || typeof manifest !== "object") return null;
+  const taskId = cleanText(manifest.task_id || item.task_id, 300);
+  const instruction = cleanText(manifest.task_prompt, 200_000);
+  if (!taskId || !instruction) return null;
+  const rubrics = [];
+  for (const rubric of manifest.rubrics || []) {
+    const rubricId = cleanText(rubric?.rubric_id, 100);
+    const requirement = cleanText(rubric?.requirement, 30_000);
+    if (!rubricId || !requirement) return null;
+    rubrics.push({ rubric_id: rubricId, requirement, verification: cleanText(rubric?.verification, 20_000) });
+  }
+  const pass = acceptedHumanPass(item);
+  const runId = cleanText(manifest.run_id || item.run_id, 120);
+  const manifestKey = cleanText(item.manifest_key, 2_000);
+  return {
+    id: osworldTaskIdFor(taskId),
+    snapshot,
+    instruction,
+    source: "Apollo",
+    config: [
+      { type: "launch", parameters: { command: ["google-chrome", "--remote-debugging-port=1337"] } },
+      { type: "launch", parameters: { command: ["socat", "tcp-listen:9222,fork", "tcp:localhost:1337"] } },
+      { type: "activate_window", parameters: { window_name: "Google Chrome" } },
+    ],
+    trajectory: "trajectories/",
+    related_apps: ["chrome"],
+    evaluator: inertOsworldEvaluator(),
+    proxy: false,
+    fixed_ip: false,
+    possibility_of_env_change: "low",
+    apollo: {
+      schema_version: OSWORLD_EXPORT_SCHEMA_VERSION,
+      task_id: taskId,
+      creator_pid: cleanText(manifest.creator_pid, 80) || null,
+      run_id: runId,
+      manifest_key: manifestKey,
+      status: item.status ?? null,
+      human_final_grade: item.human_final_grade ?? null,
+      human_pass: pass,
+      // Same field names the offline exporter writes, populated only for
+      // accepted passes so downstream consumers can treat both outputs alike.
+      accepted_run_id: pass ? runId : null,
+      accepted_manifest_key: pass ? manifestKey : null,
+      human_reviewed_at: cleanText(item.reviewed_at, 80) || null,
+      rubrics,
+      evaluation: "Run scripts/trajectory_review/run.py and complete Apollo human Grade; ignore OSWorld result.txt.",
+    },
+  };
+}
+
+// Newest run per task, deterministically (reviewed_at, then run_id) —
+// mirrors select_latest_passes but over whichever rows the caller filtered.
+export function selectLatestRunPerTask(items) {
+  const selected = new Map();
+  for (const item of items) {
+    const taskId = cleanText(item?.manifest?.task_id || item?.task_id, 300);
+    if (!taskId) continue;
+    const current = selected.get(taskId);
+    const candidateOrder = `${cleanText(item.reviewed_at, 80)} ${cleanText(item.run_id, 120)}`;
+    const currentOrder = current ? `${cleanText(current.reviewed_at, 80)} ${cleanText(current.run_id, 120)}` : "";
+    if (!current || candidateOrder > currentOrder) selected.set(taskId, item);
+  }
+  return [...selected.keys()].sort().map((taskId) => selected.get(taskId));
+}
+
+// format=osworld: the same bundle export_osworld.py writes to disk
+// (tasks.json + test_apollo.json), served directly. Default = accepted human
+// passes only (drop-in parity with the exporter); grade=any = every task in
+// the queue regardless of grade.
+export function buildOsworldExportReport(items, generatedAt = new Date().toISOString(), options = {}) {
+  const requestedTaskId = cleanText(options.taskId, 300);
+  const requestedStatus = ["pending", "in_review", "reviewed"].includes(options.status) ? options.status : "";
+  const anyGrade = options.grade === "any";
+  const snapshot = /^[a-z0-9_-]{1,40}$/i.test(String(options.snapshot || "")) ? String(options.snapshot) : "chrome";
+  const filtered = items.filter((item) =>
+    (!requestedTaskId || item.task_id === requestedTaskId)
+    && (!requestedStatus || item.status === requestedStatus)
+    && (anyGrade || acceptedHumanPass(item))
+  );
+  const selected = selectLatestRunPerTask(filtered);
+  const tasks = selected.map((item) => osworldTaskForItem(item, snapshot)).filter(Boolean);
+  const offset = Math.max(0, Number(options.offset) || 0);
+  const limit = Math.min(200, Math.max(1, Number(options.limit) || 200));
+  const page = tasks.slice(offset, offset + limit);
+  return {
+    schema_version: OSWORLD_EXPORT_SCHEMA_VERSION,
+    generated_at: generatedAt,
+    snapshot,
+    selection: anyGrade ? "latest_run_per_task_any_grade" : "latest_accepted_human_pass_per_task",
+    exported: tasks.length,
+    task_ids: tasks.map((task) => task.apollo.task_id),
+    osworld_ids: tasks.map((task) => task.id),
+    // Same two files export_osworld.py writes: tasks.json + test_apollo.json.
+    tasks: page,
+    test_apollo: { [snapshot]: tasks.map((task) => task.id) },
+    native_result_txt_is_authoritative: false,
+    page: {
+      offset,
+      limit,
+      returned: page.length,
+      filtered_total: tasks.length,
+      next_offset: offset + page.length < tasks.length ? offset + page.length : null,
+    },
+  };
 }
 
 export function buildTrajectoryReportingReport(items, generatedAt = new Date().toISOString(), options = {}) {
@@ -2609,6 +4982,7 @@ export function buildTrajectoryReportingReport(items, generatedAt = new Date().t
       human_outcome: item.human_outcome ?? null,
       human_final_grade: item.human_final_grade ?? null,
       ...(options.includeContent ? { manifest: item.manifest, human_judgment: item.human_judgment } : {}),
+      ...(options.includeOsworld ? { osworld_task: osworldTaskForItem(item, options.snapshot || "chrome") } : {}),
     })),
     page: {
       offset,
@@ -2627,6 +5001,11 @@ async function handleTrajectoryReporting(event) {
   const params = event.queryStringParameters ?? {};
   const includes = new Set(String(params.include || "").split(",").map((value) => value.trim()).filter(Boolean));
   const includeContent = includes.has("content") || includes.has("full");
+  const includeOsworld = includes.has("osworld");
+  const formatOsworld = cleanText(params.format, 30).toLowerCase() === "osworld";
+  // The OSWorld view is built from manifest + judgment even when the caller
+  // did not ask for the raw content, so hydrate whenever either is needed.
+  const loadContent = includeContent || includeOsworld || formatOsworld;
   const state = await trajectoryQueueState();
   const items = [];
   for (let offset = 0; offset < state.manifests.length; offset += 25) {
@@ -2656,24 +5035,28 @@ async function handleTrajectoryReporting(event) {
         // grade beside it so reporting clients can migrate independently.
         human_outcome: judgment?.trajectory?.task_satisfied ?? judgment?.trajectory?.outcome ?? null,
         human_final_grade: trajectoryOverallOutcome(judgment?.trajectory) || null,
-        manifest: includeContent ? manifest : null,
-        human_judgment: includeContent ? judgment : null,
+        manifest: loadContent ? manifest : null,
+        human_judgment: loadContent ? judgment : null,
       };
     }));
     items.push(...batch.filter(Boolean));
   }
-  return respond(200, buildTrajectoryReportingReport(items, new Date().toISOString(), {
+  const reportOptions = {
     includeContent,
+    includeOsworld,
+    snapshot: /^[a-z0-9_-]{1,40}$/i.test(String(params.snapshot || "")) ? String(params.snapshot) : "chrome",
+    grade: cleanText(params.grade, 10).toLowerCase(),
     taskId: cleanText(params.task_id, 300),
     status: cleanText(params.status, 30),
     limit: params.limit,
     offset: params.offset,
-  }), { "Cache-Control": "no-store" });
+  };
+  const report = formatOsworld
+    ? buildOsworldExportReport(items, new Date().toISOString(), reportOptions)
+    : buildTrajectoryReportingReport(items, new Date().toISOString(), reportOptions);
+  return respond(200, report, { "Cache-Control": "no-store" });
 }
 
-// Done records carry an explicit outcome, but legacy markers predate that
-// field — infer from the target so historical approvals still surface to the
-// author instead of vanishing into awaiting_codex.
 function doneOutcome(done) {
   if (!done) return null;
   if (done.outcome) return done.outcome;
@@ -2684,11 +5067,16 @@ function doneOutcome(done) {
   return null;
 }
 
-// The author's current task content in the shape the my-tasks screen renders:
-// cleaned snapshot field names (title/request/criteria), with the distribution
-// metadata echoed back so the edit form can pre-fill it. Distinct from
-// cleanTaskSnapshot, which renames must_visit_or_reach to key_urls and drops
-// metadata — that shape is for reporting fingerprints, not the author UI.
+function cleanTaskMetadata(metadata) {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return null;
+  const out = {};
+  if (metadata.region != null) out.region = cleanText(metadata.region, 8);
+  if (Array.isArray(metadata.subjects)) {
+    out.subjects = metadata.subjects.slice(0, 10).map((subject) => cleanText(subject, 120)).filter(Boolean);
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 function authoredTaskContentForResponse(task) {
   if (!task || typeof task !== "object") return null;
   const out = {
@@ -2705,17 +5093,12 @@ function authoredTaskContentForResponse(task) {
       : [],
     notes: task.notes == null ? null : String(task.notes),
   };
-  if (task.metadata != null) {
-    const metadata = cleanTaskMetadata(task.metadata);
-    if (metadata) out.metadata = metadata;
-  }
+  const metadata = cleanTaskMetadata(task.metadata);
+  if (metadata) out.metadata = metadata;
   return out;
 }
 
-// The author's own task content, rebuilt field by field from an untrusted
-// payload. Shared by /review/author-edit and /review/author-amend so a revision
-// and an amendment are held to exactly the same shape and caps.
-function sanitizeAuthoredTask(edited) {
+export function sanitizeAuthoredTask(edited, originalTask = null) {
   const safeTask = {
     task_title: String(edited.task_title || "").slice(0, 300),
     agent_request: String(edited.agent_request ?? ""),
@@ -2728,26 +5111,34 @@ function sanitizeAuthoredTask(edited) {
       ? edited.required_outputs.slice(0, 30).map((item) => cleanText(item, 2_000))
       : [],
     notes: edited.notes == null ? null : String(edited.notes),
-    // Same per-step cap /review/submit applies. Not pushed into cleanSteps:
-    // that also builds the reporting snapshots, which deliberately carry the
-    // complete authored text and have a test pinning that.
-    steps: cleanSteps(edited.steps).map((step) => ({ ...step, description: step.description.slice(0, 20_000) })),
+    steps: cleanSteps(edited.steps).map((step) => ({
+      ...step,
+      description: step.description.slice(0, 20_000),
+    })),
   };
-  if (edited.metadata != null) {
-    const metadata = cleanTaskMetadata(edited.metadata);
-    if (metadata) safeTask.metadata = metadata;
+  const metadata = cleanTaskMetadata(edited.metadata);
+  if (metadata) safeTask.metadata = metadata;
+  // These fields are not editable in the author revision form. Merge them
+  // from the stored task instead of trusting an omitted/client-supplied value,
+  // otherwise a round-trip through author-edit silently drops task scope and
+  // source-derived timing context.
+  if (originalTask && typeof originalTask === "object") {
+    safeTask.site_scope = Array.isArray(originalTask.site_scope)
+      ? originalTask.site_scope.slice(0, 30).map((item) => cleanText(item, 500))
+      : [];
+    if (Object.hasOwn(originalTask, "task_summary")) {
+      safeTask.task_summary = originalTask.task_summary == null
+        ? null
+        : cleanText(originalTask.task_summary, 20_000);
+    }
+    if (Object.hasOwn(originalTask, "time_span")) {
+      safeTask.time_span = {
+        start: originalTask.time_span?.start == null ? null : cleanText(originalTask.time_span.start, 120),
+        end: originalTask.time_span?.end == null ? null : cleanText(originalTask.time_span.end, 120),
+      };
+    }
   }
   return safeTask;
-}
-
-function cleanTaskMetadata(metadata) {
-  if (!metadata || typeof metadata !== "object") return null;
-  const out = {};
-  if (metadata.region != null) out.region = cleanText(metadata.region, 8);
-  if (Array.isArray(metadata.subjects)) {
-    out.subjects = metadata.subjects.slice(0, 10).map((s) => cleanText(s, 120)).filter(Boolean);
-  }
-  return Object.keys(out).length ? out : null;
 }
 
 function snapshotForHumanReview(snapshot) {
@@ -2759,26 +5150,18 @@ function snapshotForHumanReview(snapshot) {
   };
 }
 
-// Did the REVIEWER alter the author's submission? Read only from the frozen
-// `review` block, never by re-diffing the submission against current final
-// gold: once an author amends, that diff describes their own edit. Getting this
-// from the diff made an untouched approval read as "reviewed by Dana — reach
-// out if you disagree with an edit" after the author edited it themselves, and
-// inflated changed_in_qc, which is the statistic the sign-off queue was sized
-// against in the first place.
+// Read reviewer edits only from the frozen review block. Re-diffing current
+// gold after an author amendment would attribute the author's change to QC.
 export function reviewerChangedTask(finished) {
   const review = finished?.review;
   if (!review || typeof review !== "object") return false;
   return Boolean(
-    review.title_edited ||
-      review.request_edited ||
-      (Array.isArray(review.rubrics) && review.rubrics.some((rubric) => rubric?.changed))
+    review.title_edited
+      || review.request_edited
+      || (Array.isArray(review.rubrics) && review.rubrics.some((rubric) => rubric?.changed))
   );
 }
 
-// The revision number a finished doc is on. 1 for the reviewer's own approval,
-// which carries no counter. Mirrors pcAdminRevision so a doc written before the
-// counter existed still resolves from its history length.
 export function finalGoldRevision(finished) {
   if (!finished) return 0;
   const explicit = Number(finished.revision_count);
@@ -2787,29 +5170,14 @@ export function finalGoldRevision(finished) {
     : (Array.isArray(finished.history) ? finished.history.length : 0) + 1;
 }
 
-// An author's amendment of their own approved task becomes the new final gold.
-// Shaped like buildPCAdminEdit: the current final is pushed onto a bounded
-// history before being replaced, and revision_count only ever goes up.
-//
-// The reviewer's `review` block and `reviewed_by` carry through unchanged. That
-// block is the record of what the reviewer did to the author's submission;
-// rewriting it to describe the author's own edit would destroy the only audit
-// of the human QC pass. What the author changed stays legible from the history
-// entry this adds.
-//
-// History is bounded tighter than buildPCAdminEdit's 19: entries hold whole
-// task bodies, against the 512KB cap /review/submit enforces.
+export function unchangedAmendSignoffAction(finished, participantId) {
+  return finalGoldRevision(finished) > 1
+    && String(finished?.amended_by || "") === String(participantId || "")
+    ? "amended"
+    : "accepted";
+}
+
 const FINAL_GOLD_HISTORY_LIMIT = 10;
-// Final gold has one shape, written by /review/submit. An author amendment has
-// to produce that same shape, in that same key order, or two things break: the
-// fields their form cannot edit are silently dropped from the gold record, and
-// reviewContentHash — which hashes JSON.stringify output, so key order counts —
-// never matches, meaning a save that changed nothing still burns a revision.
-//
-// site_scope is the field that made this concrete: the app derives it from the
-// author's journeys and quality scoring reads it, but no author-facing form has
-// ever exposed it. Carried over from the version being replaced, along with
-// metadata, unless the author supplied a value.
 export function finalGoldTaskFromAuthorEdit(existingTask, safeTask) {
   const metadata = safeTask.metadata ?? existingTask?.metadata ?? null;
   return {
@@ -2826,10 +5194,6 @@ export function finalGoldTaskFromAuthorEdit(existingTask, safeTask) {
   };
 }
 
-// `contentHash` must be derived the same way /review/submit derives it, so the
-// field keeps one meaning. The POST_QC gate does not read it — that gate keys on
-// reportingTaskContentHash over the snapshots, which changes on its own when the
-// task body does, so an amendment re-audits either way.
 export function buildAmendedFinalGold({ existing, amendedTask, contentHash, authorPid, amendedAt }) {
   const history = Array.isArray(existing?.history)
     ? existing.history.slice(-(FINAL_GOLD_HISTORY_LIMIT - 1))
@@ -2838,8 +5202,6 @@ export function buildAmendedFinalGold({ existing, amendedTask, contentHash, auth
     history.push({
       task: existing.task,
       review_content_hash: existing.review_content_hash ?? null,
-      // Who wrote the version being superseded: the reviewer for the first
-      // amendment, the author for every one after that.
       source: existing.amended_by ? "author" : "reviewer",
       by: existing.amended_by || existing.reviewed_by || "",
       at: existing.amended_at || existing.finished_at || "",
@@ -2856,11 +5218,6 @@ export function buildAmendedFinalGold({ existing, amendedTask, contentHash, auth
   };
 }
 
-// The diff the author sees for an approved task: their original versus the
-// reviewer's final gold version, plus the rubric edits. Approvals now carry the
-// reviewer's name — the author should be able to go and talk to whoever edited
-// their work. Rejections and returns stay anonymous; that is handled at the
-// call site, which never passes a rejecter through.
 export function buildHumanReviewForAuthor(finished, source) {
   if (!finished || typeof finished !== "object") return null;
   const original = cleanTaskSnapshot(source?.task ?? source);
@@ -2873,11 +5230,6 @@ export function buildHumanReviewForAuthor(finished, source) {
     rubrics: rubrics.map((rubric) => ({
       rubric_id: rubric.rubric_id,
       kind: rubric.kind,
-      // Which ORIGINAL step this rubric came from, or null when the reviewer
-      // added it. The author screen needs this to align the redline: a step the
-      // reviewer DELETED leaves no rubric at all, so the only way to show the
-      // author it was dropped is to find the original indices nothing claims.
-      source_index: rubric.source_index,
       title: rubric.title,
       original: rubric.original,
       final: rubric.final,
@@ -2887,11 +5239,6 @@ export function buildHumanReviewForAuthor(finished, source) {
     title_edited: Boolean(finished?.review?.title_edited),
     request_edited: Boolean(finished?.review?.request_edited),
     evergreen_verified: Boolean(finished?.review?.evergreen_verified),
-    // The display name only. reviewer_pid is a slugified email address, and the
-    // author needs a person to talk to, not another user's contact details.
-    reviewed_by: cleanText(finished?.reviewed_by, 160) || "",
-    // Whether the REVIEWER altered anything, for the "nothing changed" copy.
-    // Every approval is queued for sign-off regardless; this only labels it.
     changed: reviewerChangedTask(finished),
     revision_count: finalGoldRevision(finished),
     amended_by: cleanText(finished?.amended_by, 80) || "",
@@ -2899,14 +5246,7 @@ export function buildHumanReviewForAuthor(finished, source) {
   };
 }
 
-// The reviewer's rubric-level notes on a rejection, for the author. Same shape
-// the approved diff uses, so the screen renders it with the same component.
-// Deliberately carries no identity: an author gets the substance of why the
-// task was rejected, not who rejected it.
 function buildRejectionFeedbackForAuthor(rejected, source) {
-  // Require rubrics the reviewer actually wrote. cleanRubrics falls back to the
-  // task's own steps when a review carries none, which would present the
-  // author's own text back to them as reviewer feedback.
   if (!Array.isArray(rejected?.review?.rubrics) || !rejected.review.rubrics.length) return null;
   const original = cleanTaskSnapshot(source?.task ?? source);
   if (!original) return null;
@@ -2916,7 +5256,6 @@ function buildRejectionFeedbackForAuthor(rejected, source) {
     rubrics: rubrics.map((rubric) => ({
       rubric_id: rubric.rubric_id,
       kind: rubric.kind,
-      source_index: rubric.source_index,
       title: rubric.title,
       original: rubric.original,
       final: rubric.final,
@@ -2936,6 +5275,21 @@ async function handleReview(path, body) {
   // are invisible to /review/status counts and unclaimable via /review/claim.
   const reviewerPid = String(body.reviewer_pid || "").trim().toLowerCase();
 
+  if (path === "/review/register") {
+    const taskId = cleanText(body.task_id, 160);
+    const participantId = cleanText(body.participant_id, 80);
+    try {
+      const registered = await registerDashboardSubmission(taskId, participantId);
+      if (registered.reason === "invalid_task") return respond(400, { error: "Invalid task registration" });
+      if (registered.reason === "upload_not_found") return respond(409, { error: "Uploaded task is not visible yet" });
+      if (registered.reason === "task_mismatch") return respond(409, { error: "Uploaded task identity does not match" });
+      return respond(200, { ok: true, ...registered });
+    } catch (error) {
+      console.error("Dashboard registration failed", error);
+      return respond(503, { error: "Task uploaded, but dashboard indexing is temporarily unavailable" });
+    }
+  }
+
   if (path === "/review/contributions") {
     const participantId = String(body.participantId || "");
     const validParticipant = /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$/.test(participantId);
@@ -2948,47 +5302,35 @@ async function handleReview(path, body) {
   }
 
   if (path === "/review/status") {
-    const [{ pending, lockSet, counts }, reviewers, rejectedKeys, finishedKeys, rejecters] =
-      await Promise.all([
-        queueState(),
-        reviewerTotals(),
-        listAll(`${REVIEW_PREFIX}rejected/`),
-        listAll(`${REVIEW_PREFIX}finished/`),
-        appealRejecters(),
-      ]);
-    // Exclude the caller's own submissions and appeals they rejected from
-    // pending/claimable so the queue tiles never advertise tasks the reviewer
-    // isn't allowed to claim; report their own separately as own_pending.
+    const [{ pending, lockSet, finalizingSet, counts }, reviewers, rejectedKeys, finishedKeys, rejecters] = await Promise.all([
+      cachedQueueState(),
+      reviewerTotals(),
+      listAll(`${REVIEW_PREFIX}rejected/`),
+      listAll(`${REVIEW_PREFIX}finished/`),
+      appealRejecters(),
+    ]);
+    // Exclude the caller's own submissions from pending/claimable so the queue
+    // tiles never advertise tasks the reviewer isn't allowed to claim; report
+    // them separately as own_pending.
     const allEligible = excludeIneligible(pending, reviewerPid, rejecters);
-    const audited = await completedPreQcSubmissionKeys(allEligible);
+    const audited = await completedPreQcSubmissionKeys(pending);
     const eligible = allEligible.filter((key) => audited.has(key));
-    const claimable = eligible.filter((k) => !lockSet.has(b64url(k))).length;
+    const availability = reviewQueueAvailability(eligible, lockSet, finalizingSet);
     const approved = finishedKeys.length;
-    // One object per task lands under rejected/, but a task can now be rejected
-    // twice: once before its appeal and once after. Count tasks, not records.
-    // ...and a task rejected before its appeal was approved is no longer a
-    // rejection: its round-one record stays in S3 forever, so without this it
-    // counts in both tiles and `finished` can exceed `submitted`.
     const approvedTaskIds = new Set(
       finishedKeys.map((key) => String(key).slice(String(key).lastIndexOf("/") + 1).replace(/\.json$/, ""))
     );
     const rejected = [...distinctRejectedTaskIds(rejectedKeys)].filter((id) => !approvedTaskIds.has(id)).length;
     return respond(200, {
       ...counts,
-      locked: eligible.filter((key) => lockSet.has(b64url(key))).length,
+      locked: availability.locked,
       finished: approved + rejected,
       approved,
       pending: eligible.length,
-      claimable,
+      claimable: availability.claimable,
       awaiting_live_audit: allEligible.length - eligible.length,
-      // Only the caller's own submissions, computed on its own: allEligible now
-      // also drops appeals of tasks they rejected, and attributing that to
-      // "your own submissions" would overstate it.
       own_pending: pending.length - excludeOwnSubmissions(pending, reviewerPid).length,
       rejected,
-      // How many of the caller's own approved tasks are still waiting for them
-      // to sign off. Derived from the two listings above plus one more, with no
-      // per-task reads: the participant id is recoverable from both key shapes.
       own_awaiting_signoff: await ownAwaitingSignoff(finishedKeys, reviewerPid),
       reviewers,
     });
@@ -2996,7 +5338,56 @@ async function handleReview(path, body) {
 
   if (path === "/review/admin") {
     if (!isAllowedAdminEmail(body.admin_email)) return respond(403, { error: "Admin access required" });
-    return respond(200, await adminDashboard());
+    if (body.action === "reopen") {
+      const result = await reopenReviewOutcome(body.task_id, body.admin_email, body.reason);
+      return respond(result.status, result.body, { "Cache-Control": "no-store" });
+    }
+    if (body.action === "reopen_by_reviewer") {
+      // Bulk re-queue of one reviewer's decisions (default: approvals they did
+      // not edit). Bounded per call so the Lambda stays well inside its
+      // timeout; the response says how many remain so the client can repeat.
+      const targetReviewer = normalizeReviewerName(body.reviewer);
+      if (!targetReviewer) return respond(400, { error: "reviewer required" });
+      const onlyUnedited = body.only_unedited !== false;
+      const outcome = body.outcome === "rejected" ? "rejected" : "approved";
+      const limit = Math.max(1, Math.min(20, Math.floor(Number(body.limit) || 20)));
+      const dashboard = await adminListDashboard();
+      const matches = (dashboard.items ?? []).filter((item) =>
+        item.status === outcome &&
+        normalizeReviewerName(item.reviewer) === targetReviewer &&
+        (!onlyUnedited || outcome !== "approved" || !(item.changed_in_qc ?? item.changed))
+      );
+      const results = [];
+      for (const item of matches.slice(0, limit)) {
+        try {
+          const result = await reopenReviewOutcome(item.task_id, body.admin_email, body.reason || `Bulk re-queue of ${outcome} decisions by ${item.reviewer}`);
+          results.push({ task_id: item.task_id, ok: result.status === 200, error: result.body?.error });
+        } catch (error) {
+          results.push({ task_id: item.task_id, ok: false, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      return respond(200, {
+        ok: true,
+        reviewer: body.reviewer,
+        matched: matches.length,
+        reopened: results.filter((result) => result.ok).length,
+        failed: results.filter((result) => !result.ok),
+        remaining: Math.max(0, matches.length - results.filter((result) => result.ok).length),
+      }, { "Cache-Control": "no-store" });
+    }
+    if (body.action === "detail") {
+      const taskId = cleanText(body.task_id, 160);
+      let item = null;
+      try {
+        item = await indexedAdminDetail(taskId);
+      } catch (error) {
+        console.error("Dashboard index detail failed; using S3 source of truth", error);
+      }
+      if (!item) item = (await adminDashboard()).items.find((candidate) => candidate.task_id === taskId);
+      if (!item) return respond(404, { error: "Task not found" });
+      return respond(200, { item: { ...item, detail_loaded: true } }, { "Cache-Control": "no-store" });
+    }
+    return respond(200, pageAdminDashboard(await adminListDashboard(), body), { "Cache-Control": "no-store" });
   }
 
   if (path === "/review/pc-admin") {
@@ -3016,21 +5407,30 @@ async function handleReview(path, body) {
 
   if (path === "/review/claim") {
     if (!reviewer) return respond(400, { error: "reviewer required" });
-    const [{ pending, lockSet, inboxAge, counts }, rejecters] = await Promise.all([
+    const [{ pending, lockSet, finalizingSet, inboxAge, counts, reopenExclusions }, rejecters] = await Promise.all([
       queueState(),
       appealRejecters(),
     ]);
-    // Never hand a reviewer their own submission, nor an appeal of a task they
-    // rejected themselves (server-side authoritative — the client-side filter
-    // is only cosmetic).
-    const allEligible = excludeIneligible(pending, reviewerPid, rejecters);
-    const audited = await completedPreQcSubmissionKeys(allEligible);
+    // Never hand a reviewer their own submission (server-side authoritative —
+    // the client-side filter is only cosmetic), nor a task an admin re-queued
+    // away from them for a second opinion.
+    const allEligible = excludeReopenedForReviewer(
+      excludeIneligible(pending, reviewerPid, rejecters),
+      reviewer,
+      reopenExclusions
+    );
+    // Audit the FULL pending list, not the per-reviewer slice: the result is
+    // reviewer-independent, so the signature cache hits across concurrent
+    // reviewers instead of re-listing the pre-QC prefixes per request.
+    const audited = await completedPreQcSubmissionKeys(pending);
     const eligible = allEligible.filter((key) => audited.has(key));
-    // Try unlocked tasks first, oldest first; then stale-lock takeovers.
+    // Try ordinary unlocked tasks first, then abandoned finalizations that need
+    // recovery. Fresh ordinary locks cannot succeed and are deliberately left
+    // out so the 25-attempt cap cannot starve recovery work.
     const unlocked = eligible.filter((k) => !lockSet.has(b64url(k)));
-    const locked = eligible.filter((k) => lockSet.has(b64url(k)));
+    const finalizing = eligible.filter((k) => finalizingSet.has(b64url(k)));
     let attempts = 0;
-    for (const subKey of [...unlocked, ...locked]) {
+    for (const subKey of orderClaimCandidates(unlocked, finalizing, body.skip_keys)) {
       if (attempts++ >= 25) break; // bound worst-case latency under heavy contention
       // The marker is written at presign time — make sure the upload actually
       // happened before handing the task to a reviewer.
@@ -3048,8 +5448,30 @@ async function handleReview(path, body) {
         }
         continue;
       }
-      const token = await tryLock(subKey, reviewer);
+      // Serialize the final freshness check with author-edit publication. A
+      // queue snapshot can name the old revision while an author publishes a
+      // newer one; only the current newest inbox revision may receive a review
+      // lock, or the old review could occupy the task's singleton final-gold
+      // key and permanently block the new revision.
+      const mutationLock = await acquireAuthorMutationLock(subKey, `reviewer:${reviewerPid || reviewer}:claim`);
+      if (!mutationLock) continue;
+      let token = null;
+      try {
+        if (await recoverStaleFinalizingReview(subKey) && await revalidateClaimCandidate(subKey)) {
+          token = await tryLock(subKey, reviewer, lockKeyFor, reviewerPid);
+        }
+      } finally {
+        await releaseAuthorMutationLock(subKey, mutationLock);
+      }
       if (token) {
+        const indexedTaskId = taskIdFromSubmissionKey(subKey);
+        if (indexedTaskId) {
+          await setDashboardIndexStatus(indexedTaskId, "in_review", {
+            expected_source_key: subKey,
+            reviewer,
+            lock_expires_at: new Date(Date.now() + Number(LOCK_TTL_MS)).toISOString(),
+          }).catch((error) => console.error("Dashboard claim index update failed", error));
+        }
         const taskUrl = await getSignedUrl(s3, new GetObjectCommand({ Bucket: S3_BUCKET, Key: subKey }), {
           expiresIn: 3600,
         });
@@ -3069,10 +5491,33 @@ async function handleReview(path, body) {
   if (path === "/review/release") {
     const { sub_key, token } = body;
     if (!sub_key || !token) return respond(400, { error: "sub_key and token required" });
-    const etag = await verifyLock(sub_key, token);
-    if (!etag) return respond(409, { error: "Lock not held by you (it may have expired)" });
-    await deleteLockIfUnchanged(sub_key, etag);
+    const mutationLock = await acquireAuthorMutationLock(sub_key, `reviewer:${reviewerPid || reviewer}:release`);
+    if (!mutationLock) {
+      return respond(409, { error: "This task is being finalized or changed. Retry in a moment." });
+    }
+    try {
+    const etag = await verifyReleasableLock(sub_key, token);
+    if (!etag) return respond(409, { error: "Lock not held by you, or this review is already finalizing" });
+    const released = await deleteLockIfUnchanged(sub_key, etag);
+    // A release is a skip: record it (zero-byte, keyed by review unit) so
+    // reporting can count how many reviewers bounced off a task.
+    if (released) {
+      await s3.send(new PutObjectCommand({
+        Bucket: S3_BUCKET,
+        Key: reviewSkipMarkerKeyFor(sub_key, reviewer),
+        Body: "",
+        ContentType: "text/plain",
+      })).catch((error) => console.error("Skip marker write failed", error));
+    }
+    const indexedTaskId = taskIdFromSubmissionKey(sub_key);
+    if (released && indexedTaskId) {
+      await setDashboardIndexStatus(indexedTaskId, "pending", { expected_source_key: sub_key })
+        .catch((error) => console.error("Dashboard release index update failed", error));
+    }
     return respond(200, { ok: true });
+    } finally {
+      await releaseAuthorMutationLock(sub_key, mutationLock);
+    }
   }
 
   if (path === "/review/llm-feedback") {
@@ -3099,6 +5544,18 @@ async function handleReview(path, body) {
     if (typeof reviewed.task !== "object" || typeof reviewed.task?.agent_request !== "string") {
       return respond(400, { error: "reviewed.task.agent_request required" });
     }
+    const sourceWorkflow = String(sub_key).includes("trajectory_rework")
+      ? await readJson(sub_key).then(({ json }) => json?.workflow).catch(() => null)
+      : null;
+    const trajectoryEditLink = sourceWorkflow?.kind === "trajectory_edit"
+      ? {
+          kind: "trajectory_edit",
+          revision_of_task_id: cleanText(sourceWorkflow.revision_of_task_id, 300),
+          source_manifest_key: cleanText(sourceWorkflow.source_manifest_key, 2_000),
+          run_id: cleanText(sourceWorkflow.run_id, 120),
+          reason: cleanText(sourceWorkflow.reason, 20_000),
+        }
+      : null;
     const reviewedMetadata = taskMetadataForReporting(reviewed.task);
     const safeReviewed = {
       schema_version: "odyssey_long_task_v2_reviewed",
@@ -3122,7 +5579,10 @@ async function handleReview(path, body) {
             })).filter((step) => step.description.trim())
           : [],
       },
-      review: typeof reviewed.review === "object" && !Array.isArray(reviewed.review) ? reviewed.review : {},
+      review: {
+        ...(typeof reviewed.review === "object" && !Array.isArray(reviewed.review) ? reviewed.review : {}),
+        ...(trajectoryEditLink ? { trajectory_edit: trajectoryEditLink } : {}),
+      },
     };
     if (JSON.stringify(safeReviewed).length > 512 * 1024) {
       return respond(400, { error: "reviewed payload too large (512KB max)" });
@@ -3130,6 +5590,17 @@ async function handleReview(path, body) {
     const contentHash = reviewContentHash(safeReviewed);
     const taskId = taskIdRaw.replace(/[^A-Za-z0-9_-]/g, "_");
     const finishedKey = `${REVIEW_PREFIX}finished/${taskId}.json`;
+    const changedInReview = Boolean(
+      safeReviewed.review?.title_edited ||
+      safeReviewed.review?.request_edited ||
+      (Array.isArray(safeReviewed.review?.rubrics) && safeReviewed.review.rubrics.some((rubric) => rubric?.changed))
+    );
+    const decisionPid = await reviewerPidForDecision(sub_key, token, reviewerPid);
+    const mutationLock = await acquireAuthorMutationLock(sub_key, `reviewer:${decisionPid || reviewer}:approve`);
+    if (!mutationLock) {
+      return respond(409, { error: "This task is being changed or reopened. Retry in a moment." });
+    }
+    try {
     // Retry after an ambiguous network/server error: if this exact outcome
     // already won, finish its credit receipt and return success idempotently.
     // Check the durable done record BEFORE requiring the now-deleted lock: a
@@ -3147,24 +5618,39 @@ async function handleReview(path, body) {
       await recordReviewerCredit(creditedReviewer, "approved", sub_key, taskId, completedAt);
       const retryEtag = await verifyLock(sub_key, token);
       if (retryEtag) await deleteLockIfUnchanged(sub_key, retryEtag);
+      await setDashboardIndexStatus(taskIdRaw, "approved", {
+        expected_source_key: sub_key,
+        reviewer: creditedReviewer,
+        reviewed_at: completedAt,
+        done_target: finishedKey,
+        claimed_at: String(existingDone.claimed_at || ""),
+        changed: changedInReview,
+        changed_in_qc: changedInReview,
+        final_title: safeReviewed.task.task_title,
+        final_difficulty: safeReviewed.task.difficulty,
+        final_metadata: safeReviewed.task.metadata,
+        final_gold_revision: 1,
+      }).catch((error) => console.error("Dashboard approval index update failed", error));
       return respond(200, { ok: true, finished_key: finishedKey, idempotent: true });
     }
-    let etag = await verifyLock(sub_key, token);
+    let etag = await verifyCurrentReviewDecision(sub_key, token);
     if (!etag) return respond(409, { error: "Lock not held by you (it may have expired)" });
-    const claimedAt = await lockClaimedAt(sub_key);
     etag = await beginFinalization(sub_key, token, reviewer, "approved", contentHash);
     if (!etag) return respond(409, { error: "Another edit or outcome is already being submitted" });
     let completedAt = new Date().toISOString();
-    // reviewer_pid alongside the display name: the name is free text a client
-    // supplies, so it is not a stable handle. Authors are shown the name; the
-    // pid is what any later attribution should join on.
-    let doc = {
-      ...safeReviewed,
-      review_content_hash: contentHash,
-      reviewed_by: reviewer,
-      reviewer_pid: reviewerPid,
-      finished_at: completedAt,
-    };
+    // Capture this before the finished object is written. The lock is deleted
+    // immediately after finalization, and reporting needs the same immutable
+    // claim timestamp on final gold as on the done record. It deliberately is
+    // not part of `safeReviewed` or `contentHash`.
+    const claimedAt = await lockClaimedAt(sub_key);
+    let doc = buildApprovedFinalGoldDocument({
+      reviewed: safeReviewed,
+      contentHash,
+      reviewer,
+      reviewerPid: decisionPid,
+      claimedAt,
+      completedAt,
+    });
     const createdFinished = await tryConditionalWrite(() => s3.send(
       new PutObjectCommand({
         Bucket: S3_BUCKET,
@@ -3188,33 +5674,48 @@ async function handleReview(path, body) {
       target: finishedKey,
       outcome: "approved",
       reviewer,
+      reviewer_pid: decisionPid,
       task_id: taskId,
       completed_at: completedAt,
-      content_hash: contentHash,
-      // Copied off the lock before it is deleted: the pair (claimed_at,
-      // completed_at) is the only durable record of how long a review took.
       claimed_at: claimedAt,
+      content_hash: contentHash,
     });
     if (done.target !== finishedKey || done.outcome !== "approved" || (done.content_hash && done.content_hash !== contentHash)) {
       return respond(409, { error: "This task was already finished by another reviewer" });
     }
     await recordReviewerCredit(String(done.reviewer || reviewer), "approved", sub_key, taskId, String(done.completed_at || completedAt));
     await deleteLockIfUnchanged(sub_key, etag);
+    await setDashboardIndexStatus(taskIdRaw, "approved", {
+      expected_source_key: sub_key,
+      reviewer: String(done.reviewer || reviewer),
+      reviewed_at: String(done.completed_at || completedAt),
+      done_target: finishedKey,
+      claimed_at: String(done.claimed_at || claimedAt || ""),
+      changed: changedInReview,
+      changed_in_qc: changedInReview,
+      final_title: safeReviewed.task.task_title,
+      final_difficulty: safeReviewed.task.difficulty,
+      final_metadata: safeReviewed.task.metadata,
+      final_gold_revision: 1,
+    }).catch((error) => console.error("Dashboard approval index update failed", error));
     return respond(200, { ok: true, finished_key: finishedKey });
+    } finally {
+      await releaseAuthorMutationLock(sub_key, mutationLock);
+    }
   }
 
   // Newest accepted tasks, for the in-app reference library (authored content
   // only — these records were provenance-stripped at submit time).
   if (path === "/review/finished") {
     const all = await listAllObjects(`${REVIEW_PREFIX}finished/`);
-    // Take a wider candidate window than the page: an author amendment rewrites
-    // finished/{task_id}.json in place, so LastModified is when it was last
-    // touched, not when it was approved. Ordering below is by finished_at.
-    const newest = all
-      .sort((a, b) => (b.LastModified?.getTime() ?? 0) - (a.LastModified?.getTime() ?? 0))
-      .slice(0, 60);
-    const reads = await Promise.all(
-      newest.map((o) =>
+    // Amendments rewrite LastModified, so selecting a LastModified window
+    // before reading finished_at can omit genuinely recent approvals. Read in
+    // bounded batches, then rank the complete set by the immutable approval
+    // timestamp.
+    const reads = [];
+    for (let offset = 0; offset < all.length; offset += 25) {
+      const batch = await Promise.all(
+        all.slice(offset, offset + 25).map((o) =>
         readJson(o.Key)
           .then(({ json }) => ({
             task_id: json.task_id,
@@ -3226,12 +5727,11 @@ async function handleReview(path, body) {
             finished_at: json.finished_at ?? "",
           }))
           .catch(() => null)
-      )
-    );
-    const items = reads
-      .filter(Boolean)
-      .sort((a, b) => String(b.finished_at).localeCompare(String(a.finished_at)))
-      .slice(0, 30);
+        )
+      );
+      reads.push(...batch);
+    }
+    const items = sortFinishedExamples(reads, 30);
     return respond(200, { items });
   }
 
@@ -3241,30 +5741,34 @@ async function handleReview(path, body) {
     const { sub_key, token, task_id, reason } = body;
     if (!sub_key || !token) return respond(400, { error: "sub_key and token required" });
     const rejectionReason = String(reason || "").trim();
-    // The floor used to be 3 characters, which let "spam" and "reject task"
-    // through. Authors can now appeal a rejection, and an appeal against a
-    // four-word verdict wastes two people's time, so the reason has to say
-    // enough to act on.
     if (rejectionReason.length < MIN_REJECTION_REASON_LENGTH) {
       return respond(400, {
         error: `A rejection reason of at least ${MIN_REJECTION_REASON_LENGTH} characters is required — say what is wrong so the author can fix it.`,
       });
     }
-    // cleanRubrics doubles as the sanitizer here: with a review present it
-    // rebuilds every row field by field under the same caps the approval path
-    // uses, and yields [] when the client sent nothing usable.
     const rejectionRubrics = cleanRubrics(body.review, null, null);
     let sanitizedRejectionReview = rejectionRubrics.length ? { rubrics: rejectionRubrics } : null;
-    // cleanRubrics caps row count and titles but leaves the text itself
-    // unbounded, and unlike /review/submit this path had no size check at all.
-    // The object is read back on every my-tasks row, so an oversized one is a
-    // cost every page load pays. Feedback is dropped, never the rejection.
     if (sanitizedRejectionReview && JSON.stringify(sanitizedRejectionReview).length > 256 * 1024) {
       sanitizedRejectionReview = null;
     }
     const rejId = String(task_id || "task-unknown").replace(/[^A-Za-z0-9_-]/g, "_");
     const rejectedKey = `${REVIEW_PREFIX}rejected/${rejId}_${createHash("sha256").update(sub_key).digest("hex").slice(0, 16)}.json`;
-    const contentHash = reviewContentHash({ task_id: rejId, reason: rejectionReason.slice(0, 500) });
+    const contentHash = reviewContentHash({
+      task_id: rejId,
+      reason: rejectionReason.slice(0, 500),
+      ...(sanitizedRejectionReview ? { review: sanitizedRejectionReview } : {}),
+    });
+    const decisionPid = await reviewerPidForDecision(sub_key, token, reviewerPid);
+    if (!VALID_PID.test(decisionPid)) {
+      return respond(409, {
+        error: "Refresh and reclaim this task before rejecting it so the author can receive a safely routed appeal.",
+      }, { "Cache-Control": "no-store" });
+    }
+    const mutationLock = await acquireAuthorMutationLock(sub_key, `reviewer:${decisionPid || reviewer}:reject`);
+    if (!mutationLock) {
+      return respond(409, { error: "This task is being changed or reopened. Retry in a moment." });
+    }
+    try {
     // As with approval, a byte-identical retry must succeed after the first
     // request committed and removed its lock but lost the HTTP response.
     const existingDone = await readDoneRecord(sub_key);
@@ -3280,11 +5784,18 @@ async function handleReview(path, body) {
       await recordReviewerCredit(creditedReviewer, "rejected", sub_key, rejId, completedAt);
       const retryEtag = await verifyLock(sub_key, token);
       if (retryEtag) await deleteLockIfUnchanged(sub_key, retryEtag);
+      await setDashboardIndexStatus(String(task_id || "task-unknown"), "rejected", {
+        expected_source_key: sub_key,
+        reviewer: creditedReviewer,
+        reviewed_at: completedAt,
+        claimed_at: String(existingDone.claimed_at || ""),
+        rejection_reason: rejectionReason.slice(0, 500),
+        done_target: rejectedKey,
+      }).catch((error) => console.error("Dashboard rejection index update failed", error));
       return respond(200, { ok: true, rejected_key: rejectedKey, idempotent: true });
     }
-    let etag = await verifyLock(sub_key, token);
+    let etag = await verifyCurrentReviewDecision(sub_key, token);
     if (!etag) return respond(409, { error: "Lock not held by you (it may have expired)" });
-    const claimedAt = await lockClaimedAt(sub_key);
     etag = await beginFinalization(sub_key, token, reviewer, "rejected", contentHash);
     if (!etag) return respond(409, { error: "Another edit or outcome is already being submitted" });
     let completedAt = new Date().toISOString();
@@ -3292,10 +5803,7 @@ async function handleReview(path, body) {
       source_key: sub_key,
       task_id: rejId,
       rejected_by: reviewer,
-      rejected_by_pid: reviewerPid,
-      // The reviewer's working rubric rows, so the author sees which steps
-      // failed rather than only a summary sentence. Shown to them without
-      // attribution — rejections stay anonymous.
+      rejected_by_pid: decisionPid,
       ...(sanitizedRejectionReview ? { review: sanitizedRejectionReview } : {}),
       reason: rejectionReason.slice(0, 500),
       review_content_hash: contentHash,
@@ -3317,234 +5825,36 @@ async function handleReview(path, body) {
       }
       completedAt = String(existingRejected.rejected_at || completedAt);
     }
+    const claimedAt = await lockClaimedAt(sub_key);
     const done = await writeDoneRecord(sub_key, {
       target: rejectedKey,
       outcome: "rejected",
       reviewer,
+      reviewer_pid: decisionPid,
       task_id: rejId,
       completed_at: completedAt,
-      content_hash: contentHash,
-      // Copied off the lock before it is deleted: the pair (claimed_at,
-      // completed_at) is the only durable record of how long a review took.
       claimed_at: claimedAt,
+      content_hash: contentHash,
     });
     if (done.target !== rejectedKey || done.outcome !== "rejected" || (done.content_hash && done.content_hash !== contentHash)) {
       return respond(409, { error: "This task was already finished by another reviewer" });
     }
     await recordReviewerCredit(String(done.reviewer || reviewer), "rejected", sub_key, rejId, String(done.completed_at || completedAt));
     await deleteLockIfUnchanged(sub_key, etag);
+    await setDashboardIndexStatus(String(task_id || "task-unknown"), "rejected", {
+      expected_source_key: sub_key,
+      reviewer: String(done.reviewer || reviewer),
+      reviewed_at: String(done.completed_at || completedAt),
+      rejection_reason: rejectionReason.slice(0, 500),
+      done_target: rejectedKey,
+      claimed_at: String(done.claimed_at || claimedAt || ""),
+    }).catch((error) => console.error("Dashboard rejection index update failed", error));
     return respond(200, { ok: true, rejected_key: rejectedKey });
+    } finally {
+      await releaseAuthorMutationLock(sub_key, mutationLock);
+    }
   }
 
-  // Author-facing: list this participant's own tasks with their live status.
-  // Read-only — no model calls, no mutations. Ownership is enforced server-side
-  // (the participant_id must match the submitter embedded in each sub_key).
-  if (path === "/review/my-tasks") {
-    const participantId = String(body.participant_id || "").trim().toLowerCase();
-    if (!VALID_PID.test(participantId)) {
-      return respond(400, { error: "Invalid participant_id" }, { "Cache-Control": "no-store" });
-    }
-    const { byTaskDir, lockSet, doneByEncodedKey, inboxAge } = await loadReviewIndex({
-      readDoneRecords: true,
-      doneRecordFilter: (key) => participantIdFromSubKey(key) === participantId,
-    });
-    const ownUnits = [];
-    for (const { newest, oldestAt } of byTaskDir.values()) {
-      if (participantIdFromSubKey(newest) === participantId) ownUnits.push({ newest, oldestAt });
-    }
-    // Newest first: an author working a long sign-off backlog wants the task
-    // they just had reviewed, not the one from three weeks ago.
-    ownUnits.sort((a, b) => b.oldestAt - a.oldestAt || b.newest.localeCompare(a.newest));
-    const sourceTotal = ownUnits.length;
-    const offset = Math.max(0, Number(body.offset) || 0);
-    const limit = Math.min(200, Math.max(1, Number(body.limit) || 50));
-    const pageUnits = ownUnits.slice(offset, offset + limit);
-    // pending = passed the PRE_QC audit gate (a current completed artifact),
-    // the same definition the reviewer queue uses for claimability.
-    const audited = await completedPreQcSubmissionKeys(pageUnits.map((unit) => unit.newest));
-    // Which of this author's tasks they have already signed off. One listing,
-    // not one GET per row.
-    const signoffObjects = await listAllObjects(AUTHOR_SIGNOFF_PREFIX);
-    const signoffKeys = new Set();
-    for (const object of signoffObjects) {
-      const encoded = object.Key.slice(AUTHOR_SIGNOFF_PREFIX.length).replace(/\.json$/, "");
-      try {
-        signoffKeys.add(fromB64url(encoded));
-      } catch {
-        /* malformed receipt key */
-      }
-    }
-    // Totals across every one of this author's tasks, not just this page, so
-    // the sign-off progress line stays honest while they page through. Free:
-    // both maps already cover the whole set.
-    let approvedTotal = 0;
-    let awaitingSignoffTotal = 0;
-    for (const { newest } of ownUnits) {
-      if (doneOutcome(doneByEncodedKey.get(b64url(newest)) ?? null) !== "approved") continue;
-      approvedTotal += 1;
-      if (!signoffKeys.has(newest)) awaitingSignoffTotal += 1;
-    }
-    const rejectionsInUnit = new Map();
-    for (const [encoded, record] of doneByEncodedKey.entries()) {
-      if (doneOutcome(record) !== "rejected") continue;
-      try {
-        const unit = reviewUnitForKey(fromB64url(encoded));
-        rejectionsInUnit.set(unit, (rejectionsInUnit.get(unit) ?? 0) + 1);
-      } catch {
-        /* malformed done key */
-      }
-    }
-    const buildItem = async ({ newest }) => {
-      const done = doneByEncodedKey.get(b64url(newest)) ?? null;
-      const outcome = doneOutcome(done);
-      let status;
-      if (outcome === "approved") status = "approved";
-      else if (outcome === "rejected") status = "rejected";
-      else if (outcome === "returned") status = "returned";
-      else if (lockSet.has(b64url(newest))) status = "in_review";
-      else if (audited.has(newest)) status = "pending";
-      else status = "awaiting_codex";
-      const source = await readJson(newest).then(({ json }) => json).catch(() => null);
-      const task = source?.task ?? source;
-      const original = cleanTaskSnapshot(task);
-      const rubrics = cleanRubrics(null, original, null);
-      const contentHash = original ? reportingTaskContentHash(original, null, rubrics) : null;
-      const submittedAt =
-        source?.created_at ||
-        (inboxAge.has(newest) ? new Date(inboxAge.get(newest)).toISOString() : null);
-      const item = {
-        task_id: cleanText(source?.task_id, 300),
-        sub_key: newest,
-        title: cleanText(task?.task_title ?? task?.title, 300),
-        request: String(task?.agent_request ?? task?.request ?? "").slice(0, 300),
-        status,
-        submitted_at: submittedAt || null,
-        content_hash: contentHash,
-      };
-      const rejectionCount = rejectionsInUnit.get(reviewUnitForKey(newest)) ?? 0;
-      item.rejection_count = rejectionCount;
-      if (status === "approved" && done?.target) {
-        const finished = await readJson(done.target).then(({ json }) => json).catch(() => null);
-        // Approvals are attributed: the author should be able to go and talk to
-        // whoever edited their task.
-        item.reviewed_by = cleanText(finished?.reviewed_by, 160) || "";
-        item.reviewer_changed = reviewerChangedTask(finished);
-        item.revision_count = finalGoldRevision(finished);
-        item.signed_off_at = "";
-        item.signoff_action = "";
-        item.needs_signoff = !signoffKeys.has(newest);
-      }
-      if (status === "rejected" && done?.target) {
-        const rejected = await readJson(done.target).then(({ json }) => json).catch(() => null);
-        item.rejection_reason = cleanText(rejected?.reason, 500) || "";
-        // One appeal per task. Anything already appealed once is finished.
-        item.can_appeal = rejectionCount <= 1;
-      }
-      if (status === "returned" && done?.target) {
-        const returned = await readJson(done.target).then(({ json }) => json).catch(() => null);
-        item.returned_reason = cleanText(returned?.reason, 500) || "";
-        item.returned_by = cleanText(returned?.returned_by, 160) || "";
-      }
-      return item;
-    };
-    // Batched rather than one unbounded Promise.all: each row costs at least one
-    // GET, and the heaviest author already has well over a hundred tasks. Same
-    // width loadReviewIndex uses for done records.
-    const items = [];
-    for (let i = 0; i < pageUnits.length; i += 25) {
-      items.push(...(await Promise.all(pageUnits.slice(i, i + 25).map(buildItem))));
-    }
-    // Signoff receipts hold the timestamp and which way the author went. Read
-    // only for the rows on this page that have one.
-    const signedRows = items.filter((item) => item.status === "approved" && !item.needs_signoff);
-    for (let i = 0; i < signedRows.length; i += 25) {
-      await Promise.all(signedRows.slice(i, i + 25).map(async (item) => {
-        const receipt = await readJson(authorSignoffKeyFor(item.sub_key))
-          .then(({ json }) => json)
-          .catch(() => null);
-        item.signed_off_at = cleanText(receipt?.signed_off_at, 60) || "";
-        item.signoff_action = cleanText(receipt?.action, 20) || "";
-      }));
-    }
-    return respond(
-      200,
-      {
-        items,
-        offset,
-        limit,
-        source_total: sourceTotal,
-        approved_total: approvedTotal,
-        awaiting_signoff_total: awaitingSignoffTotal,
-      },
-      { "Cache-Control": "no-store" }
-    );
-  }
-
-  // Author-facing: the Codex feedback for one of the author's own submissions.
-  // Reuses the claimed-task LLM-review path but skips the reviewer lock (the
-  // author holds no lock), and overlays the finished status so an approved/
-  // rejected/returned task surfaces its reason and (for approvals) the diff.
-  if (path === "/review/my-task-feedback") {
-    const { sub_key } = body;
-    const participantId = String(body.participant_id || "").trim().toLowerCase();
-    if (!sub_key) return respond(400, { error: "sub_key required" }, { "Cache-Control": "no-store" });
-    if (!VALID_PID.test(participantId)) {
-      return respond(400, { error: "Invalid participant_id" }, { "Cache-Control": "no-store" });
-    }
-    if (participantIdFromSubKey(sub_key) !== participantId) {
-      return respond(403, { error: "You can only view your own tasks" }, { "Cache-Control": "no-store" });
-    }
-    const preQc = await preQcReviewForClaimedTask(sub_key);
-    const source = await readJson(sub_key).then(({ json }) => json).catch(() => null);
-    const taskField = authoredTaskContentForResponse(source?.task ?? source);
-    const done = await readDoneRecord(sub_key);
-    const outcome = doneOutcome(done);
-    const response = {
-      status: preQc.status,
-      stale: preQc.stale,
-      task_content_hash: preQc.task_content_hash,
-      review: preQc.review,
-      task: taskField,
-    };
-    if (outcome === "approved" && done?.target) {
-      response.status = "approved";
-      const finished = await readJson(done.target).then(({ json }) => json).catch(() => null);
-      const humanReview = buildHumanReviewForAuthor(finished, source);
-      if (humanReview) response.human_review = humanReview;
-      // The full final gold in the same shape as `task`. The amend form seeds
-      // from this: an author correcting an approved task starts from the
-      // reviewer's version, not from their own original. human_review.final is
-      // a display snapshot and carries no difficulty, notes, or metadata.
-      response.final_task = authoredTaskContentForResponse(finished?.task ?? null);
-      const receipt = await readJson(authorSignoffKeyFor(sub_key))
-        .then(({ json }) => json)
-        .catch(() => null);
-      response.signed_off_at = cleanText(receipt?.signed_off_at, 60) || "";
-      response.signoff_action = cleanText(receipt?.action, 20) || "";
-      response.needs_signoff = !receipt;
-    } else if (outcome === "rejected" && done?.target) {
-      response.status = "rejected";
-      const rejected = await readJson(done.target).then(({ json }) => json).catch(() => null);
-      response.rejection_reason = cleanText(rejected?.reason, 500) || "";
-      // Substance without attribution: the author learns which steps failed,
-      // not who decided it.
-      const feedback = buildRejectionFeedbackForAuthor(rejected, source);
-      if (feedback) response.rejection_feedback = feedback;
-    } else if (outcome === "returned" && done?.target) {
-      response.status = "returned";
-      const returned = await readJson(done.target).then(({ json }) => json).catch(() => null);
-      response.returned_reason = cleanText(returned?.reason, 500) || "";
-      response.returned_by = cleanText(returned?.returned_by, 160) || "";
-    }
-    response.history = await authorTaskHistory(sub_key);
-    return respond(200, response, { "Cache-Control": "no-store" });
-  }
-
-  // Author self-edit: write a new submission object in the SAME task directory
-  // (so reviewUnitForKey keeps grouping it as the same unit), re-entering the
-  // reviewer queue for a fresh Codex audit. Never finalizes; originals stay
-  // immutable. Allowed only when the newest revision is open (awaiting_codex,
-  // pending) or returned — locked or finished tasks cannot be edited.
   if (path === "/review/author-edit") {
     const { sub_key, edited } = body;
     const participantId = String(body.participant_id || "").trim().toLowerCase();
@@ -3558,124 +5868,184 @@ async function handleReview(path, body) {
     if (!edited || typeof edited !== "object" || Array.isArray(edited)) {
       return respond(400, { error: "edited payload required" }, { "Cache-Control": "no-store" });
     }
-    const safeTask = sanitizeAuthoredTask(edited);
-    if (!String(safeTask.agent_request).trim()) {
+    const submittedTask = sanitizeAuthoredTask(edited);
+    if (!String(submittedTask.agent_request).trim()) {
       return respond(400, { error: "agent_request is required" }, { "Cache-Control": "no-store" });
     }
-    const newOriginal = cleanTaskSnapshot(safeTask);
-    const newRubrics = cleanRubrics(null, newOriginal, null);
-    const newContentHash = reportingTaskContentHash(newOriginal, null, newRubrics);
+    const requestedAppealReason = cleanAppealReason(body.appeal_reason);
+    const mutationLock = await acquireAuthorMutationLock(sub_key, `author:${participantId}:edit`);
+    if (!mutationLock) {
+      return respond(409, { error: "This task is being changed or reopened. Retry in a moment." }, { "Cache-Control": "no-store" });
+    }
+    try {
     const unit = reviewUnitForKey(sub_key);
-    const { byTaskDir, lockSet, doneByEncodedKey } = await loadReviewIndex({
+    const { byTaskDir, lockSet, unresolvedLockSet, doneSet, doneByEncodedKey } = await loadReviewIndex({
       readDoneRecords: true,
       doneRecordFilter: (key) => reviewUnitForKey(key) === unit,
     });
     const entry = byTaskDir.get(unit);
     if (!entry) return respond(404, { error: "Task not found" }, { "Cache-Control": "no-store" });
     const newest = entry.newest;
+    if (!durableDoneStateIsReadable(doneSet, doneByEncodedKey, newest)) {
+      return respond(503, { error: "Task completion state is temporarily unreadable. Retry before editing." }, { "Cache-Control": "no-store" });
+    }
+    if (unresolvedLockSet.has(b64url(newest))) {
+      return respond(503, { error: "Task review lock is temporarily unreadable. Retry before editing." }, { "Cache-Control": "no-store" });
+    }
     const newestDone = doneByEncodedKey.get(b64url(newest)) ?? null;
     const outcome = doneOutcome(newestDone);
-    // Every rejection this unit has ever taken, not just the newest. The map is
-    // built from the done/ listing rather than inbox markers, so a revision
-    // whose marker was deleted by an earlier edit still counts — which is
-    // exactly the case that decides whether an appeal is still available.
     const rejectionCount = [...doneByEncodedKey.values()]
       .filter((record) => doneOutcome(record) === "rejected").length;
-    const eligibility = authorEditEligibility(outcome, lockSet.has(b64url(newest)), rejectionCount);
+    let eligibility = authorEditEligibility(outcome, lockSet.has(b64url(newest)), rejectionCount);
     if (!eligibility.allowed) {
       return respond(409, { error: eligibility.reason }, { "Cache-Control": "no-store" });
     }
-    // Read from `newest`, the same object eligibility was decided against —
-    // not from the client's sub_key. A second tab still showing the pre-appeal
-    // row would otherwise hand us the superseded submission, and the appeal
-    // lineage read off it would come back empty: the revision would be written
-    // with no appeals/ marker and the rejecting reviewer could claim it again.
     const original = await readJson(newest).then(({ json }) => json).catch(() => null);
     if (!original) {
       return respond(404, { error: "Original submission not found" }, { "Cache-Control": "no-store" });
     }
-    // Idempotency: if this exact edited content already exists as a not-done
-    // file in the unit, return it instead of writing a duplicate.
-    for (const fileKey of entry.files) {
-      if (doneByEncodedKey.has(b64url(fileKey))) continue; // done files are immutable
-      const existing = await readJson(fileKey).then(({ json }) => json).catch(() => null);
-      if (!existing) continue;
+    let verifiedAppealRejecterPid = "";
+    if (eligibility.appeal) {
+      if (!appealReasonIsValid(requestedAppealReason)) {
+        return respond(400, {
+          error: `Explain why this rejection should be reviewed again (${MIN_APPEAL_REASON_LENGTH} characters minimum).`,
+        }, { "Cache-Control": "no-store" });
+      }
+      const rejectedDoc = newestDone?.target
+        ? await readJson(newestDone.target).then(({ json }) => json).catch(() => null)
+        : null;
+      verifiedAppealRejecterPid = rejectedByPidFromDocument(rejectedDoc);
+      if (!verifiedAppealRejecterPid) {
+        return respond(409, {
+          error: "This rejection cannot be appealed yet because its reviewer routing record needs repair. Ask the task lead to unlock it.",
+        }, { "Cache-Control": "no-store" });
+      }
+    }
+    const safeTask = sanitizeAuthoredTask(edited, original.task ?? original);
+    const newOriginal = cleanTaskSnapshot(safeTask);
+    const newRubrics = cleanRubrics(null, newOriginal, null);
+    const newContentHash = reportingTaskContentHash(newOriginal, null, newRubrics);
+    const dir = newest.slice(0, newest.lastIndexOf("/"));
+    // Inbox markers intentionally exclude a source whose publication failed.
+    // Look at the task directory itself so an exact retry can recover the
+    // latest durably-saved revision instead of creating another orphan.
+    const revisionKeys = await listAll(`${dir}/`)
+      .then((keys) => keys
+        .filter((key) => isReviewSubmissionKey(key) && reviewUnitForKey(key) === unit)
+        .sort())
+      .catch(() => [...entry.files].sort());
+    const retryKey = revisionKeys.at(-1);
+    if (retryKey && !doneByEncodedKey.has(b64url(retryKey))) {
+      const existing = await readJson(retryKey).then(({ json }) => json).catch(() => null);
+      if (existing) {
       const existingOriginal = cleanTaskSnapshot(existing.task ?? existing);
       const existingRubrics = cleanRubrics(null, existingOriginal, null);
       if (reportingTaskContentHash(existingOriginal, null, existingRubrics) === newContentHash) {
-        return respond(200, { ok: true, new_sub_key: fileKey, new_content_hash: newContentHash, status: "awaiting_codex" }, { "Cache-Control": "no-store" });
+          const rejectedByPid = await rejectedByPidForAppeal(
+            retryKey,
+            existing.appeal_of_sub_key,
+            doneByEncodedKey,
+          );
+          const priorMarkerKey = retryKey !== newest
+            ? newest
+            : [...entry.files].filter((key) => key !== retryKey).sort().at(-1)
+              || existing.appeal_of_sub_key
+              || null;
+          const { markerWritten, appealRouted } = await publishStoredAuthorRevision({
+            subKey: retryKey,
+            revision: existing,
+            previousSubKey: priorMarkerKey,
+            rejectedByPid,
+          });
+          if (markerWritten) {
+            const indexItem = buildAdminItemFromDocuments({
+              source: existing,
+              sourceKey: retryKey,
+              submittedAt: cleanText(existing.created_at, 60),
+            });
+            await putDashboardIndexItem(indexItem)
+              .catch((error) => console.error("Dashboard retried author revision index update failed", error));
+            adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
+          }
+          return respond(markerWritten ? 200 : 503, {
+          ok: markerWritten,
+          ...(markerWritten ? {} : { error: "Your revision was saved but could not be queued safely. Retry to finish publishing it." }),
+          new_sub_key: retryKey,
+          new_content_hash: newContentHash,
+          status: markerWritten ? "awaiting_codex" : "revision_saved_unqueued",
+          queued: markerWritten,
+          appeal: Boolean(existing.appeal_of_sub_key),
+          appeal_routed: appealRouted,
+        }, { "Cache-Control": "no-store" });
+      }
       }
     }
-    // An appeal is spent whether or not the author changed anything, and the
-    // idempotency scan below cannot catch this case: it skips files with a done
-    // record, which the rejected revision always has.
-    if (eligibility.appeal) {
-      const rejectedSnapshot = cleanTaskSnapshot(original.task ?? original);
-      const rejectedHash = reportingTaskContentHash(
-        rejectedSnapshot,
-        null,
-        cleanRubrics(null, rejectedSnapshot, null)
-      );
-      if (rejectedHash === newContentHash) {
-        return respond(
-          409,
-          { error: "This is the same task that was rejected. Change what the reviewer flagged before appealing — you only get one." },
-          { "Cache-Control": "no-store" }
-        );
-      }
+    // An exact retry above may repair or confirm a publication whose response
+    // the client missed. A different edit to an already-queued appeal would
+    // create a second author pass before QC, so reject it server-side as well
+    // as hiding the action in the UI. Reviewer-returned tasks remain editable.
+    eligibility = authorEditEligibility(
+      outcome,
+      lockSet.has(b64url(newest)),
+      rejectionCount,
+      !outcome && Boolean(original.appeal_of_sub_key),
+    );
+    if (!eligibility.allowed) {
+      return respond(409, { error: eligibility.reason }, { "Cache-Control": "no-store" });
     }
+    // A reason-only appeal is valid: the author may believe the rejection was
+    // mistaken even when the task text itself should remain unchanged.
     const revisedAt = new Date().toISOString();
     const newSubmission = { ...original, task: safeTask, created_at: revisedAt };
-    delete newSubmission.quality_signals; // advisory — a revised task re-enters audit
-    // How long the author spent on this revision. Stored as the pair of stamps
-    // the reporting layer derives minutes from, never as a client-sent duration.
+    delete newSubmission.quality_signals;
     const editStartedAt = cleanText(body.edit_started_at, 60) || null;
-    // Stage stamps are per revision. The spread above copies the previous
-    // revision's, so a client that sends none would otherwise pair a stale start
-    // with this revision's created_at and report a fabricated duration.
     delete newSubmission.edit_started_at;
     delete newSubmission.appeal_started_at;
     if (editStartedAt) {
       newSubmission[eligibility.appeal ? "appeal_started_at" : "edit_started_at"] = editStartedAt;
     }
-    // The rejection this revision answers, so the author's own screen and the
-    // reporting feed can tell an appeal apart from an ordinary revision.
-    //
-    // Carried forward, not recomputed: only the revision made directly from the
-    // rejection sees outcome "rejected". Once it is in the queue the author can
-    // keep editing, and each of those revisions looks like an ordinary pending
-    // edit — so without inheriting this, a second edit would drop the marker and
-    // hand the appeal straight back to the reviewer who rejected it.
+    const priorAuthorRevisionNumber = Math.max(
+      0,
+      Math.floor(Number(original.author_revision_number) || 0),
+      Number(original.appeal_number) > 0 || original.edit_started_at ? 1 : 0,
+    );
+    const priorAuthorRequeueCount = Math.max(
+      0,
+      Math.floor(Number(original.author_requeue_count) || 0),
+      original.edit_started_at ? 1 : 0,
+    );
+    newSubmission.author_revision_of_sub_key = newest;
+    newSubmission.author_revision_number = priorAuthorRevisionNumber + 1;
+    newSubmission.author_requeue_count = priorAuthorRequeueCount + (eligibility.appeal ? 0 : 1);
+    if (!eligibility.appeal) newSubmission.author_requeued_at = revisedAt;
     let rejectedByPid = "";
     if (eligibility.appeal) {
-      const rejectedDoc = newestDone?.target
-        ? await readJson(newestDone.target).then(({ json }) => json).catch(() => null)
-        : null;
-      rejectedByPid = cleanText(rejectedDoc?.rejected_by_pid, 80) || "";
+      rejectedByPid = verifiedAppealRejecterPid;
       newSubmission.appeal_of_sub_key = newest;
       newSubmission.appeal_number = rejectionCount;
-      // Only this revision is the appeal itself. appeal_of_sub_key rides along
-      // on later edits so routing keeps working, so the timeline needs its own
-      // marker or every subsequent edit would read as another appeal.
       newSubmission.appeal_submission = true;
+      newSubmission.appeal_reason = requestedAppealReason;
     } else if (original.appeal_of_sub_key) {
-      rejectedByPid = (await readJson(appealKeyFor(newest))
-        .then(({ json }) => cleanText(json?.rejected_by_pid, 80))
-        .catch(() => "")) || "";
+      rejectedByPid = await rejectedByPidForAppeal(newest, original.appeal_of_sub_key, doneByEncodedKey);
       newSubmission.appeal_of_sub_key = original.appeal_of_sub_key;
       newSubmission.appeal_number = Number(original.appeal_number) || 1;
+      newSubmission.appeal_reason = cleanAppealReason(original.appeal_reason);
       delete newSubmission.appeal_submission;
+    } else {
+      delete newSubmission.appeal_reason;
+    }
+    if (!appealRevisionCanPublish(newSubmission, rejectedByPid)) {
+      return respond(409, {
+        error: "This appeal cannot be queued until its reviewer routing record is repaired. Ask the task lead to unlock it.",
+      }, { "Cache-Control": "no-store" });
     }
     if (JSON.stringify(newSubmission).length > 512 * 1024) {
       return respond(400, { error: "edited payload too large (512KB max)" }, { "Cache-Control": "no-store" });
     }
-    // Same task directory via the shared key-builder: the directory MUST match
-    // the original so reviewUnitForKey keeps the revision in the same unit.
-    const dir = sub_key.slice(0, sub_key.lastIndexOf("/"));
-    const baseFilename = sub_key
-      .slice(sub_key.lastIndexOf("/") + 1)
+    const baseFilename = newest
+      .slice(newest.lastIndexOf("/") + 1)
       .replace(/^\d+(?:-[A-Za-z0-9]+)?_/, "");
-    const participantIdFromKey = participantIdFromSubKey(sub_key);
+    const participantIdFromKey = participantIdFromSubKey(newest);
     const taskId = dir.slice(`${UPLOAD_PREFIX}${participantIdFromKey}/`.length);
     const newSubKey = uploadObjectKey(participantIdFromKey, taskId, baseFilename);
     await s3.send(new PutObjectCommand({
@@ -3685,70 +6055,37 @@ async function handleReview(path, body) {
       ContentType: "application/json",
       IfNoneMatch: "*",
     }));
-    // Inbox marker so the new revision enters the review queue. The old marker
-    // is removed for cleanliness; the old submission object is never deleted
-    // (immutability/audit).
-    const markerWritten = await s3
-      .send(new PutObjectCommand({
-        Bucket: S3_BUCKET,
-        Key: inboxKeyFor(newSubKey),
-        Body: newSubKey,
-        ContentType: "text/plain",
-        IfNoneMatch: "*",
-      }))
-      .then(() => true)
-      .catch((err) => isConditionalConflict(err));
-    // Only once the new marker exists. The reviewable unit is assembled from
-    // inbox markers alone, so dropping the old one after a failed write would
-    // remove the task from the author's list, the reviewer queue and the admin
-    // dashboard in one go, with no way back to it. A stale extra marker is
-    // harmless by comparison — the unit resolves on its newest file.
+    const { markerWritten, appealRouted } = await publishStoredAuthorRevision({
+      subKey: newSubKey,
+      revision: newSubmission,
+      previousSubKey: newest,
+      rejectedByPid,
+    });
     if (markerWritten) {
-      await s3
-        .send(new DeleteObjectCommand({ Bucket: S3_BUCKET, Key: inboxKeyFor(newest) }))
-        .catch(() => {});
+      const indexItem = buildAdminItemFromDocuments({
+        source: newSubmission,
+        sourceKey: newSubKey,
+        submittedAt: revisedAt,
+      });
+      await putDashboardIndexItem(indexItem)
+        .catch((error) => console.error("Dashboard author revision index update failed", error));
+      adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
     }
-    // A small side marker the claim path reads, so an appeal is never offered
-    // back to the reviewer who rejected it. Kept out of the submission body:
-    // /review/claim would otherwise have to read every candidate task to route.
-    let appealRouted = false;
-    if (newSubmission.appeal_of_sub_key) {
-      appealRouted = await s3
-        .send(new PutObjectCommand({
-          Bucket: S3_BUCKET,
-          Key: appealKeyFor(newSubKey),
-          Body: JSON.stringify({
-            sub_key: newSubKey,
-            appeal_of: newSubmission.appeal_of_sub_key,
-            rejected_by_pid: rejectedByPid,
-            created_at: revisedAt,
-          }),
-          ContentType: "application/json",
-          IfNoneMatch: "*",
-        }))
-        .then(() => true)
-        .catch(() => false);
+    return respond(markerWritten ? 200 : 503, {
+      ok: markerWritten,
+      ...(markerWritten ? {} : { error: "Your revision was saved but could not be queued safely. Retry to finish publishing it." }),
+      new_sub_key: newSubKey,
+      new_content_hash: newContentHash,
+      status: markerWritten ? "awaiting_codex" : "revision_saved_unqueued",
+      queued: markerWritten,
+      appeal: Boolean(newSubmission.appeal_of_sub_key),
+      appeal_routed: appealRouted,
+    }, { "Cache-Control": "no-store" });
+    } finally {
+      await releaseAuthorMutationLock(sub_key, mutationLock);
     }
-    return respond(
-      200,
-      {
-        ok: true,
-        new_sub_key: newSubKey,
-        new_content_hash: newContentHash,
-        status: "awaiting_codex",
-        appeal: Boolean(newSubmission.appeal_of_sub_key),
-        // False when the marker did not land: the revision is in the queue, but
-        // nothing is keeping the original rejecter from claiming it.
-        appeal_routed: appealRouted,
-      },
-      { "Cache-Control": "no-store" }
-    );
   }
 
-  // Author sign-off: "I have read what the reviewer did to my task and I accept
-  // it." An immutable receipt, nothing else — final gold is untouched. Pairs
-  // with /review/author-amend, which is the same acknowledgement expressed as
-  // an edit.
   if (path === "/review/author-signoff") {
     const { sub_key } = body;
     const participantId = String(body.participant_id || "").trim().toLowerCase();
@@ -3759,9 +6096,11 @@ async function handleReview(path, body) {
     if (participantIdFromSubKey(sub_key) !== participantId) {
       return respond(403, { error: "You can only sign off your own tasks" }, { "Cache-Control": "no-store" });
     }
-    // Keyed on the unit's newest submission, not on whatever sub_key the client
-    // held: /review/my-tasks decides needs_signoff against `newest`, so a receipt
-    // written under a stale key would leave the row in the queue forever.
+    const mutationLock = await acquireAuthorMutationLock(sub_key, `author:${participantId}:signoff`);
+    if (!mutationLock) {
+      return respond(409, { error: "This task is being changed or reopened. Retry in a moment." }, { "Cache-Control": "no-store" });
+    }
+    try {
     const unit = reviewUnitForKey(sub_key);
     const { byTaskDir } = await loadReviewIndex();
     const newest = byTaskDir.get(unit)?.newest ?? sub_key;
@@ -3772,35 +6111,62 @@ async function handleReview(path, body) {
     const finished = done?.target
       ? await readJson(done.target).then(({ json }) => json).catch(() => null)
       : null;
+    if (!finished) {
+      return respond(503, { error: "Approved final task is temporarily unavailable. Retry before signing off." }, { "Cache-Control": "no-store" });
+    }
     const signedOffAt = new Date().toISOString();
+    let priorReceipt = null;
+    try {
+      priorReceipt = await readJson(authorSignoffKeyFor(newest)).then(({ json }) => json);
+    } catch (error) {
+      if (!isMissingObjectError(error)) {
+        return respond(503, { error: "Existing author sign-off is temporarily unavailable. Retry." }, { "Cache-Control": "no-store" });
+      }
+    }
+    const effectiveAction = priorReceipt?.action === "amended"
+      || unchangedAmendSignoffAction(finished, participantId) === "amended"
+      ? "amended"
+      : "accepted";
+    const effectiveSignedOffAt = cleanText(priorReceipt?.signed_off_at, 60) || signedOffAt;
+    let authorApproved;
+    try {
+      authorApproved = await writeAuthorApprovedFinal({
+        finished,
+        finalGoldKey: done.target,
+        subKey: newest,
+        taskId: cleanText(done?.task_id, 300),
+        participantId,
+        action: effectiveAction,
+        approvedAt: effectiveSignedOffAt,
+      });
+    } catch (error) {
+      console.error("Author-approved final write failed", error);
+      return respond(503, { error: "The final author-approved copy could not be stored. Retry." }, { "Cache-Control": "no-store" });
+    }
     const { receipt, created } = await writeAuthorSignoff({
       subKey: newest,
       taskId: cleanText(done?.task_id, 300),
       participantId,
       action: "accepted",
       contentHash: cleanText(finished?.review_content_hash, 80) || "",
-      // The pair the reporting layer derives signoff_minutes from. Client-sent
-      // durations are never trusted; stageMinutes drops an implausible span.
       openedAt: cleanText(body.opened_at, 60) || null,
-      at: signedOffAt,
+      at: effectiveSignedOffAt,
     });
-    return respond(
-      200,
-      {
-        ok: true,
-        ...(created ? {} : { idempotent: true }),
-        action: receipt?.action ?? "accepted",
-        signed_off_at: receipt?.signed_off_at ?? signedOffAt,
-      },
-      { "Cache-Control": "no-store" }
-    );
+    await refreshAuthorDashboardIndex(newest, done, finished, receipt)
+      .catch((error) => console.error("Dashboard author sign-off index update failed", error));
+    adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
+    return respond(200, {
+      ok: true,
+      ...(created ? {} : { idempotent: true }),
+      action: receipt?.action ?? "accepted",
+      signed_off_at: receipt?.signed_off_at ?? effectiveSignedOffAt,
+      author_approved_key: authorApproved.key,
+    }, { "Cache-Control": "no-store" });
+    } finally {
+      await releaseAuthorMutationLock(sub_key, mutationLock);
+    }
   }
 
-  // Author amendment: the author's correction of their own approved task
-  // becomes the new final gold, with no second reviewer pass. This is a
-  // deliberate departure from "only reviewers write final gold" — see
-  // QUALITY_CONTROL.md. The reviewer's audit of the original submission is
-  // preserved inside the doc; only the task body moves.
   if (path === "/review/author-amend") {
     const { sub_key, edited } = body;
     const participantId = String(body.participant_id || "").trim().toLowerCase();
@@ -3818,6 +6184,11 @@ async function handleReview(path, body) {
     if (!String(safeTask.agent_request).trim()) {
       return respond(400, { error: "agent_request is required" }, { "Cache-Control": "no-store" });
     }
+    const mutationLock = await acquireAuthorMutationLock(sub_key, `author:${participantId}:amend`);
+    if (!mutationLock) {
+      return respond(409, { error: "This task is being changed or reopened. Retry in a moment." }, { "Cache-Control": "no-store" });
+    }
+    try {
     const unit = reviewUnitForKey(sub_key);
     const { byTaskDir, lockSet, doneByEncodedKey } = await loadReviewIndex({
       readDoneRecords: true,
@@ -3839,9 +6210,6 @@ async function handleReview(path, body) {
       return respond(404, { error: "Final gold not found" }, { "Cache-Control": "no-store" });
     }
     const amendedTask = finalGoldTaskFromAuthorEdit(existing.task, safeTask);
-    // Hashed the same way /review/submit hashes final gold, over the same
-    // fields in the same order. Deriving it differently here would leave two
-    // incompatible values in one field and break the no-op check below.
     const contentHash = reviewContentHash({
       schema_version: existing.schema_version,
       task_id: existing.task_id,
@@ -3850,25 +6218,54 @@ async function handleReview(path, body) {
       review: existing.review ?? {},
     });
     const amendedAt = new Date().toISOString();
-    // The author opened the form, read the reviewer's version and saved it back
-    // unchanged. That is an acceptance, not a no-op: skip the revision, but
-    // still record the sign-off, or the task sits in their queue forever while
-    // the screen tells them it was saved.
     if (existing.review_content_hash === contentHash) {
-      await writeAuthorSignoff({
+      const signoffAction = unchangedAmendSignoffAction(existing, participantId);
+      let priorReceipt = null;
+      try {
+        priorReceipt = await readJson(authorSignoffKeyFor(newest)).then(({ json }) => json);
+      } catch (error) {
+        if (!isMissingObjectError(error)) {
+          return respond(503, { error: "Existing author sign-off is temporarily unavailable. Retry." }, { "Cache-Control": "no-store" });
+        }
+      }
+      const effectiveSignedOffAt = cleanText(priorReceipt?.signed_off_at, 60)
+        || cleanText(existing.amended_at, 60)
+        || amendedAt;
+      let authorApproved;
+      try {
+        authorApproved = await writeAuthorApprovedFinal({
+          finished: existing,
+          finalGoldKey: finishedKey,
+          subKey: newest,
+          taskId: cleanText(done?.task_id, 300),
+          participantId,
+          action: signoffAction,
+          approvedAt: effectiveSignedOffAt,
+        });
+      } catch (error) {
+        console.error("No-op amendment author-approved final write failed", error);
+        return respond(503, { error: "The final author-approved copy could not be stored. Retry." }, { "Cache-Control": "no-store" });
+      }
+      const { receipt } = await writeAuthorSignoff({
         subKey: newest,
         taskId: cleanText(done?.task_id, 300),
         participantId,
-        action: "accepted",
+        action: signoffAction,
         contentHash,
         openedAt: cleanText(body.opened_at, 60) || null,
-        at: amendedAt,
+        at: effectiveSignedOffAt,
       });
-      return respond(
-        200,
-        { ok: true, idempotent: true, action: "accepted", revision_count: finalGoldRevision(existing), new_content_hash: contentHash },
-        { "Cache-Control": "no-store" }
-      );
+      await refreshAuthorDashboardIndex(newest, done, existing, receipt)
+        .catch((error) => console.error("Dashboard no-op author amend index update failed", error));
+      adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
+      return respond(200, {
+        ok: true,
+        idempotent: true,
+        action: receipt?.action ?? signoffAction,
+        revision_count: finalGoldRevision(existing),
+        new_content_hash: contentHash,
+        author_approved_key: authorApproved.key,
+      }, { "Cache-Control": "no-store" });
     }
     const doc = buildAmendedFinalGold({
       existing,
@@ -3880,10 +6277,6 @@ async function handleReview(path, body) {
     if (JSON.stringify(doc).length > 512 * 1024) {
       return respond(400, { error: "amended payload too large (512KB max)" }, { "Cache-Control": "no-store" });
     }
-    // Archive first, then replace. The archive is a conditional create, so two
-    // concurrent amendments cannot both claim the same revision number; the
-    // replace is an If-Match on the version that was archived, so neither can
-    // overwrite the other's result.
     const archiveKey = finishedHistoryKeyFor(done.task_id || "task-unknown", finalGoldRevision(existing));
     const archived = await tryConditionalWrite(() => s3.send(new PutObjectCommand({
       Bucket: S3_BUCKET,
@@ -3893,11 +6286,6 @@ async function handleReview(path, body) {
       IfNoneMatch: "*",
     })));
     if (!archived) {
-      // An archive already exists for this revision. Either another amendment is
-      // mid-flight, or an earlier attempt archived and then failed to replace —
-      // a timeout or a throttle — which would otherwise wedge this task at 409
-      // forever, since every retry recomputes the same key. Resume when the
-      // archived copy is the version being replaced; refuse only when it is not.
       const archivedDoc = await readJson(archiveKey).then(({ json }) => json).catch(() => null);
       if (archivedDoc?.review_content_hash !== existing.review_content_hash) {
         return respond(409, { error: "Another amendment of this task is already in flight." }, { "Cache-Control": "no-store" });
@@ -3913,11 +6301,22 @@ async function handleReview(path, body) {
     if (!replaced) {
       return respond(409, { error: "This task changed while you were editing. Reload and try again." }, { "Cache-Control": "no-store" });
     }
-    // An amendment is itself a sign-off: the author read the reviewer's version
-    // and responded to it. It supersedes an earlier "accepted" receipt — an
-    // author may accept a task and amend it later, and a receipt still claiming
-    // they accepted would describe a version that no longer exists.
-    await writeAuthorSignoff({
+    let authorApproved;
+    try {
+      authorApproved = await writeAuthorApprovedFinal({
+        finished: doc,
+        finalGoldKey: finishedKey,
+        subKey: newest,
+        taskId: cleanText(done?.task_id, 300),
+        participantId,
+        action: "amended",
+        approvedAt: amendedAt,
+      });
+    } catch (error) {
+      console.error("Author amendment final copy write failed", error);
+      return respond(503, { error: "Your amendment was saved, but the final author-approved copy still needs to be stored. Retry." }, { "Cache-Control": "no-store" });
+    }
+    const { receipt } = await writeAuthorSignoff({
       subKey: newest,
       taskId: cleanText(done?.task_id, 300),
       participantId,
@@ -3926,28 +6325,208 @@ async function handleReview(path, body) {
       openedAt: cleanText(body.opened_at, 60) || null,
       at: amendedAt,
     });
-    return respond(
-      200,
-      { ok: true, revision_count: doc.revision_count, new_content_hash: contentHash, amended_at: amendedAt },
-      { "Cache-Control": "no-store" }
-    );
+    await refreshAuthorDashboardIndex(newest, done, doc, receipt)
+      .catch((error) => console.error("Dashboard author amendment index update failed", error));
+    adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
+    return respond(200, {
+      ok: true,
+      revision_count: doc.revision_count,
+      new_content_hash: contentHash,
+      amended_at: amendedAt,
+      author_approved_key: authorApproved.key,
+    }, { "Cache-Control": "no-store" });
+    } finally {
+      await releaseAuthorMutationLock(sub_key, mutationLock);
+    }
   }
 
-  // Reviewer "return to author": mirrors /review/reject's lock handling and
-  // idempotent retry, but writes a returned record and a done-record with
-  // outcome "returned". No reviewer credit — a return isn't a finished review.
+  if (path === "/review/my-tasks") {
+    const participantId = String(body.participant_id || "").trim().toLowerCase();
+    if (!VALID_PID.test(participantId)) {
+      return respond(400, { error: "Invalid participant_id" }, { "Cache-Control": "no-store" });
+    }
+    const { byTaskDir, lockSet, doneByEncodedKey, inboxAge } = await loadReviewIndex({
+      readDoneRecords: true,
+      doneRecordFilter: (key) => participantIdFromSubKey(key) === participantId,
+    });
+    const ownUnits = [];
+    for (const { newest, oldestAt } of byTaskDir.values()) {
+      if (participantIdFromSubKey(newest) === participantId) ownUnits.push({ newest, oldestAt });
+    }
+    ownUnits.sort((a, b) => b.oldestAt - a.oldestAt || b.newest.localeCompare(a.newest));
+    const sourceTotal = ownUnits.length;
+    const offset = Math.max(0, Number(body.offset) || 0);
+    const limit = Math.min(200, Math.max(1, Number(body.limit) || 50));
+    const pageUnits = ownUnits.slice(offset, offset + limit);
+    const audited = await completedPreQcSubmissionKeys(pageUnits.map((unit) => unit.newest));
+    const signoffObjects = await listAllObjects(AUTHOR_SIGNOFF_PREFIX);
+    const signoffKeys = new Set();
+    for (const object of signoffObjects) {
+      const encoded = object.Key.slice(AUTHOR_SIGNOFF_PREFIX.length).replace(/\.json$/, "");
+      try {
+        signoffKeys.add(fromB64url(encoded));
+      } catch {
+        // Ignore malformed receipts.
+      }
+    }
+    let approvedTotal = 0;
+    let awaitingSignoffTotal = 0;
+    for (const { newest } of ownUnits) {
+      if (doneOutcome(doneByEncodedKey.get(b64url(newest)) ?? null) !== "approved") continue;
+      approvedTotal += 1;
+      if (!signoffKeys.has(newest)) awaitingSignoffTotal += 1;
+    }
+    const rejectionsInUnit = new Map();
+    for (const [encoded, record] of doneByEncodedKey.entries()) {
+      if (doneOutcome(record) !== "rejected") continue;
+      try {
+        const unit = reviewUnitForKey(fromB64url(encoded));
+        rejectionsInUnit.set(unit, (rejectionsInUnit.get(unit) ?? 0) + 1);
+      } catch {
+        // Ignore malformed done keys.
+      }
+    }
+    const buildItem = async ({ newest }) => {
+      const done = doneByEncodedKey.get(b64url(newest)) ?? null;
+      const outcome = doneOutcome(done);
+      let status;
+      if (outcome === "approved") status = "approved";
+      else if (outcome === "rejected") status = "rejected";
+      else if (outcome === "returned") status = "returned";
+      else if (lockSet.has(b64url(newest))) status = "in_review";
+      else if (audited.has(newest)) status = "pending";
+      else status = "awaiting_codex";
+      const source = await readJson(newest).then(({ json }) => json).catch(() => null);
+      const task = source?.task ?? source;
+      const original = cleanTaskSnapshot(task);
+      const rubrics = cleanRubrics(null, original, null);
+      const contentHash = original ? reportingTaskContentHash(original, null, rubrics) : null;
+      const submittedAt = source?.created_at
+        || (inboxAge.has(newest) ? new Date(inboxAge.get(newest)).toISOString() : null);
+      const item = {
+        task_id: cleanText(source?.task_id, 300),
+        sub_key: newest,
+        title: cleanText(task?.task_title ?? task?.title, 300),
+        request: String(task?.agent_request ?? task?.request ?? "").slice(0, 300),
+        status,
+        submitted_at: submittedAt || null,
+        content_hash: contentHash,
+      };
+      const rejectionCount = rejectionsInUnit.get(reviewUnitForKey(newest)) ?? 0;
+      item.rejection_count = rejectionCount;
+      if (status === "approved" && done?.target) {
+        const finished = await readJson(done.target).then(({ json }) => json).catch(() => null);
+        item.reviewer_changed = reviewerChangedTask(finished);
+        item.revision_count = finalGoldRevision(finished);
+        item.signed_off_at = "";
+        item.signoff_action = "";
+        item.needs_signoff = !signoffKeys.has(newest);
+      }
+      if (status === "rejected" && done?.target) {
+        const rejected = await readJson(done.target).then(({ json }) => json).catch(() => null);
+        item.rejection_reason = cleanText(rejected?.reason, 500) || "";
+        item.can_appeal = rejectionCanAppeal(rejectionCount, rejected);
+        if (rejectionCount === 1 && !item.can_appeal) {
+          item.appeal_unavailable_reason = "This rejection cannot be appealed yet. Ask the task lead to unlock it.";
+        }
+      }
+      if (status === "returned" && done?.target) {
+        const returned = await readJson(done.target).then(({ json }) => json).catch(() => null);
+        item.returned_reason = cleanText(returned?.reason, 500) || "";
+      }
+      return item;
+    };
+    const items = [];
+    for (let index = 0; index < pageUnits.length; index += 25) {
+      items.push(...(await Promise.all(pageUnits.slice(index, index + 25).map(buildItem))));
+    }
+    const signedRows = items.filter((item) => item.status === "approved" && !item.needs_signoff);
+    for (let index = 0; index < signedRows.length; index += 25) {
+      await Promise.all(signedRows.slice(index, index + 25).map(async (item) => {
+        const receipt = await readJson(authorSignoffKeyFor(item.sub_key))
+          .then(({ json }) => json)
+          .catch(() => null);
+        item.signed_off_at = cleanText(receipt?.signed_off_at, 60) || "";
+        item.signoff_action = cleanText(receipt?.action, 20) || "";
+      }));
+    }
+    return respond(200, {
+      items,
+      offset,
+      limit,
+      source_total: sourceTotal,
+      approved_total: approvedTotal,
+      awaiting_signoff_total: awaitingSignoffTotal,
+    }, { "Cache-Control": "no-store" });
+  }
+
+  if (path === "/review/my-task-feedback") {
+    const { sub_key } = body;
+    const participantId = String(body.participant_id || "").trim().toLowerCase();
+    if (!sub_key) return respond(400, { error: "sub_key required" }, { "Cache-Control": "no-store" });
+    if (!VALID_PID.test(participantId)) {
+      return respond(400, { error: "Invalid participant_id" }, { "Cache-Control": "no-store" });
+    }
+    if (participantIdFromSubKey(sub_key) !== participantId) {
+      return respond(403, { error: "You can only view your own tasks" }, { "Cache-Control": "no-store" });
+    }
+    const preQc = await preQcReviewForClaimedTask(sub_key);
+    const source = await readJson(sub_key).then(({ json }) => json).catch(() => null);
+    const done = await readDoneRecord(sub_key);
+    const outcome = doneOutcome(done);
+    const response = {
+      status: preQc.status,
+      stale: preQc.stale,
+      task_content_hash: preQc.task_content_hash,
+      review: preQc.review,
+      task: authoredTaskContentForResponse(source?.task ?? source),
+    };
+    if (outcome === "approved" && done?.target) {
+      response.status = "approved";
+      const finished = await readJson(done.target).then(({ json }) => json).catch(() => null);
+      const humanReview = buildHumanReviewForAuthor(finished, source);
+      if (humanReview) response.human_review = humanReview;
+      response.final_task = authoredTaskContentForResponse(finished?.task ?? null);
+      const receipt = await readJson(authorSignoffKeyFor(sub_key))
+        .then(({ json }) => json)
+        .catch(() => null);
+      response.signed_off_at = cleanText(receipt?.signed_off_at, 60) || "";
+      response.signoff_action = cleanText(receipt?.action, 20) || "";
+      response.needs_signoff = !receipt;
+    } else if (outcome === "rejected" && done?.target) {
+      response.status = "rejected";
+      const rejected = await readJson(done.target).then(({ json }) => json).catch(() => null);
+      response.rejection_reason = cleanText(rejected?.reason, 500) || "";
+      const feedback = buildRejectionFeedbackForAuthor(rejected, source);
+      if (feedback) response.rejection_feedback = feedback;
+    } else if (outcome === "returned" && done?.target) {
+      response.status = "returned";
+      const returned = await readJson(done.target).then(({ json }) => json).catch(() => null);
+      response.returned_reason = cleanText(returned?.reason, 500) || "";
+    }
+    response.history = await authorTaskHistory(sub_key);
+    return respond(200, response, { "Cache-Control": "no-store" });
+  }
+
   if (path === "/review/return-to-author") {
     const { sub_key, token, task_id, reason } = body;
-    if (!sub_key || !token) return respond(400, { error: "sub_key and token required" }, { "Cache-Control": "no-store" });
+    if (!sub_key || !token) {
+      return respond(400, { error: "sub_key and token required" }, { "Cache-Control": "no-store" });
+    }
     const returnReason = String(reason || "").trim();
     if (returnReason.length < 3) {
       return respond(400, { error: "A return reason is required" }, { "Cache-Control": "no-store" });
     }
-    const taskId = String(task_id || "task-unknown").replace(/[^A-Za-z0-9_-]/g, "_");
+    const rawTaskId = String(task_id || "task-unknown");
+    const taskId = rawTaskId.replace(/[^A-Za-z0-9_-]/g, "_");
     const returnedKey = `${REVIEW_PREFIX}returned/${b64url(sub_key)}.json`;
     const contentHash = reviewContentHash({ task_id: taskId, reason: returnReason.slice(0, 500) });
-    // As with reject, a byte-identical retry must succeed after the first
-    // request committed and removed its lock but lost the HTTP response.
+    const decisionPid = await reviewerPidForDecision(sub_key, token, reviewerPid);
+    const mutationLock = await acquireAuthorMutationLock(sub_key, `reviewer:${decisionPid || reviewer}:return`);
+    if (!mutationLock) {
+      return respond(409, { error: "This task is being changed or reopened. Retry in a moment." }, { "Cache-Control": "no-store" });
+    }
+    try {
     const existingDone = await readDoneRecord(sub_key);
     if (existingDone) {
       if (existingDone.target !== returnedKey || (existingDone.outcome && existingDone.outcome !== "returned")) {
@@ -3958,31 +6537,36 @@ async function handleReview(path, body) {
       }
       const retryEtag = await verifyLock(sub_key, token);
       if (retryEtag) await deleteLockIfUnchanged(sub_key, retryEtag);
+      await setDashboardIndexStatus(rawTaskId, "pending", { expected_source_key: sub_key })
+        .catch((error) => console.error("Dashboard return index update failed", error));
       return respond(200, { ok: true, returned_key: returnedKey, idempotent: true }, { "Cache-Control": "no-store" });
     }
-    let etag = await verifyLock(sub_key, token);
-    if (!etag) return respond(409, { error: "Lock not held by you (it may have expired)" }, { "Cache-Control": "no-store" });
+    let etag = await verifyCurrentReviewDecision(sub_key, token);
+    if (!etag) {
+      return respond(409, { error: "Lock not held by you (it may have expired)" }, { "Cache-Control": "no-store" });
+    }
     const claimedAt = await lockClaimedAt(sub_key);
     etag = await beginFinalization(sub_key, token, reviewer, "returned", contentHash);
-    if (!etag) return respond(409, { error: "Another edit or outcome is already being submitted" }, { "Cache-Control": "no-store" });
+    if (!etag) {
+      return respond(409, { error: "Another edit or outcome is already being submitted" }, { "Cache-Control": "no-store" });
+    }
     let completedAt = new Date().toISOString();
     const returnedDoc = {
       sub_key,
       task_id: taskId,
       reason: returnReason.slice(0, 500),
       returned_by: reviewer,
+      returned_by_pid: decisionPid,
       content_hash: contentHash,
       returned_at: completedAt,
     };
-    const createdReturned = await tryConditionalWrite(() => s3.send(
-      new PutObjectCommand({
-        Bucket: S3_BUCKET,
-        Key: returnedKey,
-        Body: JSON.stringify(returnedDoc, null, 2),
-        ContentType: "application/json",
-        IfNoneMatch: "*",
-      })
-    ));
+    const createdReturned = await tryConditionalWrite(() => s3.send(new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: returnedKey,
+      Body: JSON.stringify(returnedDoc, null, 2),
+      ContentType: "application/json",
+      IfNoneMatch: "*",
+    })));
     if (!createdReturned) {
       const existingReturned = await readJson(returnedKey).then(({ json }) => json).catch(() => null);
       if (!existingReturned || existingReturned.content_hash !== contentHash) {
@@ -3994,19 +6578,23 @@ async function handleReview(path, body) {
       target: returnedKey,
       outcome: "returned",
       reviewer,
+      reviewer_pid: decisionPid,
       task_id: taskId,
       completed_at: completedAt,
       content_hash: contentHash,
-      // Copied off the lock before it is deleted: the pair (claimed_at,
-      // completed_at) is the only durable record of how long a review took.
       claimed_at: claimedAt,
     });
     if (done.target !== returnedKey || done.outcome !== "returned" || (done.content_hash && done.content_hash !== contentHash)) {
       return respond(409, { error: "This task was already finished by another reviewer" }, { "Cache-Control": "no-store" });
     }
-    // Returns are not finished reviews — do not inflate reviewerTotals.
     await deleteLockIfUnchanged(sub_key, etag);
+    await setDashboardIndexStatus(rawTaskId, "pending", { expected_source_key: sub_key })
+      .catch((error) => console.error("Dashboard return index update failed", error));
+    adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
     return respond(200, { ok: true, returned_key: returnedKey }, { "Cache-Control": "no-store" });
+    } finally {
+      await releaseAuthorMutationLock(sub_key, mutationLock);
+    }
   }
 
   return respond(404, { error: `Unknown review route ${path}` });
@@ -4016,6 +6604,13 @@ async function handleReview(path, body) {
 
 export const handler = async (event) => {
   try {
+    // Scheduled refresh (EventBridge rule) — not an HTTP request.
+    if (event?.source === "aws.events" || event?.action === "refresh-admin-snapshot") {
+      if (!S3_BUCKET) return { ok: false, error: "Missing S3_BUCKET env var" };
+      const result = await refreshAdminDashboardSnapshot();
+      console.log("admin snapshot refreshed", JSON.stringify(result));
+      return { ok: true, ...result };
+    }
     const method = event.requestContext?.http?.method || "POST";
     const path = event.rawPath || event.requestContext?.http?.path || "/presign";
     if (method === "OPTIONS") {
@@ -4091,6 +6686,14 @@ export const handler = async (event) => {
       }
     }
 
+    // A dedicated Apollo PC deployment uses the same reviewed implementation
+    // and bucket, but must never accept v2 or legacy uploads. The primary
+    // deployment accepts legacy/v2 traffic while refusing PC uploads, so a
+    // misconfigured PC build cannot silently rejoin the v2 queue.
+    if (!uploadScopeAllows(APP_SCOPE, isV2, isPC)) {
+      return respond(400, { error: `This upload type is not enabled for the ${APP_SCOPE} API` });
+    }
+
     // Timestamp keeps retry ordering stable; the nonce prevents same-millisecond
     // concurrent presigns from targeting the same S3 object.
     const key = uploadObjectKey(participantId, taskId, filename);
@@ -4129,7 +6732,7 @@ export const handler = async (event) => {
     // PC review sidecars contain authored task text only — never participant
     // identity, mail, calendar records, aliases, or expected answers. The PC
     // client uploads them after the manifest, so the private bundle is already
-    // complete before a task can enter the shared review queue.
+    // complete before a task can enter the PC-only review queue.
     if (isPC && /^review_task_[A-Za-z0-9_-]{1,120}\.json$/.test(String(filename))) {
       await s3
         .send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: inboxKeyFor(key), Body: key, ContentType: "text/plain" }))

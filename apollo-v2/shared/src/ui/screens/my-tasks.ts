@@ -22,22 +22,13 @@ import {
   type LlmPanelStatus,
 } from "../components/llm-panel";
 import { participantId as schemaParticipantId } from "../../schema";
-import { alignCriteria, alignSteps, summarizeChanges, type StepDiffRow } from "../../diff";
-import { redlineBlock, redlineNodes } from "../components/redline";
+import { diffSummary, diffWords } from "../../textdiff";
 
-const PAGE_SIZE = 50;
-
-// Unified redline or the old two-column view. Module-scoped on purpose: an
-// author works down a queue of approvals, so the choice should hold across rows
-// for the session. Nothing in shared/src uses localStorage and this is not the
-// place to start.
-type DiffView = "unified" | "split";
-let diffView: DiffView = "unified";
-
-/** Reset hook: the view is module state, so tests must not inherit it. */
-export function setDiffView(view: DiffView): void {
-  diffView = view;
-}
+// The backend caps this endpoint at 200. Loading the largest supported page
+// keeps search and status filters useful for almost every author without
+// making them page through a 50-row window first.
+const PAGE_SIZE = 200;
+const MIN_APPEAL_REASON_LENGTH = 20;
 
 const STATUS_LABEL: Record<MyTaskStatus, string> = {
   awaiting_codex: "Awaiting Codex",
@@ -47,6 +38,72 @@ const STATUS_LABEL: Record<MyTaskStatus, string> = {
   rejected: "Rejected",
   returned: "Returned",
 };
+
+export type MyTaskFilter = "all" | "action" | "in_progress" | "approved" | "rejected" | "returned";
+export type MyTaskSort = "newest" | "oldest" | "status";
+
+interface MyTasksViewState {
+  offset: number;
+  query: string;
+  filter: MyTaskFilter;
+  sort: MyTaskSort;
+  scrollTop: number;
+}
+
+// Screen instances can be rebuilt after notifications or route transitions.
+// Keep each signed-in author's place in memory so finishing a task on a later
+// page never silently drops them back at the beginning.
+const myTasksViewByParticipant = new Map<string, MyTasksViewState>();
+
+export function resetMyTasksViewState(participantId?: string): void {
+  if (participantId) myTasksViewByParticipant.delete(participantId);
+  else myTasksViewByParticipant.clear();
+}
+
+export function myTaskNeedsAction(item: MyTaskItem): boolean {
+  return Boolean(
+    item.needs_signoff
+      || item.status === "returned"
+      || (item.status === "rejected" && item.can_appeal)
+  );
+}
+
+export function filterAndSortMyTasks(
+  items: MyTaskItem[],
+  query: string,
+  filter: MyTaskFilter,
+  sort: MyTaskSort
+): MyTaskItem[] {
+  const needle = query.trim().toLowerCase();
+  const filtered = items.filter((item) => {
+    const matchesQuery = !needle || [
+      item.title,
+      item.request,
+      item.rejection_reason,
+      item.returned_reason,
+      STATUS_LABEL[item.status],
+    ].some((value) => String(value ?? "").toLowerCase().includes(needle));
+    if (!matchesQuery) return false;
+    if (filter === "action") return myTaskNeedsAction(item);
+    if (filter === "in_progress") {
+      return item.status === "awaiting_codex" || item.status === "pending" || item.status === "in_review";
+    }
+    return filter === "all" || item.status === filter;
+  });
+  const submittedAt = (item: MyTaskItem) => {
+    const parsed = Date.parse(item.submitted_at ?? "");
+    return Number.isFinite(parsed) ? parsed : 0;
+  };
+  return filtered.sort((a, b) => {
+    if (sort === "oldest") return submittedAt(a) - submittedAt(b) || a.title.localeCompare(b.title);
+    if (sort === "status") {
+      return Number(myTaskNeedsAction(b)) - Number(myTaskNeedsAction(a))
+        || STATUS_LABEL[a.status].localeCompare(STATUS_LABEL[b.status])
+        || submittedAt(b) - submittedAt(a);
+    }
+    return submittedAt(b) - submittedAt(a) || a.title.localeCompare(b.title);
+  });
+}
 
 function statusBadge(status: MyTaskStatus): HTMLElement {
   const cls =
@@ -71,6 +128,16 @@ export type EditMode = "revise" | "appeal" | "amend" | null;
 export function editModeFor(item: MyTaskItem): EditMode {
   if (item.status === "approved") return "amend";
   if (item.status === "rejected") return item.can_appeal ? "appeal" : null;
+  // Once a rejected task's appeal is queued, that revision is the author's
+  // one final pass. Do not offer another edit while it waits for Codex/QC.
+  // A reviewer may still explicitly return it, which opens the normal
+  // return-to-author correction flow.
+  if (
+    (item.status === "awaiting_codex" || item.status === "pending")
+    && (item.rejection_count ?? 0) > 0
+  ) {
+    return null;
+  }
   if (item.status === "awaiting_codex" || item.status === "pending" || item.status === "returned") {
     return "revise";
   }
@@ -126,185 +193,143 @@ function diffSnapshot(label: string, snap: MyTaskContentSnapshot, extraClass = "
   );
 }
 
-// The original two-column view. Named for what it actually does — it renders
-// two whole snapshots and diffs nothing — now that a real diff sits beside it.
-function renderSplitSnapshots(hr: MyTaskHumanReview): HTMLElement {
+export interface ApprovedReviewChange {
+  label: string;
+  before: string;
+  after: string;
+}
+
+export function approvedReviewChanges(hr: MyTaskHumanReview): ApprovedReviewChange[] {
+  const changes: ApprovedReviewChange[] = [];
+  const add = (label: string, before: string | undefined, after: string | undefined) => {
+    const prior = String(before ?? "");
+    const next = String(after ?? "");
+    if (prior !== next) changes.push({ label, before: prior, after: next });
+  };
+  add("Task title", hr.original.title, hr.final.title);
+  add("Task request", hr.original.request, hr.final.request);
+
+  const criterionCount = Math.max(hr.original.criteria.length, hr.final.criteria.length);
+  for (let index = 0; index < criterionCount; index += 1) {
+    add(`Success criterion ${index + 1}`, hr.original.criteria[index], hr.final.criteria[index]);
+  }
+
+  const originalSteps = new Map(hr.original.steps.map((step) => [step.order, step]));
+  const finalSteps = new Map(hr.final.steps.map((step) => [step.order, step]));
+  const stepOrders = [...new Set([...originalSteps.keys(), ...finalSteps.keys()])].sort((a, b) => a - b);
+  for (const order of stepOrders) {
+    const original = originalSteps.get(order);
+    const final = finalSteps.get(order);
+    add(`Step ${order} · title`, original?.title, final?.title);
+    add(`Step ${order} · instructions`, original?.description, final?.description);
+  }
+  return changes;
+}
+
+function inlineReviewDiff(change: ApprovedReviewChange): HTMLElement {
+  const ops = diffWords(change.before, change.after);
+  const copy = el("p", {
+    class: "my-task-change-copy inline-diff",
+    "aria-label": `${change.label} changed from ${change.before || "empty"} to ${change.after || "empty"}`,
+  });
+  for (const op of ops) {
+    if (op.type === "equal") copy.append(document.createTextNode(op.text));
+    else if (op.type === "delete") copy.append(el("del", { class: "diff-del" }, op.text));
+    else copy.append(el("ins", { class: "diff-ins" }, op.text));
+  }
+  return copy;
+}
+
+function changedField(change: ApprovedReviewChange): HTMLElement {
+  const kind = !change.before ? "Added" : !change.after ? "Removed" : "Edited";
+  return el(
+    "article",
+    { class: "my-task-change-field" },
+    el(
+      "div",
+      { class: "my-task-change-field-head" },
+      el("h5", null, change.label),
+      el("span", { class: `my-task-change-kind ${kind.toLowerCase()}` }, kind)
+    ),
+    inlineReviewDiff(change)
+  );
+}
+
+function renderDiff(hr: MyTaskHumanReview): HTMLElement {
   const finalLabel = hr.amended_by
     ? "Final gold · your amendment"
     : hr.changed === false
       ? "Final gold · unchanged"
       : "Final gold version";
-  return el(
-    "div",
-    { class: "admin-snapshots has-final my-task-diff" },
-    diffSnapshot(hr.title_edited || hr.request_edited ? "Your original" : "Your submission", hr.original),
-    diffSnapshot(finalLabel, hr.final, "final")
-  );
-}
-
-const ROW_CHIP: Record<Exclude<StepDiffRow["status"], "unchanged">, string> = {
-  changed: "edited",
-  added: "added",
-  removed: "removed",
-};
-
-function redlineRow(row: StepDiffRow, index: number): HTMLElement {
-  // Untouched rows fold away. On the common approval — one step edited out of
-  // ten — this is the difference between a screenful and a scroll.
-  if (row.status === "unchanged") {
+  const changes = approvedReviewChanges(hr);
+  if (!changes.length) {
     return el(
-      "li",
-      { class: "my-task-redline-row is-unchanged" },
-      el(
-        "details",
-        { class: "redline-unchanged" },
-        el(
-          "summary",
-          null,
-          el("span", { class: "rubric-num mono" }, String(index + 1)),
-          el("strong", null, row.title),
-          el("span", { class: "muted small" }, "unchanged")
-        ),
-        el("p", { class: "redline-text" }, row.after ?? "")
-      )
-    );
-  }
-
-  const body: (HTMLElement | string)[] =
-    row.status === "removed"
-      ? [el("del", { class: "redline-del" }, row.before ?? "")]
-      : row.status === "added"
-        ? [el("ins", { class: "redline-ins" }, row.after ?? "")]
-        : redlineNodes(row.before ?? "", row.after ?? "");
-
-  return el(
-    "li",
-    { class: `my-task-redline-row is-${row.status}` },
-    el(
-      "div",
-      { class: "my-task-redline-head" },
-      el("span", { class: "rubric-num mono" }, String(index + 1)),
-      el("strong", null, row.title),
-      el("span", { class: `chip tag redline-chip is-${row.status}` }, ROW_CHIP[row.status])
-    ),
-    el("p", { class: "redline-text" }, ...body)
-  );
-}
-
-function redlineSection(heading: string, rows: StepDiffRow[]): HTMLElement | null {
-  if (!rows.length) return null;
-  return el(
-    "div",
-    { class: "my-task-redline-section" },
-    el("h6", null, heading),
-    el("ol", { class: "my-task-redline-list" }, ...rows.map(redlineRow))
-  );
-}
-
-// One sentence naming what moved, so the author knows what to look for before
-// they start reading.
-function changeSummaryLine(hr: MyTaskHumanReview): string {
-  const summary = summarizeChanges(hr);
-  const parts: string[] = [];
-  if (summary.titleChanged) parts.push("the title");
-  if (summary.requestChanged) parts.push("the request");
-  if (summary.stepsChanged) {
-    parts.push(`${summary.stepsChanged} of ${summary.stepsTotal} ${summary.stepsTotal === 1 ? "step" : "steps"}`);
-  }
-  if (summary.criteriaChanged) {
-    parts.push(`${summary.criteriaChanged} success ${summary.criteriaChanged === 1 ? "criterion" : "criteria"}`);
-  }
-  if (!parts.length) return "Nothing changed.";
-  const listed = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
-  return `Changed: ${listed}.`;
-}
-
-function renderUnifiedRedline(hr: MyTaskHumanReview): HTMLElement {
-  const summary = summarizeChanges(hr);
-
-  // An untouched approval used to render two identical columns. There is
-  // nothing to compare, so show the task once and say so.
-  if (!summary.anyChange) {
-    return el(
-      "div",
-      { class: "my-task-redline-wrap" },
-      el("p", { class: "notice ok my-task-redline-none" }, "Approved as you wrote it — the reviewer changed nothing."),
-      diffSnapshot("Final gold · unchanged", hr.final, "final")
-    );
-  }
-
-  // After an amendment this is no longer purely the reviewer's doing: the
-  // frozen review block is never rewritten, so original → final now spans the
-  // author's own edit too. Say that rather than implying the reviewer did it.
-  const heading = hr.amended_by ? "Your original vs the current final gold" : "What the reviewer changed";
-  const note = hr.amended_by
-    ? "This includes your own amendment, not just the reviewer's edits."
-    : null;
-
-  return el(
-    "div",
-    { class: "my-task-redline-wrap" },
-    el(
       "section",
-      { class: "admin-snapshot my-task-redline" },
-      el("div", { class: "admin-snapshot-head" }, el("h5", null, heading)),
-      el("p", { class: "field-hint" }, changeSummaryLine(hr)),
-      note ? el("p", { class: "muted small" }, note) : null,
-      redlineBlock("Title", hr.original.title || "", hr.final.title || ""),
-      redlineBlock("Request", hr.original.request || "", hr.final.request || ""),
-      redlineSection("Success criteria", alignCriteria(hr)),
-      redlineSection("Steps", alignSteps(hr))
+      { class: "my-task-change-review unchanged" },
+      el(
+        "div",
+        { class: "my-task-change-head" },
+        el("div", null, el("p", { class: "eyebrow" }, "Review changes"), el("h4", null, "No text changed")),
+        el("span", { class: "chip tag" }, "0 edits")
+      ),
+      el("p", { class: "field-hint" }, "The title, request, success criteria, and steps match your submission."),
+      diffSnapshot(finalLabel, hr.final, "final")
+    );
+  }
+
+  const totals = changes.reduce(
+    (sum, change) => {
+      const count = diffSummary(diffWords(change.before, change.after));
+      return { inserted: sum.inserted + count.inserted, deleted: sum.deleted + count.deleted };
+    },
+    { inserted: 0, deleted: 0 }
+  );
+  const fullVersions = el(
+    "details",
+    { class: "my-task-full-compare" },
+    el("summary", null, "View complete versions side by side"),
+    el(
+      "div",
+      { class: "admin-snapshots has-final my-task-diff" },
+      diffSnapshot("Your original", hr.original),
+      diffSnapshot(finalLabel, hr.final, "final")
     )
   );
-}
-
-function diffViewToggle(onPick: () => void): HTMLElement {
-  const button = (view: DiffView, label: string) =>
+  return el(
+    "section",
+    { class: "my-task-change-review" },
     el(
-      "button",
-      {
-        class: `btn ghost tiny ${diffView === view ? "active" : ""}`.trim(),
-        type: "button",
-        "aria-pressed": diffView === view ? "true" : "false",
-        onclick: () => {
-          if (diffView === view) return;
-          diffView = view;
-          onPick();
-        },
-      },
-      label
-    );
-  return el(
-    "div",
-    { class: "my-task-diff-toggle" },
-    el("span", { class: "muted small" }, "View"),
-    button("unified", "Redline"),
-    button("split", "Side-by-side")
+      "div",
+      { class: "my-task-change-head" },
+      el(
+        "div",
+        null,
+        el("p", { class: "eyebrow" }, "Review changes"),
+        el("h4", null, `${changes.length} ${changes.length === 1 ? "field" : "fields"} edited`)
+      ),
+      el("span", { class: "my-task-change-volume mono" }, `+${totals.inserted} / −${totals.deleted} words`)
+    ),
+    el(
+      "div",
+      { class: "my-task-diff-legend", "aria-label": "Diff legend" },
+      el("span", null, el("i", { class: "diff-key removed", "aria-hidden": "true" }), "Removed"),
+      el("span", null, el("i", { class: "diff-key added", "aria-hidden": "true" }), "Added"),
+      el("small", null, "Unmarked text stayed the same")
+    ),
+    el("div", { class: "my-task-change-list" }, ...changes.map(changedField)),
+    fullVersions
   );
 }
 
-export function renderVersionPanel(hr: MyTaskHumanReview, onToggle: () => void): HTMLElement {
-  return el(
-    "div",
-    { class: "my-task-versions" },
-    diffViewToggle(onToggle),
-    diffView === "unified" ? renderUnifiedRedline(hr) : renderSplitSnapshots(hr)
-  );
-}
-
-// Who reviewed an approved task. Named on purpose: the author should be able to
-// go and ask them about the edit. Rejections never reach this path — that
-// feedback stays anonymous.
-function reviewerLine(hr: MyTaskHumanReview): HTMLElement | null {
-  if (!hr.reviewed_by) return null;
+// Show what happened in human QC without exposing who made the decision.
+function reviewOutcomeLine(hr: MyTaskHumanReview): HTMLElement {
   return el(
     "p",
     { class: "my-task-reviewer" },
-    el("span", { class: "chip tag review-chip" }, "reviewed by"),
-    el("strong", null, hr.reviewed_by),
+    el("span", { class: "chip tag review-chip" }, "human review"),
     hr.changed === false
-      ? el("span", { class: "muted" }, " — approved as you wrote it, nothing changed.")
-      : el("span", { class: "muted" }, " — reach out to them if you disagree with an edit.")
+      ? el("span", { class: "muted" }, "Approved as you wrote it; nothing changed.")
+      : el("span", { class: "muted" }, "Approved with edits; highlighted changes appear first.")
   );
 }
 
@@ -316,7 +341,7 @@ function readOnlyTask(item: MyTaskItem, fb: MyTaskFeedback): HTMLElement {
 
 function statusNotice(item: MyTaskItem, fb: MyTaskFeedback): HTMLElement | null {
   if (item.status === "rejected" || fb.status === "rejected") {
-    const canAppeal = item.can_appeal !== false;
+    const canAppeal = item.can_appeal === true;
     return el(
       "div",
       { class: "admin-rejection" },
@@ -327,7 +352,9 @@ function statusNotice(item: MyTaskItem, fb: MyTaskFeedback): HTMLElement | null 
         { class: "muted small" },
         canAppeal
           ? "If you think this was the wrong call, revise the task and send it back. You get one appeal, and it goes to a different reviewer."
-          : "You have already appealed this rejection once, so this task is finished. Use the feedback on your next task."
+          : item.appeal_unavailable_reason
+            ? item.appeal_unavailable_reason
+            : "You have already appealed this rejection once, so this task is finished. Use the feedback on your next task."
       )
     );
   }
@@ -397,7 +424,8 @@ function historyPanel(fb: MyTaskFeedback): HTMLElement | null {
         null,
         el("span", { class: "mono muted admin-date" }, new Date(entry.at).toLocaleString()),
         el("span", null, HISTORY_LABEL[entry.event] ?? entry.event),
-        entry.by ? el("strong", null, ` ${entry.by}`) : null,
+        // Author history never renders `by`, even if a stale or malformed API
+        // response includes it. All human-review decisions stay anonymous.
         entry.minutes != null ? el("span", { class: "muted small" }, ` · ${entry.minutes} min`) : null
       )
     )
@@ -411,7 +439,8 @@ interface EditFormRefs {
   titleInput: HTMLInputElement;
   reqArea: HTMLTextAreaElement;
   diffSelect: HTMLSelectElement;
-  stepRows: { title: string; area: HTMLTextAreaElement }[];
+  stepRows: { titleInput: HTMLInputElement; area: HTMLTextAreaElement }[];
+  appealReasonArea: HTMLTextAreaElement | null;
   payload: () => AuthorEditPayload;
   // Handed back directly rather than re-queried off the form: the step list
   // renders its own ghost buttons ("Remove", "+ Add a step") ahead of the
@@ -419,6 +448,76 @@ interface EditFormRefs {
   submitBtn: HTMLButtonElement;
   cancelBtn: HTMLButtonElement;
   statusMsg: HTMLElement;
+}
+
+interface StringListEditor {
+  root: HTMLElement;
+  values: () => string[];
+}
+
+function renderStringListEditor(
+  initial: string[],
+  singularLabel: string,
+  addLabel: string,
+  placeholder: string
+): StringListEditor {
+  const items = initial.map((item) => String(item));
+  const root = el("div", { class: "my-task-list-editor" });
+  const draw = () => {
+    root.replaceChildren();
+    items.forEach((item, index) => {
+      const area = el("textarea", {
+        class: "textarea my-task-list-item",
+        rows: "2",
+        "aria-label": `${singularLabel} ${index + 1}`,
+        placeholder,
+      }) as HTMLTextAreaElement;
+      area.value = item;
+      area.addEventListener("input", () => {
+        items[index] = area.value;
+      });
+      root.append(
+        el(
+          "div",
+          { class: "my-task-list-row" },
+          area,
+          el(
+            "button",
+            {
+              class: "btn ghost tiny",
+              type: "button",
+              "aria-label": `Remove ${singularLabel.toLowerCase()} ${index + 1}`,
+              onclick: () => {
+                items.splice(index, 1);
+                draw();
+              },
+            },
+            "Remove"
+          )
+        )
+      );
+    });
+    root.append(
+      el(
+        "button",
+        {
+          class: "btn ghost small my-task-list-add",
+          type: "button",
+          onclick: () => {
+            items.push("");
+            draw();
+            root.querySelector<HTMLTextAreaElement>(".my-task-list-row:last-of-type textarea")?.focus();
+          },
+        },
+        addLabel
+      )
+    );
+  };
+  draw();
+  return {
+    root,
+    values: () => items.map((item) => item.trim()).filter(Boolean),
+  };
 }
 
 // Which version the form starts from. An amendment seeds from final gold — the
@@ -459,12 +558,66 @@ function renderEditForm(
   ) as HTMLSelectElement;
   diffSelect.value = current?.difficulty ?? "high";
 
-  const stepRows: { title: string; area: HTMLTextAreaElement }[] = [];
+  const appealReasonArea = mode === "appeal"
+    ? el("textarea", {
+        class: "textarea",
+        rows: "4",
+        maxLength: "2000",
+        minLength: String(MIN_APPEAL_REASON_LENGTH),
+        required: true,
+        "aria-label": "Why should this rejection be reviewed again?",
+        placeholder: "Explain what the rejection missed or why the task is valid as written.",
+      }) as HTMLTextAreaElement
+    : null;
+
+  const criteriaEditor = renderStringListEditor(
+    current?.criteria ?? fallback?.criteria ?? [],
+    "Success criterion",
+    "+ Add success criterion",
+    "Describe one condition the completed task must satisfy."
+  );
+  const outputsEditor = renderStringListEditor(
+    current?.required_outputs ?? [],
+    "Required output",
+    "+ Add required output",
+    "Describe one artifact or result the task must produce."
+  );
+  const urlsEditor = renderStringListEditor(
+    current?.must_visit_or_reach ?? [],
+    "Required URL or destination",
+    "+ Add required URL",
+    "https://example.com/path or a named destination"
+  );
+  const notesArea = el("textarea", {
+    class: "textarea",
+    rows: "4",
+    "aria-label": "Notes",
+    placeholder: "Optional context, constraints, or caveats for the task.",
+  }) as HTMLTextAreaElement;
+  notesArea.value = current?.notes ?? "";
+
+  const stepRows: { titleInput: HTMLInputElement; area: HTMLTextAreaElement }[] = [];
   const stepList = el("div", { class: "rubric-list" });
   const drawSteps = () => {
     stepList.replaceChildren();
     stepRows.length = 0;
     steps.forEach((step, i) => {
+      const kindLine = el(
+        "p",
+        { class: "rubric-kind" },
+        `Step ${i + 1}${step.title ? ` · ${step.title}` : ""}`
+      );
+      const stepTitleInput = el("input", {
+        class: "input my-task-step-title",
+        type: "text",
+        value: step.title,
+        placeholder: `Title for step ${i + 1}`,
+        "aria-label": `Step ${i + 1} title`,
+      }) as HTMLInputElement;
+      stepTitleInput.addEventListener("input", () => {
+        step.title = stepTitleInput.value;
+        kindLine.textContent = `Step ${i + 1}${step.title.trim() ? ` · ${step.title.trim()}` : ""}`;
+      });
       const area = el("textarea", {
         class: "rubric-text",
         rows: "2",
@@ -480,7 +633,7 @@ function renderEditForm(
         area.style.height = "auto";
         area.style.height = `${Math.max(60, area.scrollHeight + 2)}px`;
       });
-      stepRows.push({ title: step.title, area });
+      stepRows.push({ titleInput: stepTitleInput, area });
       stepList.append(
         el(
           "div",
@@ -489,7 +642,14 @@ function renderEditForm(
           el(
             "div",
             { class: "rubric-content" },
-            el("p", { class: "rubric-kind" }, `Step ${i + 1}${step.title ? ` · ${step.title}` : ""}`),
+            kindLine,
+            el(
+              "label",
+              { class: "my-task-step-title-field" },
+              el("span", { class: "field-label" }, "Step title"),
+              stepTitleInput
+            ),
+            el("span", { class: "field-label" }, "Step description"),
             area,
             el(
               "button",
@@ -514,7 +674,7 @@ function renderEditForm(
           class: "btn ghost small",
           type: "button",
           onclick: () => {
-            steps.push({ order: steps.length + 1, title: `Step ${steps.length + 1}`, description: "" });
+            steps.push({ order: steps.length + 1, title: "", description: "" });
             drawSteps();
           },
         },
@@ -528,11 +688,11 @@ function renderEditForm(
     task_title: titleInput.value.trim(),
     agent_request: reqArea.value.trim(),
     difficulty: diffSelect.value,
-    success_criteria: current?.criteria ?? fallback?.criteria ?? [],
+    success_criteria: criteriaEditor.values(),
     steps: steps.map((s, i) => ({ order: i + 1, title: s.title, description: s.description.trim() })),
-    must_visit_or_reach: current?.must_visit_or_reach ?? [],
-    required_outputs: current?.required_outputs ?? [],
-    notes: current?.notes ?? null,
+    must_visit_or_reach: urlsEditor.values(),
+    required_outputs: outputsEditor.values(),
+    notes: notesArea.value.trim() || null,
     metadata: current?.metadata,
   });
 
@@ -555,6 +715,21 @@ function renderEditForm(
     "div",
     { class: "my-task-edit" },
     el("h4", null, heading),
+    ...(appealReasonArea
+      ? [
+          el(
+            "div",
+            { class: "field" },
+            el("span", { class: "field-label" }, "Why should this be reviewed again?"),
+            el(
+              "p",
+              { class: "field-hint" },
+              `This goes to the fresh reviewer. Explain what the first decision missed (${MIN_APPEAL_REASON_LENGTH} characters minimum).`
+            ),
+            appealReasonArea
+          ),
+        ]
+      : []),
     el(
       "div",
       { class: "field" },
@@ -576,9 +751,37 @@ function renderEditForm(
     el(
       "div",
       { class: "field" },
+      el("span", { class: "field-label" }, "Success criteria"),
+      el("p", { class: "field-hint" }, "Add, remove, or rewrite the conditions that define a successful result."),
+      criteriaEditor.root
+    ),
+    el(
+      "div",
+      { class: "field" },
       el("span", { class: "field-label" }, "Steps"),
       el("p", { class: "field-hint" }, hint),
       stepList
+    ),
+    el(
+      "div",
+      { class: "field" },
+      el("span", { class: "field-label" }, "Required outputs"),
+      el("p", { class: "field-hint" }, "List the concrete artifacts or results the task must produce."),
+      outputsEditor.root
+    ),
+    el(
+      "div",
+      { class: "field" },
+      el("span", { class: "field-label" }, "Required URLs or destinations"),
+      el("p", { class: "field-hint" }, "List any exact pages, URLs, or destinations the task must reach."),
+      urlsEditor.root
+    ),
+    el(
+      "div",
+      { class: "field" },
+      el("span", { class: "field-label" }, "Notes"),
+      el("p", { class: "field-hint" }, "Optional context, constraints, or caveats that should travel with the task."),
+      notesArea
     ),
     el("div", { class: "form-actions" }, cancelBtn, submitBtn),
     statusMsg
@@ -586,7 +789,7 @@ function renderEditForm(
 
   return {
     wrap,
-    refs: { titleInput, reqArea, diffSelect, stepRows, payload, submitBtn, cancelBtn, statusMsg },
+    refs: { titleInput, reqArea, diffSelect, stepRows, appealReasonArea, payload, submitBtn, cancelBtn, statusMsg },
   };
 }
 
@@ -610,9 +813,8 @@ function renderFeedback(
     wrap.replaceChildren();
     const approved = fb.status === "approved" || item.status === "approved";
     if (approved && fb.human_review) {
-      const line = reviewerLine(fb.human_review);
-      if (line) wrap.append(line);
-      wrap.append(renderVersionPanel(fb.human_review, draw));
+      wrap.append(reviewOutcomeLine(fb.human_review));
+      wrap.append(renderDiff(fb.human_review));
     } else {
       wrap.append(readOnlyTask(item, fb));
     }
@@ -719,6 +921,12 @@ function renderFeedback(
     const originalLabel = submitBtn.textContent ?? "Submit";
     submitBtn.addEventListener("click", async () => {
       if (!ctx.state.reviewKey || !ctx.state.identity) return;
+      const appealReason = refs.appealReasonArea?.value.trim() ?? "";
+      if (editMode === "appeal" && appealReason.length < MIN_APPEAL_REASON_LENGTH) {
+        statusMsg.textContent = `Explain why this should be reviewed again (${MIN_APPEAL_REASON_LENGTH} characters minimum).`;
+        refs.appealReasonArea?.focus();
+        return;
+      }
       submitBtn.disabled = true;
       submitBtn.textContent = "Submitting…";
       statusMsg.textContent = "";
@@ -728,7 +936,14 @@ function renderFeedback(
           await authorAmend(ctx.state.reviewKey, pid, item.sub_key, refs.payload(), openedAt);
           ctx.actions.notifyInfo("Saved — your version is now the final one.");
         } else {
-          await authorEdit(ctx.state.reviewKey, pid, item.sub_key, refs.payload(), editStartedAt);
+          await authorEdit(
+            ctx.state.reviewKey,
+            pid,
+            item.sub_key,
+            refs.payload(),
+            editStartedAt,
+            editMode === "appeal" ? appealReason : null
+          );
           ctx.actions.notifyInfo(
             editMode === "appeal"
               ? "Appeal sent — a different reviewer will take a fresh look once Codex re-audits it."
@@ -771,21 +986,34 @@ export function signoffSuffix(item: MyTaskItem): string {
     : ` · you accepted it on ${when}`;
 }
 
-function taskRow(ctx: Ctx, item: MyTaskItem, reloadList: () => void): HTMLElement {
+function taskRow(
+  ctx: Ctx,
+  item: MyTaskItem,
+  reloadList: () => void,
+  openTask: () => void
+): HTMLElement {
   const when = item.submitted_at ? new Date(item.submitted_at).toLocaleDateString() : "—";
   const reasonLine =
     item.status === "rejected" && item.rejection_reason
       ? item.rejection_reason
       : item.status === "returned" && item.returned_reason
         ? item.returned_reason
-        : item.status === "approved" && item.reviewed_by
-          ? `Reviewed by ${item.reviewed_by}${item.reviewer_changed === false ? " · unchanged" : ""}${signoffSuffix(item)}`
+        : item.status === "approved"
+          ? `Approved${item.reviewer_changed === false ? " · unchanged" : ""}${signoffSuffix(item)}`
           : null;
   const detail = el("details", { class: "admin-submission my-task-row" });
   detail.append(
     el(
       "summary",
-      { class: "admin-submission-summary" },
+      {
+        class: "admin-submission-summary",
+        onclick: (event: MouseEvent) => {
+          // A task gets the whole screen. Prevent the native details toggle so
+          // a long editor never expands inside a high-volume worklist.
+          event.preventDefault();
+          openTask();
+        },
+      },
       el(
         "span",
         { class: "admin-summary-main" },
@@ -794,7 +1022,7 @@ function taskRow(ctx: Ctx, item: MyTaskItem, reloadList: () => void): HTMLElemen
       ),
       statusBadge(item.status),
       el("span", { class: "muted mono admin-date" }, when),
-      el("span", { class: "admin-chevron", "aria-hidden": "true" }, "▾")
+      el("span", { class: "admin-chevron my-task-open-arrow", "aria-hidden": "true" }, "→")
     )
   );
   const detailBody = el("div", { class: "admin-submission-detail" });
@@ -857,7 +1085,7 @@ export function signoffProgress(approvedTotal: number, awaiting: number): string
 
 export function renderMyTasks(ctx: Ctx): HTMLElement {
   const { state } = ctx;
-  const root = el("section", { class: "screen narrow my-tasks-screen" });
+  const root = el("section", { class: "screen my-tasks-screen" });
   root.append(
     el(
       "header",
@@ -866,7 +1094,7 @@ export function renderMyTasks(ctx: Ctx): HTMLElement {
       el(
         "p",
         { class: "screen-sub" },
-        "Track your submissions, see Codex feedback and reviewer notes, sign off on the tasks a reviewer edited, and revise anything still open."
+        "Track your submissions, see Codex feedback and reviewer notes, sign off on approved tasks, and revise anything still open."
       )
     )
   );
@@ -880,108 +1108,248 @@ export function renderMyTasks(ctx: Ctx): HTMLElement {
     return root;
   }
 
-  let offset = 0;
+  const authorPid = schemaParticipantId(state.identity);
+  const remembered = myTasksViewByParticipant.get(authorPid) ?? {
+    offset: 0,
+    query: "",
+    filter: "all" as MyTaskFilter,
+    sort: "newest" as MyTaskSort,
+    scrollTop: 0,
+  };
+  let offset = remembered.offset;
+  let query = remembered.query;
+  let filter: MyTaskFilter = remembered.filter;
+  let sort: MyTaskSort = remembered.sort;
+  let scrollTop = remembered.scrollTop;
 
-  const reloadList = () => {
-    void refresh();
+  const rememberView = () => {
+    myTasksViewByParticipant.set(authorPid, { offset, query, filter, sort, scrollTop });
   };
 
-  const refresh = async () => {
+  const rememberScroll = () => {
+    scrollTop = Math.max(document.documentElement.scrollTop, document.body.scrollTop, window.scrollY || 0);
+    rememberView();
+  };
+
+  const restoreScroll = () => {
+    if (!scrollTop) return;
+    requestAnimationFrame(() => {
+      document.documentElement.scrollTop = scrollTop;
+      document.body.scrollTop = scrollTop;
+    });
+  };
+
+  const reloadList = () => {
+    rememberScroll();
+    void refresh(true);
+  };
+
+  const openTask = (item: MyTaskItem) => {
+    rememberScroll();
+    state.myTaskSelection = item;
+    ctx.actions.goto("my-task");
+  };
+
+  const refresh = async (quiet = false) => {
     if (!state.reviewKey || !state.identity) return;
-    body.replaceChildren(el("p", { class: "muted status-line" }, "Loading your tasks…"));
+    if (!quiet) body.replaceChildren(el("p", { class: "muted status-line" }, "Loading your tasks…"));
     try {
       const page = await myTaskPage(
         state.reviewKey,
-        schemaParticipantId(state.identity),
+        authorPid,
         offset,
         PAGE_SIZE
       );
-      body.replaceChildren();
+      if (page.source_total > 0 && page.items.length === 0 && offset > 0) {
+        offset = Math.floor((page.source_total - 1) / PAGE_SIZE) * PAGE_SIZE;
+        scrollTop = 0;
+        rememberView();
+        await refresh(quiet);
+        return;
+      }
       if (!page.source_total) {
-        body.append(el("p", { class: "muted" }, "You haven't submitted any tasks yet."));
+        body.replaceChildren(el("p", { class: "muted" }, "You haven't submitted any tasks yet."));
         return;
       }
 
-      const awaiting = page.items.filter((item) => item.needs_signoff);
-      const rest = page.items.filter((item) => !item.needs_signoff);
+      const searchInput = el("input", {
+        class: "input my-tasks-search",
+        type: "search",
+        value: query,
+        placeholder: "Search titles, requests, or feedback",
+        "aria-label": "Search my tasks",
+      }) as HTMLInputElement;
+      const filterSelect = el(
+        "select",
+        { class: "input", "aria-label": "Filter tasks" },
+        el("option", { value: "all" }, "All statuses"),
+        el("option", { value: "action" }, "Needs my action"),
+        el("option", { value: "in_progress" }, "In progress"),
+        el("option", { value: "approved" }, "Approved"),
+        el("option", { value: "rejected" }, "Rejected"),
+        el("option", { value: "returned" }, "Returned")
+      ) as HTMLSelectElement;
+      filterSelect.value = filter;
+      const sortSelect = el(
+        "select",
+        { class: "input", "aria-label": "Sort tasks" },
+        el("option", { value: "newest" }, "Newest first"),
+        el("option", { value: "oldest" }, "Oldest first"),
+        el("option", { value: "status" }, "Action and status")
+      ) as HTMLSelectElement;
+      sortSelect.value = sort;
+      const clearFilters = el("button", { class: "btn ghost small", type: "button" }, "Clear filters") as HTMLButtonElement;
+      const controls = el(
+        "section",
+        { class: "my-tasks-controls", "aria-label": "Find and filter tasks" },
+        el(
+          "label",
+          { class: "my-tasks-search-field" },
+          el("span", { class: "field-label" }, "Find a task"),
+          searchInput
+        ),
+        el("label", null, el("span", { class: "field-label" }, "Status"), filterSelect),
+        el("label", null, el("span", { class: "field-label" }, "Sort"), sortSelect),
+        clearFilters
+      );
+      const results = el("div", { class: "my-tasks-results" });
+      body.replaceChildren(controls, results);
 
-      if (page.awaiting_signoff_total > 0) {
-        const section = el("section", { class: "my-tasks-section needs-signoff" });
-        section.append(
-          sectionHead(
-            "Needs your sign-off",
-            page.awaiting_signoff_total,
-            "A reviewer approved these. Check what changed, then accept it or make your own version final."
-          ),
-          el("p", { class: "my-tasks-progress mono" }, signoffProgress(page.approved_total, page.awaiting_signoff_total))
-        );
-        if (awaiting.length) {
-          section.append(...awaiting.map((item) => taskRow(ctx, item, reloadList)));
-        } else {
-          section.append(
+      const filtersActive = () => Boolean(query.trim() || filter !== "all" || sort !== "newest");
+      const clear = () => {
+        query = "";
+        filter = "all";
+        sort = "newest";
+        searchInput.value = "";
+        filterSelect.value = filter;
+        sortSelect.value = sort;
+        rememberView();
+        drawResults();
+        searchInput.focus();
+      };
+      const drawResults = () => {
+        results.replaceChildren();
+        clearFilters.hidden = !filtersActive();
+        const visible = filterAndSortMyTasks(page.items, query, filter, sort);
+        if (!visible.length) {
+          results.append(
             el(
-              "p",
-              { class: "muted" },
-              `None on this page. Your ${page.awaiting_signoff_total} outstanding ${page.awaiting_signoff_total === 1 ? "task is" : "tasks are"} on another page — use Newer and Older below to reach them.`
+              "div",
+              { class: "my-tasks-empty" },
+              el("h3", null, "No tasks match"),
+              el("p", { class: "muted" }, "Try a different search or clear the filters to see your submissions."),
+              el("button", { class: "btn ghost", type: "button", onclick: clear }, "Clear filters")
+            )
+          );
+          return;
+        }
+
+        const awaiting = visible.filter((item) => item.needs_signoff);
+        const rest = visible.filter((item) => !item.needs_signoff);
+        const active = filtersActive();
+        if (awaiting.length || (!active && page.awaiting_signoff_total > 0)) {
+          const section = el("section", { class: "my-tasks-section needs-signoff" });
+          section.append(
+            sectionHead(
+              "Needs your sign-off",
+              active ? awaiting.length : page.awaiting_signoff_total,
+              "A reviewer approved these. Check what changed, then accept it or make your own version final."
+            ),
+            el("p", { class: "my-tasks-progress mono" }, signoffProgress(page.approved_total, page.awaiting_signoff_total))
+          );
+          if (awaiting.length) {
+            section.append(...awaiting.map((item) => taskRow(ctx, item, reloadList, () => openTask(item))));
+          } else {
+            section.append(
+              el(
+                "p",
+                { class: "muted" },
+                `None on this page. Your ${page.awaiting_signoff_total} outstanding ${page.awaiting_signoff_total === 1 ? "task is" : "tasks are"} on another page — use Newer and Older below to reach them.`
+              )
+            );
+          }
+          results.append(section);
+        }
+
+        if (rest.length || !active) {
+          const restSection = el("section", { class: "my-tasks-section" });
+          restSection.append(
+            sectionHead(
+              "All submissions",
+              active ? rest.length : page.source_total - page.awaiting_signoff_total,
+              active
+                ? "Submissions matching your current search, status, and sort choices."
+                : page.awaiting_signoff_total
+                  ? "Everything else you've submitted — the ones waiting on you are listed above."
+                  : "Everything you've submitted."
+            ),
+            ...rest.map((item) => taskRow(ctx, item, reloadList, () => openTask(item)))
+          );
+          results.append(restSection);
+        }
+
+        const lastPage = offset + page.limit >= page.source_total;
+        if (offset > 0 || !lastPage) {
+          const shownTo = Math.min(offset + page.limit, page.source_total);
+          results.append(
+            el(
+              "div",
+              { class: "form-actions my-tasks-pager" },
+              el(
+                "button",
+                {
+                  class: "btn ghost",
+                  type: "button",
+                  disabled: offset === 0,
+                  onclick: () => {
+                    offset = Math.max(0, offset - PAGE_SIZE);
+                    scrollTop = 0;
+                    rememberView();
+                    void refresh();
+                  },
+                },
+                "← Newer"
+              ),
+              el("span", { class: "muted mono" }, `${offset + 1}–${shownTo} of ${page.source_total}`),
+              el(
+                "button",
+                {
+                  class: "btn ghost",
+                  type: "button",
+                  disabled: lastPage,
+                  onclick: () => {
+                    offset += PAGE_SIZE;
+                    scrollTop = 0;
+                    rememberView();
+                    void refresh();
+                  },
+                },
+                "Older →"
+              )
             )
           );
         }
-        body.append(section);
-      }
+      };
 
-      const restSection = el("section", { class: "my-tasks-section" });
-      restSection.append(
-        sectionHead(
-          "All submissions",
-          // Counts what this section actually lists across every page: the
-          // sign-off queue above is not repeated here, so source_total would
-          // never match the rows underneath it.
-          page.source_total - page.awaiting_signoff_total,
-          page.awaiting_signoff_total
-            ? "Everything else you've submitted, newest first — the ones waiting on you are listed above."
-            : "Everything you've submitted, newest first."
-        ),
-        ...rest.map((item) => taskRow(ctx, item, reloadList))
-      );
-      body.append(restSection);
-
-      const lastPage = offset + page.limit >= page.source_total;
-      if (offset > 0 || !lastPage) {
-        const shownTo = Math.min(offset + page.limit, page.source_total);
-        body.append(
-          el(
-            "div",
-            { class: "form-actions my-tasks-pager" },
-            el(
-              "button",
-              {
-                class: "btn ghost",
-                type: "button",
-                disabled: offset === 0,
-                onclick: () => {
-                  offset = Math.max(0, offset - PAGE_SIZE);
-                  void refresh();
-                },
-              },
-              "← Newer"
-            ),
-            el("span", { class: "muted mono" }, `${offset + 1}–${shownTo} of ${page.source_total}`),
-            el(
-              "button",
-              {
-                class: "btn ghost",
-                type: "button",
-                disabled: lastPage,
-                onclick: () => {
-                  offset += PAGE_SIZE;
-                  void refresh();
-                },
-              },
-              "Older →"
-            )
-          )
-        );
-      }
+      searchInput.addEventListener("input", () => {
+        query = searchInput.value;
+        rememberView();
+        drawResults();
+      });
+      filterSelect.addEventListener("change", () => {
+        filter = filterSelect.value as MyTaskFilter;
+        rememberView();
+        drawResults();
+      });
+      sortSelect.addEventListener("change", () => {
+        sort = sortSelect.value as MyTaskSort;
+        rememberView();
+        drawResults();
+      });
+      clearFilters.addEventListener("click", clear);
+      drawResults();
+      rememberView();
+      restoreScroll();
     } catch (err) {
       body.replaceChildren(
         el("p", { class: "muted" }, `Couldn't load your tasks: ${err instanceof Error ? err.message : String(err)}`),
@@ -1001,6 +1369,62 @@ export function renderMyTasks(ctx: Ctx): HTMLElement {
   void refresh();
 
   root.append(backHome(ctx));
+  return root;
+}
+
+// A single author task gets a dedicated page. The list row intentionally
+// carries only compact status metadata; the complete authored task, human
+// diff, anonymous feedback, history, and editor load here on demand.
+export function renderMyTask(ctx: Ctx): HTMLElement {
+  const item = ctx.state.myTaskSelection;
+  const root = el("section", { class: "screen my-task-detail-screen" });
+  const back = el(
+    "button",
+    { class: "btn ghost small my-task-detail-back", type: "button", onclick: () => ctx.actions.goto("my-tasks") },
+    "← Back to My Tasks"
+  );
+  root.append(back);
+
+  if (!item || !ctx.state.identity || !ctx.state.reviewKey) {
+    root.append(
+      el("h2", { class: "display" }, "Task unavailable"),
+      el("p", { class: "muted" }, "Return to My Tasks and choose a submission to open.")
+    );
+    return root;
+  }
+
+  const when = item.submitted_at ? new Date(item.submitted_at).toLocaleDateString() : "—";
+  root.append(
+    el(
+      "header",
+      { class: "my-task-detail-head" },
+      el(
+        "div",
+        { class: "my-task-detail-title" },
+        el("p", { class: "eyebrow" }, "My task"),
+        el("h2", { class: "display" }, item.title || "Untitled task"),
+        el("p", { class: "screen-sub" }, item.request || "Open the task below to review its complete content and feedback.")
+      ),
+      el(
+        "div",
+        { class: "my-task-detail-meta" },
+        statusBadge(item.status),
+        el("span", { class: "muted mono" }, `Submitted ${when}`)
+      )
+    )
+  );
+
+  const body = el(
+    "div",
+    { class: "my-task-detail-body" },
+    el("p", { class: "muted status-line" }, "Loading task and feedback…")
+  );
+  root.append(body);
+  const finishAndReturn = () => {
+    ctx.state.myTaskSelection = null;
+    ctx.actions.goto("my-tasks");
+  };
+  void loadFeedback(ctx, item, body, finishAndReturn, new Date().toISOString());
   return root;
 }
 

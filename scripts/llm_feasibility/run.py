@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import concurrent.futures
 import dataclasses
 import datetime as dt
@@ -30,14 +31,14 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 
-PIPELINE_VERSION = "apollo-llm-feasibility-v19"
+PIPELINE_VERSION = "apollo-llm-feasibility-v22"
 ARTIFACT_SCHEMA_VERSION = "apollo-llm-feasibility-artifact-v11"
 RUBRIC_SCHEMA_VERSION = "apollo-rubric-feasibility-v9"
 BROWSER_SCHEMA_VERSION = "apollo-browser-feasibility-v3"
 FEASIBILITY_MANAGER_SCHEMA_VERSION = "apollo-feasibility-manager-core-v4"
 EVERGREEN_SCHEMA_VERSION = "apollo-evergreen-review-v1"
 MANAGER_SCHEMA_VERSION = "apollo-feasibility-manager-v10"
-QUALITY_SCHEMA_VERSION = "apollo-task-quality-review-v4"
+QUALITY_SCHEMA_VERSION = "apollo-task-quality-review-v5"
 RUBRIC_REPAIR_SCHEMA_VERSION = "apollo-rubric-repair-v3"
 TASK_REPAIR_MANAGER_SCHEMA_VERSION = "apollo-task-repair-manager-v1"
 REPAIR_PLAN_SCHEMA_VERSION = "apollo-task-repair-plan-v3"
@@ -46,6 +47,7 @@ PLAYWRIGHT_MCP_VERSION = "0.0.79"
 PRE_QC_PASS_PREFIX = "v2-review/llm_pre_qc_pass"
 PRE_QC_ATTENTION_PREFIX = "v2-review/llm_pre_qc_attention"
 PRE_QC_CLAIM_PREFIX = "v2-review/llm_pre_qc_claims"
+QUEUE_ROOTS = {"v2": "v2-review", "pc": "pc-review"}
 BASE_DIR = Path(__file__).resolve().parent
 SCHEMA_DIR = BASE_DIR / "schemas"
 PROMPT_DIR = BASE_DIR / "prompts"
@@ -137,6 +139,8 @@ class Config:
     s3_pre_qc_pass_prefix: str = PRE_QC_PASS_PREFIX
     s3_pre_qc_attention_prefix: str = PRE_QC_ATTENTION_PREFIX
     s3_pre_qc_claim_prefix: str = PRE_QC_CLAIM_PREFIX
+    reasoning_effort: str | None = None
+    model_provider: str | None = None
 
 
 def canonical_json(value: Any) -> str:
@@ -173,6 +177,12 @@ def atomic_write_json(path: Path, value: Any) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def task_belongs_to_queue(task_id: str, queue: str) -> bool:
+    """Fail closed for PC IDs while retaining legacy non-PC rows in v2."""
+    is_pc = str(task_id).startswith("pc_")
+    return is_pc if queue == "pc" else not is_pc
 
 
 def read_json(path: Path) -> Any:
@@ -446,7 +456,14 @@ EVERGREEN_REVIEW_KEYS = {
 QUALITY_VERDICTS = {"PASS", "FAIL", "NEEDS_HUMAN_REVIEW"}
 QUALITY_AXIS_KEYS = {"verdict", "summary", "concerns"}
 QUALITY_DIFFICULTY_KEYS = QUALITY_AXIS_KEYS | {"rating"}
-QUALITY_RUBRIC_KEYS = {"rubric_id", "verdict", "summary", "issues"}
+QUALITY_RUBRIC_KEYS = {
+    "rubric_id",
+    "verdict",
+    "summary",
+    "issues",
+    "request_support",
+    "introduced_requirements",
+}
 QUALITY_REVIEW_KEYS = {
     "schema_version",
     "task_id",
@@ -472,6 +489,109 @@ def _validate_quality_axis(value: Any, where: str, *, difficulty: bool = False) 
         if axis["verdict"] == "PASS" and axis["rating"] != "APPROPRIATE":
             raise PipelineError("quality difficulty may pass only when its rating is APPROPRIATE")
     return axis
+
+
+# Exact named services are not harmless implementation details when they occur
+# only in a scored step. Requiring an unrequested site makes the evaluator
+# stricter than the authored request. This deterministic inventory supplements
+# the model's semantic alignment judgment and makes known false-pass cases such
+# as an unrequested CryptPad deliverable fail closed.
+NAMED_SERVICE_REQUIREMENTS = (
+    "Airtable", "Amazon", "Apple Maps", "Asana", "Booking.com", "Canva",
+    "ChatGPT", "ClickUp", "CoinGecko", "CoinMarketCap", "CryptPad", "Dropbox",
+    "eBay", "Eventbrite", "Expedia", "Facebook", "Figma", "GitHub", "Gmail",
+    "Google Calendar", "Google Docs", "Google Drive", "Google Flights",
+    "Google Maps", "Google Sheets", "Instagram", "Kayak", "LinkedIn",
+    "Notion", "OneDrive", "OpenTable", "Reddit", "Resy", "Slack", "Spotify",
+    "TikTok", "Todoist", "Trello", "Tripadvisor", "Twitter", "Uber", "Venmo",
+    "Walmart", "Webull", "X.com", "YouTube", "Zillow",
+)
+CAMEL_REQUIREMENT_RE = re.compile(r"\b[A-Z][a-z0-9]+(?:[A-Z][A-Za-z0-9]*)+\b")
+
+
+def _alignment_text(value: str) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def named_requirement_candidates(criterion: str) -> tuple[str, ...]:
+    text = str(criterion or "")
+    candidates: list[str] = []
+    normalized = _alignment_text(text)
+    for service in NAMED_SERVICE_REQUIREMENTS:
+        if _alignment_text(service) in normalized:
+            candidates.append(service)
+    for token in CAMEL_REQUIREMENT_RE.findall(text):
+        if token not in candidates:
+            candidates.append(token)
+    return tuple(dict.fromkeys(candidates))
+
+
+def unrequested_named_requirements(task: Task, rubric: Rubric) -> tuple[str, ...]:
+    prompt = _alignment_text(task.prompt)
+    return tuple(
+        candidate
+        for candidate in named_requirement_candidates(rubric.criterion)
+        if _alignment_text(candidate) not in prompt
+    )
+
+
+def enforce_named_requirement_alignment(value: Any, task: Task) -> Any:
+    """Fail a model PASS that requires a named app absent from the request.
+
+    The model output remains available in the attempt cache. The validated
+    review records the deterministic correction so the task produces useful
+    attention feedback instead of becoming a pipeline error.
+    """
+    if not isinstance(value, dict) or not isinstance(value.get("rubric_assessments"), list):
+        return value
+    review = copy.deepcopy(value)
+    rubrics_by_id = {rubric.rubric_id: rubric for rubric in task.rubrics}
+    changed = False
+    for assessment in review["rubric_assessments"]:
+        if not isinstance(assessment, dict) or assessment.get("verdict") != "PASS":
+            continue
+        rubric = rubrics_by_id.get(str(assessment.get("rubric_id") or ""))
+        if rubric is None:
+            continue
+        unrequested = unrequested_named_requirements(task, rubric)
+        if not unrequested:
+            continue
+        changed = True
+        names = ", ".join(unrequested)
+        assessment["verdict"] = "FAIL"
+        introduced = assessment.get("introduced_requirements")
+        if not isinstance(introduced, list):
+            introduced = []
+        assessment["introduced_requirements"] = [
+            *[str(item) for item in introduced if str(item).strip()],
+            *[f"Require {name}" for name in unrequested],
+        ][:3]
+        issues = assessment.get("issues")
+        if not isinstance(issues, list):
+            issues = []
+        assessment["issues"] = [
+            *[str(item) for item in issues if str(item).strip()],
+            f"{names} is required by this step but not by the task request.",
+        ][:3]
+        assessment["summary"] = (
+            f"This step needs attention because it requires {names}, "
+            "which the task request does not ask for."
+        )[:360]
+    if changed:
+        verdicts = [
+            str(review.get("task_coherence", {}).get("verdict") or "NEEDS_HUMAN_REVIEW"),
+            *[str(item.get("verdict") or "NEEDS_HUMAN_REVIEW") for item in review["rubric_assessments"] if isinstance(item, dict)],
+        ]
+        review["overall_verdict"] = (
+            "FAIL" if "FAIL" in verdicts
+            else "NEEDS_HUMAN_REVIEW" if "NEEDS_HUMAN_REVIEW" in verdicts
+            else "PASS"
+        )
+        review["summary"] = (
+            "This task needs attention because at least one scored step requires "
+            "a named app or service that the original request does not ask for."
+        )
+    return review
 
 
 def validate_quality_review(value: Any, task: Task) -> dict[str, Any]:
@@ -501,6 +621,42 @@ def validate_quality_review(value: Any, task: Task) -> dict[str, Any]:
             raise PipelineError(f"quality rubric_assessments[{index}] verdict is invalid")
         _require_text(item["summary"], f"quality rubric_assessments[{index}].summary", 360)
         _require_string_list(item["issues"], f"quality rubric_assessments[{index}].issues", 3, 360)
+        support = _require_string_list(
+            item["request_support"],
+            f"quality rubric_assessments[{index}].request_support",
+            3,
+            360,
+        )
+        introduced = _require_string_list(
+            item["introduced_requirements"],
+            f"quality rubric_assessments[{index}].introduced_requirements",
+            3,
+            360,
+        )
+        for excerpt in support:
+            if _alignment_text(excerpt) not in _alignment_text(task.prompt):
+                raise PipelineError(
+                    f"quality rubric_assessments[{index}] request_support must quote the task request exactly"
+                )
+        rubric = next((rubric for rubric in task.rubrics if rubric.rubric_id == item["rubric_id"]), None)
+        unrequested = unrequested_named_requirements(task, rubric) if rubric else ()
+        if item["verdict"] == "PASS":
+            if not support:
+                raise PipelineError(
+                    f"quality rubric_assessments[{index}] PASS requires exact request_support"
+                )
+            if introduced:
+                raise PipelineError(
+                    f"quality rubric_assessments[{index}] cannot pass introduced requirements"
+                )
+            if unrequested:
+                raise PipelineError(
+                    f"quality rubric_assessments[{index}] cannot pass unrequested named requirement: {', '.join(unrequested)}"
+                )
+        if introduced and item["verdict"] != "FAIL":
+            raise PipelineError(
+                f"quality rubric_assessments[{index}] introduced requirements require FAIL"
+            )
     expected_ids = [rubric.rubric_id for rubric in task.rubrics]
     if len(actual_ids) != len(set(actual_ids)) or set(actual_ids) != set(expected_ids):
         raise PipelineError("quality review must assess every rubric exactly once")
@@ -1063,7 +1219,21 @@ def validate_repair_plan(
         raise PipelineError("projected quality review status is invalid")
     if projected_quality["error"] is not None:
         raise PipelineError("projected quality review cannot contain an error")
-    validated_quality = validate_quality_review(projected_quality["review"], task)
+    projected_prompt = str(plan["suggested_task_prompt"] or task.prompt)
+    projected_task = Task(
+        task_id=task.task_id,
+        prompt=projected_prompt,
+        rubrics=tuple(
+            Rubric(
+                rubric.rubric_id,
+                str(repair.get("suggested_rubric_text") or rubric.criterion),
+                rubric.critical,
+            )
+            for rubric, repair in zip(task.rubrics, repairs)
+        ),
+        effective_task={"request": projected_prompt},
+    )
+    validated_quality = validate_quality_review(projected_quality["review"], projected_task)
     overall_possible = (
         all_projected
         and disposition == "FEASIBLE"
@@ -1426,6 +1596,33 @@ class CodexRunner:
         ]
         if web_search:
             command.append("--search")
+        if self.config.reasoning_effort:
+            command.extend([
+                "-c",
+                f'model_reasoning_effort="{self.config.reasoning_effort}"',
+            ])
+        if self.config.model_provider:
+            command.extend([
+                "-c",
+                f"model_provider={json.dumps(self.config.model_provider)}",
+            ])
+            if self.config.model_provider == "amazon-bedrock":
+                if self.config.aws_profile:
+                    command.extend([
+                        "-c",
+                        (
+                            "model_providers.amazon-bedrock.aws.profile="
+                            f"{json.dumps(self.config.aws_profile)}"
+                        ),
+                    ])
+                if self.config.aws_region:
+                    command.extend([
+                        "-c",
+                        (
+                            "model_providers.amazon-bedrock.aws.region="
+                            f"{json.dumps(self.config.aws_region)}"
+                        ),
+                    ])
         if browser:
             command.extend([
                 "-c",
@@ -1682,6 +1879,8 @@ def _fallback_quality_review(task: Task, reason: str) -> dict[str, Any]:
                 "verdict": "NEEDS_HUMAN_REVIEW",
                 "summary": "The automated check did not finish for this step.",
                 "issues": ["The automated check did not finish."],
+                "request_support": [],
+                "introduced_requirements": [],
             }
             for rubric in task.rubrics
         ],
@@ -1807,7 +2006,7 @@ def run_quality_manager(task: Task, task_dir: Path, runner: CodexRunner) -> dict
             raw_output_path,
             web_search=False,
         )
-        review = validate_quality_review(value, task)
+        review = validate_quality_review(enforce_named_requirement_alignment(value, task), task)
     except Exception as exc:
         review = validate_quality_review(_fallback_quality_review(task, str(exc)), task)
     atomic_write_json(review_path, review)
@@ -2556,11 +2755,11 @@ def aws_base_command(config: Config) -> list[str]:
 
 
 def scrub_worker_environment(environment: Mapping[str, str]) -> dict[str, str]:
+    credential_prefixes = ("AWS_", "APOLLO_", "CLOUDFLARE_", "CMU_", "VERCEL_")
     return {
         key: value
         for key, value in environment.items()
-        if not key.startswith("AWS_")
-        and not key.startswith("APOLLO_")
+        if not key.upper().startswith(credential_prefixes)
         and "REPORTING_TOKEN" not in key.upper()
         and "REPORTING_KEY" not in key.upper()
     }
@@ -2568,17 +2767,32 @@ def scrub_worker_environment(environment: Mapping[str, str]) -> dict[str, str]:
 
 def s3_existing_metadata(config: Config, key: str) -> dict[str, str] | None:
     command = aws_base_command(config) + ["s3api", "head-object", "--bucket", str(config.s3_bucket), "--key", key]
-    completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-    if completed.returncode == 0:
+    error = ""
+    for attempt in range(4):
         try:
-            head = json.loads(completed.stdout)
-        except json.JSONDecodeError as exc:
-            raise PipelineError(f"AWS returned invalid head-object JSON for s3://{config.s3_bucket}/{key}") from exc
-        metadata = head.get("Metadata") if isinstance(head, dict) else None
-        return {str(k).lower(): str(v) for k, v in metadata.items()} if isinstance(metadata, dict) else {}
-    error = completed.stderr or ""
-    if any(marker in error for marker in ("404", "Not Found", "NoSuchKey")):
-        return None
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            error = "AWS head-object timed out"
+        else:
+            if completed.returncode == 0:
+                try:
+                    head = json.loads(completed.stdout)
+                except json.JSONDecodeError as exc:
+                    raise PipelineError(f"AWS returned invalid head-object JSON for s3://{config.s3_bucket}/{key}") from exc
+                metadata = head.get("Metadata") if isinstance(head, dict) else None
+                return {str(k).lower(): str(v) for k, v in metadata.items()} if isinstance(metadata, dict) else {}
+            error = completed.stderr or ""
+            if any(marker in error for marker in ("404", "Not Found", "NoSuchKey")):
+                return None
+        if attempt < 3:
+            time.sleep(0.25 * (2 ** attempt))
     raise PipelineError(f"could not check s3://{config.s3_bucket}/{key}: {error[-1000:].strip()}")
 
 
@@ -2616,12 +2830,27 @@ def upload_immutable(config: Config, local_path: Path, key: str, status: str, ta
         "--if-none-match",
         "*",
     ]
-    completed = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
-    if completed.returncode == 0:
-        return
-    error = completed.stderr or ""
-    if "PreconditionFailed" in error or "412" in error:
-        return
+    error = ""
+    for attempt in range(4):
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=False,
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired:
+            error = "AWS put-object timed out"
+        else:
+            if completed.returncode == 0:
+                return
+            error = completed.stderr or ""
+            if "PreconditionFailed" in error or "412" in error:
+                return
+        if attempt < 3:
+            time.sleep(0.25 * (2 ** attempt))
     raise PipelineError(f"could not upload s3://{config.s3_bucket}/{key}: {error[-1500:].strip()}")
 
 
@@ -2641,6 +2870,11 @@ def artifact_key(config: Config, task: Task, status: str) -> str:
 
 
 def upload_with_decision_claim(config: Config, artifact_path: Path, task: Task, status: str) -> None:
+    # An operational failure is not a review decision. Keeping the artifact local
+    # preserves diagnostics while leaving the production task eligible for a
+    # clean retry instead of incorrectly unblocking human review.
+    if status == "PIPELINE_ERROR":
+        return
     claim_prefix = config.s3_pre_qc_claim_prefix if config.pre_qc else config.s3_claim_prefix
     claim_key = (
         f"{claim_prefix.strip('/')}/{base64url(task.task_id)}."
@@ -2752,6 +2986,12 @@ def make_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Review only pending/in-review drafts as advisory PRE_QC artifacts in isolated prefixes.",
     )
+    parser.add_argument(
+        "--queue",
+        choices=tuple(QUEUE_ROOTS),
+        default="v2",
+        help="Read and write QC artifacts for the Apollo v2 or isolated Apollo PC queue.",
+    )
     parser.add_argument("--workdir", type=Path, default=DEFAULT_WORKDIR)
     parser.add_argument("--workers", type=int, default=6, help="Maximum simultaneous independent rubric Codex processes.")
     parser.add_argument(
@@ -2763,6 +3003,18 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-seconds", type=int, default=900, help="Timeout per Codex process and API request.")
     parser.add_argument("--retries", type=int, default=1, help="Retries for failed or malformed Codex output.")
     parser.add_argument("--model", default=None, help="Optional Codex model override; defaults to the configured CLI model.")
+    parser.add_argument(
+        "--model-provider",
+        choices=("openai", "amazon-bedrock"),
+        default=None,
+        help="Optional Codex model provider. Amazon Bedrock uses the standard AWS credential chain.",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=("low", "medium", "high", "xhigh"),
+        default=None,
+        help="Optional Codex reasoning-effort override for every worker.",
+    )
     parser.add_argument("--codex-bin", default="codex")
     parser.add_argument(
         "--browser-escalation",
@@ -2773,9 +3025,9 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plan", action="store_true", help="Validate and summarize work without invoking Codex or AWS.")
     parser.add_argument("--no-upload", action="store_true", help="Keep validated results local instead of writing S3.")
     parser.add_argument("--s3-bucket", default=os.environ.get("APOLLO_S3_BUCKET"))
-    parser.add_argument("--s3-pass-prefix", default="v2-review/llm_pass")
-    parser.add_argument("--s3-fail-prefix", default="v2-review/llm_fail")
-    parser.add_argument("--s3-claim-prefix", default="v2-review/llm_claims")
+    parser.add_argument("--s3-pass-prefix", default=None)
+    parser.add_argument("--s3-fail-prefix", default=None)
+    parser.add_argument("--s3-claim-prefix", default=None)
     parser.add_argument("--aws-profile", default=os.environ.get("AWS_PROFILE"))
     parser.add_argument("--aws-region", default=os.environ.get("AWS_REGION"))
     parser.add_argument("--lock-stale-seconds", type=int, default=7200)
@@ -2795,15 +3047,24 @@ def validate_args(args: argparse.Namespace) -> None:
         raise PipelineError("--retries must be between 0 and 3")
     if args.lock_stale_seconds < args.timeout_seconds:
         raise PipelineError("--lock-stale-seconds must be at least --timeout-seconds")
+    if args.model_provider == "amazon-bedrock" and not args.aws_region:
+        raise PipelineError("--aws-region is required with --model-provider amazon-bedrock")
     if not args.no_upload and not args.plan and not args.s3_bucket:
         raise PipelineError("--s3-bucket or APOLLO_S3_BUCKET is required unless --no-upload is used")
+    queue = getattr(args, "queue", "v2")
+    root = QUEUE_ROOTS.get(queue)
+    if not root:
+        raise PipelineError("--queue must be v2 or pc")
     allowed_prefixes = {
-        "s3_pass_prefix": "v2-review/llm_pass",
-        "s3_fail_prefix": "v2-review/llm_fail",
-        "s3_claim_prefix": "v2-review/llm_claims",
+        "s3_pass_prefix": f"{root}/llm_pass",
+        "s3_fail_prefix": f"{root}/llm_fail",
+        "s3_claim_prefix": f"{root}/llm_claims",
     }
     for field, expected in allowed_prefixes.items():
-        if str(getattr(args, field)).strip("/") != expected:
+        provided = getattr(args, field, None)
+        if provided is None:
+            setattr(args, field, expected)
+        elif str(provided).strip("/") != expected:
             raise PipelineError(f"--{field.replace('_', '-')} is fixed to {expected}; source-task prefixes are never writable")
     if not args.plan and shutil.which(args.codex_bin) is None:
         raise PipelineError(f"Codex CLI executable not found: {args.codex_bin}")
@@ -2817,6 +3078,10 @@ def run(args: argparse.Namespace) -> int:
     validate_args(args)
     rows = load_rows(args.input, args.api_url, args.api_token_env, args.timeout_seconds)
     tasks = normalize_tasks(rows, set(args.task_ids) if args.task_ids else None, args.include_reviewed)
+    wrong_queue = [task.task_id for task in tasks if not task_belongs_to_queue(task.task_id, args.queue)]
+    if wrong_queue:
+        preview = ", ".join(wrong_queue[:3])
+        raise PipelineError(f"--queue {args.queue} cannot process task(s) from the other Apollo queue: {preview}")
     if args.pre_qc:
         invalid = [task.task_id for task in tasks if task.workflow_status not in {"pending", "in_review"}]
         if invalid:
@@ -2851,7 +3116,12 @@ def run(args: argparse.Namespace) -> int:
         aws_region=args.aws_region,
         lock_stale_seconds=args.lock_stale_seconds,
         browser_escalation=args.browser_escalation,
+        reasoning_effort=args.reasoning_effort,
         pre_qc=args.pre_qc,
+        s3_pre_qc_pass_prefix=f"{QUEUE_ROOTS[args.queue]}/llm_pre_qc_pass",
+        s3_pre_qc_attention_prefix=f"{QUEUE_ROOTS[args.queue]}/llm_pre_qc_attention",
+        s3_pre_qc_claim_prefix=f"{QUEUE_ROOTS[args.queue]}/llm_pre_qc_claims",
+        model_provider=args.model_provider,
     )
     runner = CodexRunner(config)
     counts = {"LLM_PASS": 0, "LLM_FAIL": 0, "NEEDS_HUMAN_REVIEW": 0, "PIPELINE_ERROR": 0}
@@ -2884,6 +3154,7 @@ def run(args: argparse.Namespace) -> int:
         "schema_version": "apollo-llm-feasibility-run-summary-v2",
         "pipeline_version": PIPELINE_VERSION,
         "review_stage": "PRE_QC" if args.pre_qc else "POST_QC",
+        "queue": args.queue,
         "created_at_utc": utc_now(),
         "tasks_seen": len(tasks),
         "rubrics_seen": total_rubrics,

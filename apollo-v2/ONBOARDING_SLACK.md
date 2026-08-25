@@ -13,20 +13,18 @@
 - Feasible on the live public web.
 - Each step is specific and independently verifiable.
 - **Make it work later:** someone should still be able to do the task weeks or months from now. Use timing such as “next week” or “30 days from when the task starts.” Do not include a fixed date, price, schedule, availability, ranking, or answer that will go out of date.
-- **Make it work anywhere:** tasks are run from servers in another country on a logged-out browser. Check your pages in a private window while signed out — no local phone/OTP, national ID, local payment method, gated login, or country-blocked site. Nothing in a step should depend on a value that changes with the visitor's location.
+- **Make it work anywhere:** tasks run from another country in a logged-out browser. Check the pages in a private window — no local phone/OTP, national ID, local payment method, gated login, or country-blocked site.
 - Do not include sensitive information you are not comfortable sharing.
 
 ## About this task
 
-Below the request box, pick the country the task is anchored in (or **no specific country**) and one to three subjects. Two picks, a few seconds. This is how we keep the collection spread rather than concentrated in one region's web.
-
-Across your own tasks, aim for at most ~⅓ anchored in your home country, at least ~⅓ with no specific country, and no more than two tasks through any one site. Tasks about your own country are welcome — just not most of them.
+Below the request box, pick the country the task is anchored in (or **no specific country**) and one to three subjects. Two quick picks let us measure whether collection is spread across places and topics.
 
 ## Human QC
 
 - Review someone else’s task, never your own.
 - Open and verify every step against the live web.
-- Check it from *your* location, logged out — a distributed reviewer pool is the best portability check we have.
+- Check it from your location while logged out.
 - Edit unclear, duplicated, outdated, or infeasible requirements.
 - Approve only when the complete task is clear, useful, feasible, portable, and will still work later.
 

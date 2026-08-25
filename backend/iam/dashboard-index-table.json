@@ -1,0 +1,43 @@
+{
+  "TableName": "apollo-dashboard-index",
+  "AttributeDefinitions": [
+    {
+      "AttributeName": "scope",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "entity_key",
+      "AttributeType": "S"
+    }
+  ],
+  "KeySchema": [
+    {
+      "AttributeName": "scope",
+      "KeyType": "HASH"
+    },
+    {
+      "AttributeName": "entity_key",
+      "KeyType": "RANGE"
+    }
+  ],
+  "BillingMode": "PAY_PER_REQUEST",
+  "SSESpecification": {
+    "Enabled": true,
+    "SSEType": "KMS"
+  },
+  "DeletionProtectionEnabled": true,
+  "Tags": [
+    {
+      "Key": "Application",
+      "Value": "Apollo"
+    },
+    {
+      "Key": "Purpose",
+      "Value": "DashboardIndex"
+    },
+    {
+      "Key": "DataAuthority",
+      "Value": "S3"
+    }
+  ]
+}

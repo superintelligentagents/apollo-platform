@@ -1,0 +1,38 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PcUploadObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::journeys-prolific/prolific/journeys/*/pc/*"
+    },
+    {
+      "Sid": "PcReviewObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::journeys-prolific/pc-review/*"
+    },
+    {
+      "Sid": "PcScopedBucketListing",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::journeys-prolific",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "prolific/journeys/*/pc/*",
+            "pc-review/*"
+          ]
+        }
+      }
+    }
+  ]
+}

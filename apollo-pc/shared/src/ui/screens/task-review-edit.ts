@@ -2,9 +2,6 @@ import { reviewLlmFeedback, reviewReject, reviewRelease, reviewSubmit, saveClaim
 import { el } from "../components/helpers";
 import type { Ctx } from "../context";
 
-// Matches MIN_REJECTION_REASON_LENGTH in the review backend. An author can
-// appeal a rejection, and an appeal against a four-word verdict wastes two
-// people's time.
 const MIN_REJECT_REASON = 40;
 
 export function plainReviewText(value: string | null | undefined): string | null {
@@ -154,7 +151,14 @@ export function renderTaskReviewEdit(ctx: Ctx): HTMLElement {
     if (rejectReason.value.trim().length < MIN_REJECT_REASON) return;
     (reject as HTMLButtonElement).disabled = true;
     try {
-      await reviewReject(state.reviewKey!, ctx.actions.reviewerName(), claim, rejectReason.value.trim(), ctx.actions.reviewerPid());
+      await reviewReject(
+        state.reviewKey!,
+        ctx.actions.reviewerName(),
+        claim,
+        rejectReason.value.trim(),
+        rubrics.filter((row) => row.text.trim()),
+        ctx.actions.reviewerPid()
+      );
       ctx.actions.endReview("Task rejected with the reason saved.");
     } catch (error) {
       (reject as HTMLButtonElement).disabled = false;

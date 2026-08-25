@@ -23,6 +23,7 @@ export type SavedDraft = {
   generatedDraft: string | null;
   pendingTaskId: string | null;
   pendingCreatedAt: string | null;
+  authoringStartedAt?: string | null;
   savedAt: string;
 };
 
@@ -53,6 +54,7 @@ export function serializeDraftState(state: AppState, savedAt: string): SavedDraf
     generatedDraft: state.generatedDraft,
     pendingTaskId: state.pendingTaskId,
     pendingCreatedAt: state.pendingCreatedAt,
+    authoringStartedAt: state.authoringStartedAt,
     savedAt,
   };
 }
@@ -62,9 +64,8 @@ export function serializeDraftState(state: AppState, savedAt: string): SavedDraf
 // matching basketFingerprints. Returns the screen to land on.
 export function applyDraftState(state: AppState, saved: SavedDraft, template: AppState["activeTemplate"]): Screen {
   state.mode = saved.mode;
-  // Merge onto a fresh draft rather than replacing it: a draft autosaved before
-  // a field existed has no key for it, and assigning wholesale would put
-  // `undefined` where the UI and validation both expect a string or an array.
+  // Old autosaves do not have later-added fields. Merge them onto current
+  // defaults so a refresh never turns required arrays into undefined.
   state.draft = { ...emptyDraft(), ...saved.draft };
   state.guidedSteps = saved.guidedSteps;
   // Older saves predate these fields — fall back to the state defaults so a
@@ -80,6 +81,7 @@ export function applyDraftState(state: AppState, saved: SavedDraft, template: Ap
   state.generatedDraft = saved.generatedDraft;
   state.pendingTaskId = saved.pendingTaskId;
   state.pendingCreatedAt = saved.pendingCreatedAt;
+  state.authoringStartedAt = saved.authoringStartedAt ?? saved.pendingCreatedAt ?? null;
   state.requestDirty = true; // restored text is the user's; don't regenerate over it
 
   // Guided/freeform restore fully. Compose/theme need journeys — if the basket

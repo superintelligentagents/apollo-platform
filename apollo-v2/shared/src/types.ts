@@ -75,9 +75,6 @@ export type GuidedStep = {
   description: string;
 };
 
-// Distribution metadata. Declared by the author, used to monitor how collection
-// is spread across places, sites, and topics — see taxonomy.ts for the reasoning
-// and the vocabularies.
 export type TaskMetadata = {
   // ISO 3166-1 alpha-2, or REGION_GLOBAL when the task has no geographic anchor.
   region: string;
@@ -98,9 +95,8 @@ export type LongTaskRubric = {
   time_span: { start: string | null; end: string | null };
   // Present for guided-mode tasks: the structured substeps behind agent_request.
   steps?: GuidedStep[];
-  // Optional on the type because tasks collected before this field existed are
-  // still valid stored records, and readers must handle them. Authoring-time
-  // validation requires it — see validateLongTask.
+  // Optional so tasks collected before these fields existed remain readable.
+  // Authoring-time validation requires metadata on every new submission.
   metadata?: TaskMetadata;
 };
 
@@ -140,6 +136,14 @@ export type LongTask = {
   };
   // Non-blocking, client-computed effort/richness signals (see quality.ts).
   quality_signals?: import("./quality").QualitySignals;
+  // Authoring timeline (client clock): when the participant chose a mode and
+  // started this draft. created_at is when the draft was assembled to submit.
+  authoring?: { started_at: string | null };
+  // Present only on an author appeal revision. The rejecting reviewer is
+  // excluded server-side; the fresh reviewer sees the author's rationale.
+  appeal_of_sub_key?: string;
+  appeal_number?: number;
+  appeal_reason?: string;
 };
 
 export type ValidationResult = {

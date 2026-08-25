@@ -15,6 +15,7 @@ export type Screen =
   | "examples"
   | "progress"
   | "my-tasks"
+  | "my-task"
   | "review-queue"
   | "review-edit"
   | "trajectory-queue"
@@ -29,8 +30,6 @@ export type TaskDraft = {
   success_criteria: string[];
   required_outputs: string[];
   notes: string;
-  // Distribution metadata. Empty region/subjects mean "not answered yet" —
-  // validation blocks the review step until the author picks.
   region: string;
   subjects: string[];
 };
@@ -74,6 +73,8 @@ export type AppState = {
   // create a second S3 object with a different task_id.
   pendingTaskId: string | null;
   pendingCreatedAt: string | null;
+  // When the participant started this draft (mode chosen) — for authoring-time reporting.
+  authoringStartedAt: string | null;
   keyUrls: string[];
   attachedUrls: string[];
   activeTemplate: TaskTemplate | null;
@@ -90,8 +91,14 @@ export type AppState = {
   // Reviewing: the shared-secret key (persisted per device), the currently
   // claimed task + lock token, and the working rubric rows.
   reviewKey: string | null;
+  // The author's selected submission while the dedicated My Task detail /
+  // editor screen is open. Keeping the full list-row snapshot here lets Back
+  // restore the list without another lookup and lets the detail screen fetch
+  // the complete task by its opaque source key.
+  myTaskSelection: import("../review-client").MyTaskItem | null;
   reviewClaim: import("../review-client").ReviewClaim | null;
   reviewRubrics: import("../review-client").RubricRow[] | null;
+  reviewRemovedRubrics: import("../review-client").RemovedRubric[] | null;
   // Title/request/difficulty edits survive re-renders and refreshes (rubrics
   // already live in reviewRubrics). Null = not yet edited, seed from the task.
   reviewEdits: { title: string; request: string; difficulty: string; evergreenChecked?: boolean } | null;
@@ -149,8 +156,7 @@ export function emptyDraft(): TaskDraft {
     success_criteria: [""],
     required_outputs: [],
     notes: "",
-    // No default region: a pre-filled country would be answered by inattention
-    // and the whole point is to measure where tasks actually land.
+    // Do not guess a country: the author must make the classification.
     region: "",
     subjects: [],
   };
@@ -183,6 +189,7 @@ export function initialState(): AppState {
     requestDirty: false,
     pendingTaskId: null,
     pendingCreatedAt: null,
+    authoringStartedAt: null,
     keyUrls: [],
     attachedUrls: [],
     activeTemplate: null,
@@ -195,8 +202,10 @@ export function initialState(): AppState {
     processed: new Set(),
     afterHistory: null,
     reviewKey: null,
+    myTaskSelection: null,
     reviewClaim: null,
     reviewRubrics: null,
+    reviewRemovedRubrics: null,
     reviewEdits: null,
     trajectoryClaim: null,
     trajectoryJudgment: null,

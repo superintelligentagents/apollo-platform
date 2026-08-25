@@ -46,7 +46,7 @@ function task(): LongTask {
       time_span: { start: null, end: null },
       steps: [{ order: 1, title: "Research", description: "Compare at least three current options." }],
       metadata: {
-        region: "IN",
+        region: "GLOBAL",
         subjects: ["Ecommerce & Shopping > Price Comparison"],
       },
     },
@@ -138,31 +138,17 @@ describe("review gold audit trail", () => {
     ]);
   });
 
-  it("carries the author's distribution metadata into final gold", () => {
+  it("carries the author's country and subjects into final gold", () => {
     const reviewed = buildReviewedTask(task(), {
       title: "Final title",
       request: "Original request with enough detail to run.",
       difficulty: "high",
       rubrics: seedRubrics(task()).map((row) => ({ ...row, checked: true })),
     }) as { task: { metadata?: { region: string; subjects: string[] } } };
-
     expect(reviewed.task.metadata).toEqual({
-      region: "IN",
+      region: "GLOBAL",
       subjects: ["Ecommerce & Shopping > Price Comparison"],
     });
-  });
-
-  it("omits metadata in final gold for tasks authored before the field existed", () => {
-    const legacy = task();
-    delete legacy.task.metadata;
-    const reviewed = buildReviewedTask(legacy, {
-      title: "Final title",
-      request: "Original request with enough detail to run.",
-      difficulty: "high",
-      rubrics: seedRubrics(legacy).map((row) => ({ ...row, checked: true })),
-    }) as { task: Record<string, unknown> };
-
-    expect("metadata" in reviewed.task).toBe(false);
   });
 
   it("removes legacy generated criteria from final gold", () => {
@@ -283,6 +269,27 @@ describe("author feedback + return client", () => {
     await expect(authorEdit("key", "pid", "s1", {} as AuthorEditPayload)).rejects.toThrow("locked for review");
   });
 
+  it("sends the author's rationale with an appeal revision", async () => {
+    const fetchMock = mockPost({ ok: true, new_sub_key: "s2", new_content_hash: "h2", status: "awaiting_codex", appeal: true });
+    const edited = {
+      task_title: "T",
+      agent_request: "R",
+      difficulty: "high",
+      success_criteria: [],
+      steps: [],
+      must_visit_or_reach: [],
+      required_outputs: [],
+      notes: null,
+    } satisfies AuthorEditPayload;
+    await authorEdit("key", "pid", "s1", edited, "2026-08-25T00:00:00Z", "The rejection missed the explicit first-party verification requirement.");
+    const [, init] = lastCall(fetchMock);
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      participant_id: "pid",
+      sub_key: "s1",
+      appeal_reason: "The rejection missed the explicit first-party verification requirement.",
+    });
+  });
+
   it("returns a task to the author with the claim token", async () => {
     const fetchMock = mockPost({ ok: true, returned_key: "rk" });
     const claim: ReviewClaim = {
@@ -292,12 +299,13 @@ describe("author feedback + return client", () => {
       lockTtlMs: 30 * 60 * 1000,
       claimedAtMs: Date.now(),
     };
-    await reviewReturn("key", "reviewer", claim, "Please fix step 1.");
+    await reviewReturn("key", "reviewer", claim, "Please fix step 1.", "reviewer-pid");
     const [url, init] = lastCall(fetchMock);
     expect(String(url)).toContain("/review/return-to-author");
     expect(JSON.parse(init.body as string)).toEqual({
       reviewKey: "key",
       reviewer: "reviewer",
+      reviewer_pid: "reviewer-pid",
       sub_key: "s1",
       token: "tok",
       task_id: "v2/author/internal/task-1",
@@ -411,5 +419,41 @@ describe("author sign-off, amendment, and rejection feedback", () => {
     expect(block.rubrics).toHaveLength(2);
     expect((block.rubrics as Record<string, unknown>[])[0]).toMatchObject({ final: "kept", changed: false });
     expect((block.rubrics as Record<string, unknown>[])[1]).toMatchObject({ final: "rewritten", changed: true });
+  });
+});
+
+describe("session skip memory", () => {
+  it("remembers skips most-recent-last, dedupes, and caps at 50", async () => {
+    const { sessionSkips, rememberReviewSkip, rememberTrajectorySkip } = await import("../src/review-client");
+    sessionSkips.review.length = 0;
+    rememberReviewSkip("sub/a");
+    rememberReviewSkip("sub/b");
+    rememberReviewSkip("sub/a"); // re-skip moves it to the end, no duplicate
+    expect(sessionSkips.review).toEqual(["sub/b", "sub/a"]);
+    rememberReviewSkip(""); // empty keys are ignored
+    expect(sessionSkips.review).toEqual(["sub/b", "sub/a"]);
+    for (let i = 0; i < 60; i++) rememberReviewSkip(`sub/x${i}`);
+    expect(sessionSkips.review).toHaveLength(50);
+    expect(sessionSkips.review[49]).toBe("sub/x59");
+
+    sessionSkips.trajectory.length = 0;
+    rememberTrajectorySkip("v2-review/trajectory-runs/t/r/manifest.json");
+    expect(sessionSkips.trajectory).toEqual(["v2-review/trajectory-runs/t/r/manifest.json"]);
+  });
+
+  it("final gold steps follow the reviewer's row order after insert and reorder", () => {
+    const rows = seedRubrics(task()).map((row) => ({ ...row, checked: true }));
+    // task() seeds one step; add a second original-style row scenario:
+    const inserted: RubricRow = { text: "Verify the source is current.", original: null, checked: true, kind: "step", sourceIndex: null, title: "Added step", seedVersion: 3 };
+    const reordered = [inserted, ...rows]; // reviewer moved the new step FIRST
+    const reviewed = buildReviewedTask(task(), {
+      title: "T", request: "R", difficulty: "high", rubrics: reordered,
+    }) as { task: { steps: Array<{ order: number; title: string; description: string }> } };
+    expect(reviewed.task.steps.map((step) => [step.order, step.description])).toEqual([
+      [1, "Verify the source is current."],
+      [2, "Compare at least three current options."],
+    ]);
+    // Original step metadata (title) rides along wherever the row moves.
+    expect(reviewed.task.steps[1].title).toBe("Research");
   });
 });

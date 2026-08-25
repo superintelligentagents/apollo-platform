@@ -20,7 +20,7 @@
   ],
   "properties": {
     "schema_version": {"type": "string", "const": "apollo-llm-feasibility-artifact-v11"},
-    "pipeline_version": {"type": "string", "const": "apollo-llm-feasibility-v19"},
+    "pipeline_version": {"type": "string", "const": "apollo-llm-feasibility-v22"},
     "task_id": {"type": "string", "minLength": 1, "maxLength": 300},
     "task_content_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "created_at_utc": {"type": "string", "format": "date-time"},

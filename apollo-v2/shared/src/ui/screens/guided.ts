@@ -318,9 +318,6 @@ function renderStepEditor(ctx: Ctx): HTMLElement {
     )
   );
 
-  // This screen — not `form` — is where guided and freeform authors finish, so
-  // the distribution fields have to live here or validation blocks the Review
-  // step with nothing on screen to fix.
   form.append(
     metadataFields(ctx, (key) =>
       el("p", { class: "field-error", dataset: { field: key } }, state.formErrors[key] ?? "")

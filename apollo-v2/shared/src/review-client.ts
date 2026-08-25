@@ -47,7 +47,6 @@ export interface AdminTaskSnapshot {
   difficulty: string;
   criteria: string[];
   steps: { order: number; title: string; description: string }[];
-  // Optional for tasks submitted before the distribution fields existed.
   metadata?: { region?: string; subjects?: string[] };
 }
 
@@ -61,20 +60,26 @@ export interface AdminSubmission {
   status: AdminSubmissionStatus;
   reviewer: string;
   reviewed_at: string;
-  // Recorded from the release that added author sign-off onward; older rows
-  // have neither, because the lock they came from was already deleted.
+  // Recorded for decisions made after author sign-off shipped. Older rows do
+  // not have them because their claim lock has already been deleted.
   claimed_at?: string;
   review_minutes?: number | null;
   rejection_reason: string;
   trajectory_count: number;
   visit_count: number;
   changed: boolean;
+  changed_in_qc?: boolean;
+  appeal_number?: number;
+  author_revision_number?: number;
+  author_requeue_count?: number;
+  author_requeued_at?: string;
+  signoff_action?: "accepted" | "amended" | "";
+  // Admin list pages intentionally contain only compact title-level task
+  // snapshots. The complete prompt/rubrics are fetched when a row opens.
+  detail_loaded?: boolean;
   original: AdminTaskSnapshot;
   final: AdminTaskSnapshot | null;
-  // Distribution metadata sits beside the snapshots rather than inside them:
-  // the server hashes each snapshot wholesale for the reporting content hash,
-  // so a field added there would restate every task's hash. Optional because
-  // tasks authored before the metadata fields shipped carry none.
+  // Resolved once per task rather than duplicated inside both snapshots.
   task_metadata?: { region?: string; subjects?: string[] } | null;
 }
 
@@ -87,13 +92,81 @@ export interface AdminUserSummary {
   in_review: number;
   approved: number;
   rejected: number;
+  // Author-loop rollups are optional for compatibility while the backend and
+  // browser bundle are deployed independently.
+  decided?: number;
+  approval_rate?: number | null;
+  qc_edited_approvals?: number;
+  qc_edit_rate?: number | null;
+  qc_edited_author_accepted?: number;
+  qc_edited_author_amended?: number;
+  qc_edited_awaiting_signoff?: number;
+  author_accepted_approvals?: number;
+  author_amended_approvals?: number;
+  awaiting_signoff?: number;
+  author_amend_rate?: number | null;
+  appealed?: number;
+  double_rejected?: number;
+  author_requeues?: number;
+}
+
+export type AdminReviewerFlag = "no_rejections" | "rarely_edits" | "fast";
+
+export interface AdminReviewerSummary {
+  reviewer: string;
+  reviewed: number;
+  approved: number;
+  rejected: number;
+  edited_approvals: number;
+  unedited_approvals: number;
+  first_reviewed_at: string;
+  last_reviewed_at: string;
+  reject_rate: number;
+  edit_rate: number;
+  median_gap_minutes: number | null;
+  fast_share: number | null;
+  flags: AdminReviewerFlag[];
+  suspicious: boolean;
+}
+
+export interface AdminReopenResult {
+  ok: boolean;
+  task_id: string;
+  previous_outcome: string;
+  previous_reviewers: string[];
+  archived: number;
+  reopened_at: string;
+}
+
+export interface AdminBulkReopenResult {
+  ok: boolean;
+  reviewer: string;
+  matched: number;
+  reopened: number;
+  failed: { task_id: string; error?: string }[];
+  remaining: number;
 }
 
 export interface AdminDashboard {
   items: AdminSubmission[];
   users: AdminUserSummary[];
+  // Reviewer-quality rollup (older backends omit it).
+  reviewers?: AdminReviewerSummary[];
   total: number;
   truncated: boolean;
+  filtered_total?: number;
+  offset?: number;
+  limit?: number;
+  next_offset?: number | null;
+  distribution_items?: { region?: string; subjects?: string[] }[];
+}
+
+export interface AdminDashboardFilters {
+  query?: string;
+  participantId?: string;
+  status?: string;
+  offset?: number;
+  limit?: number;
 }
 
 export interface ReviewClaim {
@@ -194,12 +267,59 @@ export interface TrajectoryRun {
   steps: TrajectoryStep[];
 }
 
+export interface TaskLineageField {
+  original: string;
+  final: string;
+  changed: boolean;
+}
+
+export interface TaskLineageRubric extends Omit<TaskLineageField, "original"> {
+  rubric_id: string;
+  title: string | null;
+  original: string | null;
+}
+
+// How the trainer's authored task compares to the version the agent ran
+// (reviewers may edit title/request/rubrics before a task is exported).
+export interface TaskLineage {
+  task_id: string;
+  status: string;
+  reviewer: string;
+  reviewed_at: string;
+  revision_of_task_id: string | null;
+  changed: boolean;
+  title: TaskLineageField;
+  request: TaskLineageField;
+  rubrics: TaskLineageRubric[];
+}
+
+// An earlier graded run of the same task (or of the task this one revises):
+// the rubric wording the grader saw then, and what they decided.
+export interface PriorTrajectoryGrade {
+  run_id: string;
+  task_id: string;
+  created_at_utc: string | null;
+  agent: string | null;
+  model: string | null;
+  task_prompt: string;
+  graded_by: string;
+  graded_at: string;
+  overall_outcome: string;
+  notes: string;
+  rubrics: { rubric_id: string; requirement: string; verification: string; human_verdict: string; notes: string }[];
+}
+
 export interface TrajectoryClaim {
   manifestKey: string;
   token: string;
   run: TrajectoryRun;
   lockTtlMs: number;
   claimedAtMs: number;
+  // null = server could not find the task's lineage (older Lambda, lookup
+  // failure); the grader then shows no edit history rather than blocking.
+  taskLineage?: TaskLineage | null;
+  // Newest first; empty when this is the first graded run of the task.
+  priorGrades?: PriorTrajectoryGrade[];
 }
 
 export type HumanRubricVerdict = "" | "SUCCESS" | "FAILURE" | "UNJUDGEABLE";
@@ -223,7 +343,9 @@ export interface TrajectoryCounts {
   locked: number;
   pending: number;
   claimable: number;
-  own_pending?: number;
+  assigned_to_you?: number;
+  assigned_to_others?: number;
+  unassigned?: number;
 }
 
 // A rubric row under review: the editable text plus whether the reviewer has
@@ -238,6 +360,12 @@ export interface RubricRow {
   sourceIndex: number | null;
   title: string | null;
   seedVersion: 2 | 3;
+}
+
+export interface RemovedRubric {
+  row: RubricRow;
+  // Position in the complete active + removed ordering at removal time.
+  index: number;
 }
 
 async function post(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -259,8 +387,84 @@ export async function reviewStatus(reviewKey: string, reviewerPid?: string): Pro
   return (await post("/review/status", body)) as unknown as ReviewCounts;
 }
 
-export async function reviewAdmin(reviewKey: string, adminEmail: string): Promise<AdminDashboard> {
-  return (await post("/review/admin", { reviewKey, admin_email: adminEmail })) as unknown as AdminDashboard;
+export async function reviewRegister(
+  reviewKey: string,
+  taskId: string,
+  participantId: string
+): Promise<void> {
+  await post("/review/register", {
+    reviewKey,
+    task_id: taskId,
+    participant_id: participantId,
+  });
+}
+
+export async function reviewAdmin(
+  reviewKey: string,
+  adminEmail: string,
+  filters: AdminDashboardFilters = {}
+): Promise<AdminDashboard> {
+  return (await post("/review/admin", {
+    reviewKey,
+    admin_email: adminEmail,
+    query: filters.query ?? "",
+    participant_id: filters.participantId ?? "",
+    status: filters.status ?? "",
+    offset: filters.offset ?? 0,
+    limit: filters.limit ?? 50,
+  })) as unknown as AdminDashboard;
+}
+
+export async function reviewAdminDetail(
+  reviewKey: string,
+  adminEmail: string,
+  taskId: string
+): Promise<AdminSubmission> {
+  const response = await post("/review/admin", {
+    reviewKey,
+    admin_email: adminEmail,
+    action: "detail",
+    task_id: taskId,
+  });
+  return response.item as unknown as AdminSubmission;
+}
+
+// Throw one decided task back into the review pool (admin only). The
+// previous reviewer never gets it again.
+export async function reviewAdminReopen(
+  reviewKey: string,
+  adminEmail: string,
+  taskId: string,
+  reason = ""
+): Promise<AdminReopenResult> {
+  return (await post("/review/admin", {
+    reviewKey,
+    admin_email: adminEmail,
+    action: "reopen",
+    task_id: taskId,
+    reason,
+  })) as unknown as AdminReopenResult;
+}
+
+// Bulk variant: re-queue one reviewer's decisions (default: approvals they
+// did not edit). The server bounds each call; `remaining` says whether to
+// call again.
+export async function reviewAdminReopenByReviewer(
+  reviewKey: string,
+  adminEmail: string,
+  reviewer: string,
+  options: { onlyUnedited?: boolean; outcome?: "approved" | "rejected"; reason?: string; limit?: number } = {}
+): Promise<AdminBulkReopenResult> {
+  return (await post("/review/admin", {
+    reviewKey,
+    admin_email: adminEmail,
+    action: "reopen_by_reviewer",
+    reviewer,
+    only_unedited: options.onlyUnedited ?? true,
+    outcome: options.outcome ?? "approved",
+    reason: options.reason ?? "",
+    limit: options.limit ?? 20,
+  })) as unknown as AdminBulkReopenResult;
 }
 
 export async function contributionStatus(
@@ -275,11 +479,32 @@ export async function contributionStatus(
   })) as unknown as ContributionCounts;
 }
 
+// Session-scoped skip memory. Skipping a task means "not now", not "never":
+// the next claim sends these keys so the server serves everything else first
+// and only falls back to a skipped task when it's all that's left (the queue
+// never dead-ends). In-memory on purpose — a reload clears the list, so a
+// skip can't shrink anyone's queue permanently. Exported for tests.
+export const sessionSkips: { review: string[]; trajectory: string[] } = { review: [], trajectory: [] };
+function rememberSkip(list: string[], key: string): void {
+  if (!key) return;
+  const existing = list.indexOf(key);
+  if (existing !== -1) list.splice(existing, 1);
+  list.push(key);
+  if (list.length > 50) list.shift();
+}
+export function rememberReviewSkip(subKey: string): void {
+  rememberSkip(sessionSkips.review, subKey);
+}
+export function rememberTrajectorySkip(manifestKey: string): void {
+  rememberSkip(sessionSkips.trajectory, manifestKey);
+}
+
 // reviewerPid keeps the server from ever handing a reviewer their own
 // submission (the sub_key embeds the submitter's participant id).
 export async function reviewClaim(reviewKey: string, reviewer: string, reviewerPid?: string): Promise<ReviewClaim | null> {
   const body: Record<string, unknown> = { reviewKey, reviewer };
   if (reviewerPid) body.reviewer_pid = reviewerPid;
+  if (sessionSkips.review.length) body.skip_keys = [...sessionSkips.review];
   const res = await post("/review/claim", body);
   if (!res.sub_key) return null;
   const claimStub = {
@@ -322,6 +547,7 @@ export async function trajectoryStatus(reviewKey: string, reviewerPid?: string):
 export async function trajectoryClaim(reviewKey: string, reviewer: string, reviewerPid?: string): Promise<TrajectoryClaim | null> {
   const body: Record<string, unknown> = { reviewKey, reviewer };
   if (reviewerPid) body.reviewer_pid = reviewerPid;
+  if (sessionSkips.trajectory.length) body.skip_keys = [...sessionSkips.trajectory];
   const res = await post("/trajectory/claim", body);
   if (!res.manifest_key) return null;
   return {
@@ -330,6 +556,8 @@ export async function trajectoryClaim(reviewKey: string, reviewer: string, revie
     run: res.run as unknown as TrajectoryRun,
     lockTtlMs: Number(res.lock_ttl_ms) || 30 * 60 * 1000,
     claimedAtMs: Date.now(),
+    taskLineage: (res.task_lineage as TaskLineage | null | undefined) ?? null,
+    priorGrades: Array.isArray(res.prior_grades) ? (res.prior_grades as PriorTrajectoryGrade[]) : [],
   };
 }
 
@@ -340,12 +568,14 @@ export async function trajectoryRelease(reviewKey: string, claim: TrajectoryClai
 export async function trajectorySubmit(
   reviewKey: string,
   reviewer: string,
+  reviewerPid: string,
   claim: TrajectoryClaim,
   judgment: TrajectoryJudgmentDraft
 ): Promise<void> {
   await post("/trajectory/submit", {
     reviewKey,
     reviewer,
+    reviewer_pid: reviewerPid,
     manifest_key: claim.manifestKey,
     token: claim.token,
     judgment,
@@ -374,9 +604,6 @@ export async function reviewFinishedList(reviewKey: string): Promise<FinishedIte
   return (res.items as FinishedItem[]) ?? [];
 }
 
-// `rubrics` are the reviewer's working rows at the moment they rejected. They
-// reach the author as step-level feedback with no attribution, so a rejection
-// says which steps failed rather than only a summary sentence.
 export async function reviewReject(
   reviewKey: string,
   reviewer: string,
@@ -397,9 +624,8 @@ export async function reviewReject(
   });
 }
 
-// The same per-rubric audit shape buildReviewedTask writes into final gold, so
-// the server sanitizes both through cleanRubrics and the author's screen
-// renders them with one component.
+// Match the per-rubric audit shape written on approval. The backend sanitizes
+// it before exposing it to the author and deliberately omits reviewer identity.
 export function rejectionReviewBlock(rubrics: RubricRow[]): Record<string, unknown> {
   return {
     rubrics: rubrics
@@ -421,6 +647,8 @@ export function rejectionReviewBlock(rubrics: RubricRow[]): Record<string, unkno
 export interface ClaimSnapshot {
   claim: ReviewClaim;
   rubrics: RubricRow[] | null;
+  // Optional so snapshots written by earlier builds continue to resume.
+  removedRubrics?: RemovedRubric[] | null;
   edits: { title: string; request: string; difficulty: string; evergreenChecked?: boolean } | null;
 }
 
@@ -490,8 +718,9 @@ export async function clearTrajectoryClaimSnapshot(storage: Store): Promise<void
   await storage.set(TRAJECTORY_CLAIM_KEY, "").catch(() => {});
 }
 
-export async function reviewRelease(reviewKey: string, claim: ReviewClaim): Promise<void> {
-  await post("/review/release", { reviewKey, sub_key: claim.subKey, token: claim.token });
+export async function reviewRelease(reviewKey: string, claim: ReviewClaim, reviewer = ""): Promise<void> {
+  // reviewer attributes the skip marker the server writes on release.
+  await post("/review/release", { reviewKey, sub_key: claim.subKey, token: claim.token, reviewer });
 }
 
 export async function reviewSubmit(
@@ -520,17 +749,20 @@ export function buildReviewedTask(
 ): Record<string, unknown> {
   const criterionRows = edited.rubrics.filter((r) => r.kind !== "step");
   const stepRows = edited.rubrics.filter((r) => r.kind === "step");
-  const finalSteps = (t.task.steps ?? []).flatMap((step, sourceIndex) => {
-    const row = stepRows.find((candidate) => candidate.sourceIndex === sourceIndex);
-    return row ? [{ ...step, description: row.text.trim() }] : [];
-  });
-  const addedSteps = stepRows
-    .filter((row) => row.sourceIndex === null)
-    .map((row, index) => ({
-      order: finalSteps.length + index + 1,
-      title: row.title?.trim() || `Step ${finalSteps.length + index + 1}`,
-      description: row.text.trim(),
-    }));
+  // Final gold follows the reviewer's row ORDER (rows can be inserted,
+  // reordered, and removed). Original-step metadata rides along via
+  // sourceIndex; order is always re-numbered positionally.
+  const finalSteps = stepRows
+    .filter((row) => row.text.trim())
+    .map((row, index) => {
+      const source = row.sourceIndex !== null ? t.task.steps?.[row.sourceIndex] : undefined;
+      return {
+        ...(source ?? {}),
+        order: index + 1,
+        title: row.title?.trim() || source?.title || `Step ${index + 1}`,
+        description: row.text.trim(),
+      };
+    });
   const sourceHasSteps = (t.task.steps?.length ?? 0) > 0;
   const finalTask = {
     task_title: edited.title.trim(),
@@ -545,13 +777,10 @@ export function buildReviewedTask(
     must_visit_or_reach: t.task.must_visit_or_reach,
     required_outputs: t.task.required_outputs,
     notes: t.task.notes,
-    // Carried forward, not re-derived. Final gold is the copy the reporting
-    // feed counts, so distribution metadata that survives authoring but not
-    // review would leave approved tasks — exactly the ones worth counting —
-    // invisible. Reviewers cannot edit it yet; when they can, this should take
-    // the edited value the way title and request already do.
+    // Keep the author's classification with final gold. Reviewers edit the
+    // task and rubrics, not this distribution metadata.
     ...(t.task.metadata ? { metadata: t.task.metadata } : {}),
-    ...(((t.task.steps?.length ?? 0) || addedSteps.length) ? { steps: [...finalSteps, ...addedSteps] } : {}),
+    ...((sourceHasSteps || finalSteps.length) ? { steps: finalSteps } : {}),
   };
   const originalTask = {
     task_title: t.task.task_title,
@@ -664,11 +893,8 @@ export interface MyTaskItem {
   submitted_at: string | null;
   rejection_reason?: string;
   returned_reason?: string;
-  returned_by?: string;
   content_hash: string | null;
-  // Approved tasks only. The reviewer is named so the author can follow up with
-  // whoever edited their work; rejections stay anonymous.
-  reviewed_by?: string;
+  // Whether human QC changed the task, without identifying the reviewer.
   reviewer_changed?: boolean;
   revision_count?: number;
   // Approved and not yet acknowledged — this is what the sign-off queue lists.
@@ -678,6 +904,7 @@ export interface MyTaskItem {
   // Rejected tasks: how many times, and whether the one appeal is still open.
   rejection_count?: number;
   can_appeal?: boolean;
+  appeal_unavailable_reason?: string;
 }
 
 export interface MyTaskPage {
@@ -691,9 +918,8 @@ export interface MyTaskPage {
   awaiting_signoff_total: number;
 }
 
-// One thing that happened to a task, oldest first. `by` is present on an
-// approval and on the author's own actions, and deliberately absent on a
-// rejection or a return.
+// One thing that happened to a task, oldest first. Author-facing history keeps
+// `by` empty so no reviewer identity can cross this contract.
 export interface MyTaskHistoryEntry {
   at: string;
   event: "submitted" | "revised" | "appealed" | "returned" | "rejected" | "approved" | "accepted" | "amended";
@@ -712,10 +938,6 @@ export interface MyTaskContentSnapshot {
 export interface MyTaskHumanReviewRubric {
   rubric_id: string;
   kind: string;
-  // The index of the step this rubric came from in the author's ORIGINAL task,
-  // or null for a step the reviewer added. Optional: records reviewed before
-  // this shipped, and the rejection-feedback payload, may omit it.
-  source_index?: number | null;
   title: string | null;
   original: string | null;
   final: string;
@@ -730,7 +952,6 @@ export interface MyTaskHumanReview {
   title_edited: boolean;
   request_edited: boolean;
   evergreen_verified: boolean;
-  reviewed_by?: string;
   // Whether the reviewer altered anything at all.
   changed?: boolean;
   revision_count?: number;
@@ -770,7 +991,6 @@ export interface MyTaskFeedback {
   human_review?: MyTaskHumanReview;
   rejection_reason?: string;
   returned_reason?: string;
-  returned_by?: string;
   task?: MyTaskCurrentContent;
   // The full final gold, for approved tasks. The amend form seeds from this:
   // an author correcting an approved task starts from the reviewer's version.
@@ -810,6 +1030,7 @@ export interface AuthorAmendResult {
   revision_count: number;
   new_content_hash: string;
   amended_at?: string;
+  author_approved_key?: string;
   idempotent?: boolean;
 }
 
@@ -851,13 +1072,13 @@ export async function authorSignoff(
   participantId: string,
   subKey: string,
   openedAt?: string | null
-): Promise<{ ok: true; action: string; signed_off_at: string }> {
+): Promise<{ ok: true; action: string; signed_off_at: string; author_approved_key?: string }> {
   return (await post("/review/author-signoff", {
     reviewKey,
     participant_id: participantId,
     sub_key: subKey,
     opened_at: openedAt ?? null,
-  })) as unknown as { ok: true; action: string; signed_off_at: string };
+  })) as unknown as { ok: true; action: string; signed_off_at: string; author_approved_key?: string };
 }
 
 // The author's correction of their own approved task becomes the new final
@@ -896,15 +1117,18 @@ export async function authorEdit(
   participantId: string,
   subKey: string,
   edited: AuthorEditPayload,
-  editStartedAt?: string | null
+  editStartedAt?: string | null,
+  appealReason?: string | null
 ): Promise<AuthorEditResult> {
-  return (await post("/review/author-edit", {
+  const body: Record<string, unknown> = {
     reviewKey,
     participant_id: participantId,
     sub_key: subKey,
     edited,
     edit_started_at: editStartedAt ?? null,
-  })) as unknown as AuthorEditResult;
+  };
+  if (appealReason != null) body.appeal_reason = appealReason;
+  return (await post("/review/author-edit", body)) as unknown as AuthorEditResult;
 }
 
 // Mirrors reviewReject: the reviewer holds the claim lock and sends the task
@@ -913,11 +1137,13 @@ export async function reviewReturn(
   reviewKey: string,
   reviewer: string,
   claim: ReviewClaim,
-  reason: string
+  reason: string,
+  reviewerPid?: string
 ): Promise<void> {
   await post("/review/return-to-author", {
     reviewKey,
     reviewer,
+    reviewer_pid: reviewerPid,
     sub_key: claim.subKey,
     token: claim.token,
     task_id: claim.task.task_id,

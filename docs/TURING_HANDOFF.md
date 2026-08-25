@@ -4,7 +4,7 @@
 
 Repository access alone does not grant production access. A maintainer may need some or all of:
 
-1. Read access to the private GitHub repository.
+1. Write access to the public GitHub repository when contributing changes.
 2. Apollo reviewer/admin access through the server-side email allowlist.
 3. Vercel project access for `apollo-v2-site` and `apollo-pc-site` if deploying frontends.
 4. A least-privilege AWS role for the required job.
@@ -81,7 +81,12 @@ Use `scripts/trajectory_review/prepare.py` to publish already-generated evaluato
 
 ## Deployment
 
-The current Vercel sites were deployed from local production builds, not from an automatic GitHub build. Workspace dependencies make local prebuilt deployment the supported path. Follow each app README exactly and keep `VITE_REVIEW_KEY` in the approved deploy environment only.
+Apollo V2 deploys automatically from `main` through the `apollo-v2-site`
+Vercel project's native Git integration. The project builds from the
+`apollo-v2` monorepo root, and Vercel injects `VITE_REVIEW_KEY` from its
+Production environment. Pull requests that touch V2 run the repository's V2
+CI workflow before merge. Follow each app README for its manual fallback and
+keep every production key in the approved deploy environment only.
 
 The backend is the `journeys-presign` Lambda. Treat backend deployment as a separate privileged operation. Verify tests and the deployed source hash before changing production.
 

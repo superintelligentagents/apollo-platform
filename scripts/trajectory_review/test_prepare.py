@@ -5,7 +5,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
-from scripts.trajectory_review.prepare import PackageError, load_steps, prepare_one, put_object_if_absent, select_task_results, validate_manifest
+from scripts.trajectory_review.prepare import PackageError, load_steps, prepare_one, put_object_if_absent, select_task_results, task_belongs_to_queue, upload_package, validate_manifest
 
 
 class PrepareTrajectoryTests(unittest.TestCase):
@@ -47,6 +47,7 @@ class PrepareTrajectoryTests(unittest.TestCase):
         manifest_path, manifest = prepare_one(self._result(run_dir), eval_path, self.root / "out")
 
         self.assertEqual(manifest["schema_version"], "apollo-trajectory-review-package-v1")
+        self.assertEqual(manifest["creator_pid"], "alice")
         self.assertEqual(manifest["metrics"]["num_steps"], 2)
         self.assertEqual(manifest["metrics"]["num_screenshots"], 1)
         self.assertEqual(manifest["metrics"]["judge_errors"], 0)
@@ -131,6 +132,7 @@ class PrepareTrajectoryTests(unittest.TestCase):
                 "schema_version": "apollo-trajectory-review-package-v1",
                 "run_id": "run",
                 "task_id": "task",
+                "creator_pid": "alice",
                 "task_prompt": "prompt",
                 "rubrics": [{"rubric_id": "R1"}],
                 "steps": [{"index": 0, "screenshot_path": "../secret.png"}],
@@ -155,6 +157,35 @@ class PrepareTrajectoryTests(unittest.TestCase):
         with patch("scripts.trajectory_review.prepare.subprocess.run") as run:
             run.return_value = CompletedProcess([], 255, "", "PreconditionFailed (412)")
             self.assertFalse(put_object_if_absent(source, "bucket", "manifest.json", content_type="application/json"))
+
+    def test_pc_queue_upload_uses_pc_trajectory_prefixes(self):
+        package_dir = self.root / "pc-package"
+        package_dir.mkdir()
+        manifest_path = package_dir / "manifest.json"
+        manifest_path.write_text("{}", encoding="utf-8")
+        manifest = {"task_id": "pc_task-a", "run_id": "run-a", "creator_pid": "alice"}
+        with patch("scripts.trajectory_review.prepare.subprocess.run") as run:
+            run.return_value = CompletedProcess([], 0, "", "")
+            key = upload_package(manifest_path, manifest, "bucket", queue="pc")
+        self.assertTrue(key.startswith("pc-review/trajectory-runs/"))
+        commands = [" ".join(call.args[0]) for call in run.call_args_list]
+        self.assertTrue(any("pc-review/trajectory-inbox/" in command for command in commands))
+
+    def test_queue_identity_prevents_cross_app_trajectory_uploads(self):
+        self.assertTrue(task_belongs_to_queue("pc_task-a", "pc"))
+        self.assertFalse(task_belongs_to_queue("v2/alice/internal/task-a", "pc"))
+        self.assertFalse(task_belongs_to_queue("pc_task-a", "v2"))
+        package_dir = self.root / "wrong-queue"
+        package_dir.mkdir()
+        manifest_path = package_dir / "manifest.json"
+        manifest_path.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(PackageError, "does not belong"):
+            upload_package(
+                manifest_path,
+                {"task_id": "v2/alice/internal/task-a", "run_id": "run-a", "creator_pid": "alice"},
+                "bucket",
+                queue="pc",
+            )
 
 
 if __name__ == "__main__":

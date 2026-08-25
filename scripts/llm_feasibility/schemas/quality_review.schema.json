@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://apollo.internal/schemas/task-quality-review-v4.json",
+  "$id": "https://apollo.internal/schemas/task-quality-review-v5.json",
   "title": "Apollo task quality and step alignment review",
   "type": "object",
   "additionalProperties": false,
@@ -15,7 +15,7 @@
     "rubric_assessments"
   ],
   "properties": {
-    "schema_version": {"type": "string", "const": "apollo-task-quality-review-v4"},
+    "schema_version": {"type": "string", "const": "apollo-task-quality-review-v5"},
     "task_id": {"type": "string", "minLength": 1, "maxLength": 300},
     "overall_verdict": {"type": "string", "enum": ["PASS", "FAIL", "NEEDS_HUMAN_REVIEW"]},
     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
@@ -29,12 +29,14 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["rubric_id", "verdict", "summary", "issues"],
+        "required": ["rubric_id", "verdict", "summary", "issues", "request_support", "introduced_requirements"],
         "properties": {
           "rubric_id": {"type": "string", "minLength": 1, "maxLength": 100},
           "verdict": {"type": "string", "enum": ["PASS", "FAIL", "NEEDS_HUMAN_REVIEW"]},
           "summary": {"type": "string", "minLength": 1, "maxLength": 360},
-          "issues": {"type": "array", "maxItems": 3, "items": {"type": "string", "minLength": 1, "maxLength": 360}}
+          "issues": {"type": "array", "maxItems": 3, "items": {"type": "string", "minLength": 1, "maxLength": 360}},
+          "request_support": {"type": "array", "maxItems": 3, "items": {"type": "string", "minLength": 1, "maxLength": 360}},
+          "introduced_requirements": {"type": "array", "maxItems": 3, "items": {"type": "string", "minLength": 1, "maxLength": 360}}
         }
       }
     }

@@ -119,9 +119,7 @@ export function renderTrajectoryQueue(ctx: Ctx): HTMLElement {
           el("div", { class: "queue-tile" }, el("strong", null, String(counts.locked)), el("span", null, "being judged")),
           el("div", { class: "queue-tile" }, el("strong", null, String(counts.finished)), el("span", null, "human-reviewed"))
         ),
-        ...(counts.own_pending
-          ? [el("p", { class: "muted small" }, `${counts.own_pending} run${counts.own_pending === 1 ? " is" : "s are"} from your own task and excluded.`)]
-          : []),
+        el("p", { class: "muted small" }, "Runs here are assigned to the expert who originally created the task, not the person who reviewed it."),
         claimButton,
         el("p", { class: "muted small queue-explainer" }, "One reviewer holds a run for 30 minutes. Your grade is saved separately from the original task and trajectory.")
       );

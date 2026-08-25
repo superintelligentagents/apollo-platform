@@ -53,7 +53,7 @@ export function renderHome(ctx: Ctx): HTMLElement {
         index: "01",
         title: "Submit tasks",
         body: "Describe a realistic web project with enough research, comparison, verification, and output work to take an hour or longer.",
-        meta: `${ctx.state.uploadedCount} submitted`,
+        meta: "Create a new task",
         onpick: () => ctx.actions.goto("submit"),
       }),
       choice({

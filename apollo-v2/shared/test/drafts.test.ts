@@ -48,8 +48,8 @@ describe("bracket validation", () => {
         notes: null,
         time_span: deriveTimeSpan([]),
         metadata: {
-          region: "US",
-          subjects: ["Travel and Tourism > Air Travel"],
+          region: "GLOBAL",
+          subjects: ["Travel and Tourism > Travel and Tourism - Other"],
         },
       },
       sourceJourneys: [],

@@ -6,6 +6,7 @@ describe("refresh routing", () => {
     expect(screenFromHash("#/home")).toBe("home");
     expect(screenFromHash("#/submit")).toBe("submit");
     expect(screenFromHash("#/review-queue")).toBe("review-queue");
+    expect(screenFromHash("#/my-task")).toBe("my-task");
     expect(screenFromHash("#/trajectory-review")).toBe("trajectory-queue");
     expect(screenFromHash("#/trajectory-judge")).toBe("trajectory-edit");
     expect(screenFromHash("#/examples")).toBe("examples");

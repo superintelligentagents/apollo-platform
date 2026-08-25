@@ -3,6 +3,7 @@ import cors from "cors";
 import dotenv from "dotenv";
 import { S3Client } from "@aws-sdk/client-s3";
 import { createPresignedPost } from "@aws-sdk/s3-presigned-post";
+import { uploadScopeAllows } from "./lambda_presign.js";
 
 dotenv.config();
 
@@ -23,6 +24,7 @@ const {
   S3_BUCKET,
   UPLOAD_PREFIX = "uploads/",
   MAX_FILE_BYTES = "5000000",
+  APP_SCOPE = "primary",
 } = process.env;
 
 if (!AWS_REGION || !AWS_ACCESS_KEY_ID || !AWS_SECRET_ACCESS_KEY || !S3_BUCKET) {
@@ -67,6 +69,9 @@ app.post("/presign", async (req, res) => {
       if (!validFilename || contentType !== "application/json") {
         return res.status(400).json({ error: "Invalid pc upload type" });
       }
+    }
+    if (!uploadScopeAllows(APP_SCOPE, isV2, isPC)) {
+      return res.status(400).json({ error: `This upload type is not enabled for the ${APP_SCOPE} API` });
     }
     // Mirror lambda_presign.js key layout so dev uploads match prod.
     const key = `${UPLOAD_PREFIX}${participantId}/${taskId}/${Date.now()}_${filename}`;

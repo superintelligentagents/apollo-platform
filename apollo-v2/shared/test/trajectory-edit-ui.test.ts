@@ -76,4 +76,139 @@ describe("human trajectory grader", () => {
     followUp.dispatchEvent(new Event("input", { bubbles: true }));
     expect(root.querySelector<HTMLButtonElement>(".trajectory-submit")?.disabled).toBe(false);
   });
+
+  function claimWith(taskLineage: unknown) {
+    return {
+      manifestKey: "v2-review/trajectory-runs/task/run/manifest.json",
+      token: "token",
+      claimedAtMs: Date.now(),
+      lockTtlMs: 30 * 60 * 1000,
+      run: {
+        schema_version: "apollo-trajectory-review-package-v1",
+        run_id: "run-2",
+        task_id: "v2/alice/internal/task-2",
+        task_prompt: "Find a hotel near Hongdae for 3 nights under $150/night.",
+        created_at_utc: "2026-08-11T00:00:00Z",
+        source: { evaluator_format: null, source_result_sha256: null, run_directory_name: null, trajectory_filename: null, agent: null, model: null, run_label: null },
+        metrics: { num_steps: 1, num_screenshots: 0 },
+        rubrics: [
+          { rubric_id: "rubric-1", requirement: "Hotel is within 1 km of Hongdae station", verification: "Check the map." },
+          { rubric_id: "rubric-2", requirement: "Booking covers three nights", verification: "Check the dates." },
+        ],
+        steps: [{ index: 0, step_number: 1, action: "finish", response: "Done", final: true, screenshot_path: null, screenshot_url: null }],
+      },
+      taskLineage,
+    };
+  }
+
+  function ctxFor(claim: unknown) {
+    const state = initialState();
+    state.reviewKey = "review-key";
+    state.trajectoryClaim = claim as typeof state.trajectoryClaim;
+    return {
+      state,
+      adapter: { storage: { set: vi.fn(async () => {}), get: vi.fn(async () => null) } },
+      actions: { reviewerName: () => "Reviewer" },
+    } as unknown as Ctx;
+  }
+
+  it("shows reviewer edits to the trainer's own task inline (request + rubric diffs)", () => {
+    const root = renderTrajectoryEdit(ctxFor(claimWith({
+      task_id: "v2/alice/internal/task-2",
+      status: "approved",
+      reviewer: "Riya",
+      reviewed_at: "2026-08-12T00:00:00Z",
+      revision_of_task_id: null,
+      changed: true,
+      title: { original: "Seoul trip", final: "Seoul trip", changed: false },
+      request: { original: "Find a hotel near Hongdae for 3 nights.", final: "Find a hotel near Hongdae for 3 nights under $150/night.", changed: true },
+      rubrics: [
+        { rubric_id: "rubric-1", title: "Step 1", original: "Hotel is near Hongdae", final: "Hotel is within 1 km of Hongdae station", changed: true },
+        { rubric_id: "rubric-2", title: "Step 2", original: "Booking covers three nights", final: "Booking covers three nights", changed: false },
+      ],
+    })));
+
+    const note = root.querySelector(".trajectory-lineage-note.changed");
+    expect(note?.textContent).toContain("Edited in review by Riya");
+    expect(note?.textContent).toContain("request · 1 rubric");
+    // Prompt opens in diff mode: inserted words highlighted, struck originals kept.
+    const reference = root.querySelector<HTMLDetailsElement>(".trajectory-task-reference")!;
+    expect(reference.hasAttribute("open")).toBe(true);
+    expect(reference.querySelector(".trajectory-prompt-text .diff-ins")?.textContent).toContain("$150/night");
+    expect(reference.querySelector(".trajectory-prompt-text .diff-del")?.textContent).toBe("nights.");
+    const toggle = reference.querySelector<HTMLButtonElement>(".trajectory-prompt-toggle")!;
+    expect(toggle.textContent).toBe("Show as run");
+    toggle.click();
+    expect(reference.querySelector(".trajectory-prompt-text .diff-ins")).toBeNull();
+    expect(reference.querySelector(".trajectory-prompt-text")?.textContent).toBe("Find a hotel near Hongdae for 3 nights under $150/night.");
+    expect(toggle.textContent).toBe("Show my edits");
+
+    // Rubric 1 carries an inline diff; rubric 2 does not.
+    expect(root.querySelector(".rubric-judge .rubric-lineage")?.textContent).toContain("EDITED IN REVIEW");
+    expect(root.querySelector(".rubric-judge .rubric-lineage .diff-ins")?.textContent).toContain("within 1 km");
+    expect(root.querySelectorAll(".trajectory-rubric-chip.edited")).toHaveLength(1);
+    root.dispatchEvent(new KeyboardEvent("keydown", { key: "s", bubbles: true }));
+    expect(root.querySelector(".rubric-judge .rubric-lineage")).toBeNull();
+  });
+
+  it("says so plainly when the task ran exactly as written, and stays quiet without lineage", () => {
+    const unchanged = renderTrajectoryEdit(ctxFor(claimWith({
+      task_id: "v2/alice/internal/task-2",
+      status: "approved",
+      reviewer: "Riya",
+      reviewed_at: "2026-08-12T00:00:00Z",
+      revision_of_task_id: null,
+      changed: false,
+      title: { original: "Seoul trip", final: "Seoul trip", changed: false },
+      request: { original: "Find a hotel near Hongdae for 3 nights under $150/night.", final: "Find a hotel near Hongdae for 3 nights under $150/night.", changed: false },
+      rubrics: [],
+    })));
+    expect(unchanged.querySelector(".trajectory-lineage-note.unchanged")?.textContent).toContain("Ran exactly as you wrote it.");
+    expect(unchanged.querySelector(".trajectory-prompt-toggle")).toBeNull;
+    expect(unchanged.querySelector<HTMLButtonElement>(".trajectory-prompt-toggle")?.hidden).toBe(true);
+    expect(unchanged.querySelector(".rubric-lineage")).toBeNull();
+
+    const noLineage = renderTrajectoryEdit(ctxFor(claimWith(null)));
+    expect(noLineage.querySelector(".trajectory-lineage-note")).toBeNull();
+    expect(noLineage.querySelector(".trajectory-prompt-text")?.textContent).toBe("Find a hotel near Hongdae for 3 nights under $150/night.");
+  });
+
+  it("shows the previous run's grade per rubric, with the rubric wording as it read then", () => {
+    const claim = claimWith(null) as Record<string, unknown>;
+    claim.priorGrades = [{
+      run_id: "run-1",
+      task_id: "v2/alice/internal/task-2",
+      created_at_utc: "2026-08-10T00:00:00Z",
+      agent: "Skyvern",
+      model: "Claude Opus 5",
+      task_prompt: "Find a hotel near Hongdae for 3 nights.",
+      graded_by: "Alice",
+      graded_at: "2026-08-12T00:00:00Z",
+      overall_outcome: "EDIT_NEEDED",
+      notes: "Rubric 1 was too vague about distance.",
+      rubrics: [
+        { rubric_id: "rubric-1", requirement: "Hotel is near Hongdae", verification: "Check the map.", human_verdict: "UNJUDGEABLE", notes: "Near is undefined." },
+        { rubric_id: "rubric-2", requirement: "Booking covers three nights", verification: "Check the dates.", human_verdict: "SUCCESS", notes: "" },
+      ],
+    }];
+    const root = renderTrajectoryEdit(ctxFor(claim));
+    const note = root.querySelector(".trajectory-prior-note")!;
+    expect(note.textContent).toContain("Previous run graded Edit needed");
+    expect(note.textContent).toContain("1/2 rubrics passed");
+    expect(note.textContent).toContain("1 rubric reworded since");
+    expect(note.textContent).toContain("Rubric 1 was too vague about distance.");
+    const rows = note.querySelectorAll("tbody tr");
+    expect(rows[0].textContent).toContain("Unclear");
+    expect(rows[0].querySelector(".diff-ins")?.textContent).toContain("within 1 km");
+    expect(rows[1].textContent).toContain("Pass");
+    expect(rows[1].textContent).toContain("unchanged");
+    // Judge pane for rubric 1 carries the previous verdict + reword diff.
+    const priorBlock = root.querySelector(".rubric-judge .rubric-prior")!;
+    expect(priorBlock.textContent).toContain("PREVIOUS RUN");
+    expect(priorBlock.textContent).toContain("Unclear");
+    expect(priorBlock.textContent).toContain("Near is undefined.");
+    expect(priorBlock.querySelector(".diff-del")?.textContent).toBe("near");
+    // Without prior grades nothing is shown.
+    expect(renderTrajectoryEdit(ctxFor(claimWith(null))).querySelector(".trajectory-prior-note")).toBeNull();
+  });
 });

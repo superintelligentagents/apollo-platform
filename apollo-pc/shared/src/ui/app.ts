@@ -562,10 +562,11 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         state.busy = "Preparing your bundle…";
         render();
         try {
-          // Parts first, manifest LAST — the lambda's review-inbox marker only
-          // fires on manifest.json, so an interrupted upload never produces a
-          // claimable half-bundle. Assembly is shared with the review screen's
-          // download-preview, so what you previewed is exactly what ships.
+          // Parts first, manifest LAST. Review-safe task sidecars are uploaded
+          // only after that complete bundle, so an interrupted upload never
+          // produces a claimable task. Assembly is shared with the review
+          // screen's download-preview, so what you previewed is exactly what
+          // ships.
           const { uploads, manifestBody, privacyAudit, sanitizedTasks } = await assembleBundle(
             state,
             store,

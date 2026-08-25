@@ -66,6 +66,7 @@ class TaskSpec:
     prompt: str
     rubrics: tuple[dict[str, str], ...]
     level: str
+    creator_pid: str = ""
 
 
 def utc_now() -> str:
@@ -135,9 +136,19 @@ def normalize_task(value: Mapping[str, Any]) -> TaskSpec:
     )
     rubrics = _rubric_rows(value.get("rubrics") or content.get("rubrics"))
     level = clean_text(value.get("level") or value.get("difficulty") or final.get("difficulty") or "unknown", 40)
+    creator_pid = clean_text(
+        value.get("creator_pid")
+        or value.get("participant_id")
+        or content.get("creator_pid")
+        or content.get("participant_id"),
+        80,
+    ).lower()
+    if not creator_pid:
+        task_id_match = re.match(r"^(?:v2|pc)/([^/]+)/", task_id)
+        creator_pid = task_id_match.group(1).lower() if task_id_match else ""
     if not task_id or not prompt or not rubrics:
         raise JudgeError("task_id, task prompt, and at least one rubric are required")
-    return TaskSpec(task_id, prompt, rubrics, level)
+    return TaskSpec(task_id, prompt, rubrics, level, creator_pid)
 
 
 def load_task_index(path: Path) -> dict[str, TaskSpec]:
@@ -204,6 +215,7 @@ def assignment_hash(run_dir: Path, task: TaskSpec) -> str:
         "task_id": task.task_id,
         "prompt": task.prompt,
         "rubrics": task.rubrics,
+        "creator_pid": task.creator_pid,
     }, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
     digest.update(trajectory_path.read_bytes())
     seen: set[Path] = set()
@@ -384,6 +396,7 @@ def empty_result(run_dir: Path, task: TaskSpec, input_sha256: str, error: str) -
     return {
         "run_dir": str(run_dir),
         "task_id": task.task_id,
+        "creator_pid": task.creator_pid,
         "task": task.prompt,
         "judge_version": JUDGE_VERSION,
         "input_sha256": input_sha256,
@@ -430,6 +443,7 @@ async def evaluate_run(
     return {
         "run_dir": str(run_dir),
         "task_id": task.task_id,
+        "creator_pid": task.creator_pid,
         "task": task.prompt,
         "judge_version": JUDGE_VERSION,
         "input_sha256": input_sha256,
@@ -528,6 +542,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
             "model": args.model,
             "runs": len(assignments),
             "rubrics": sum(len(task.rubrics) for _, task in assignments),
+            "task_ids": [task.task_id for _, task in assignments],
             "output": str(args.output.resolve()),
         }
 

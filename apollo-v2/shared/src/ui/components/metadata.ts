@@ -30,19 +30,18 @@ export function metadataFields(
   const block = el(
     "fieldset",
     { class: "field metadata-fields" },
-    el(
-      "legend",
-      { class: "field-label" },
-      "About this task",
-      el(
-        "span",
-        { class: "field-hint" },
-        " — so we can keep the collection spread across places and topics"
-      )
-    )
+    el("legend", { class: "field-label" }, "About this task")
   );
 
-  block.append(regionField(ctx, d, fieldError), subjectField(ctx, d, fieldError));
+  block.append(
+    el("p", { class: "metadata-intro" }, "Two quick picks help keep the collection balanced."),
+    el(
+      "div",
+      { class: "metadata-grid" },
+      regionField(ctx, d, fieldError),
+      subjectField(ctx, d, fieldError)
+    )
+  );
   return block;
 }
 
@@ -73,7 +72,7 @@ function regionField(
     el(
       "p",
       { class: "subfield-hint" },
-      "The country whose sites, services, or institutions the task depends on. If the work would read the same anywhere — comparing product specs, researching a standard, planning a curriculum — choose ",
+      "Pick the country whose websites or services the task depends on. If none, choose ",
       el("em", null, regionLabel(REGION_GLOBAL).toLowerCase()),
       "."
     ),
@@ -174,7 +173,7 @@ function subjectField(
     el(
       "p",
       { class: "subfield-hint" },
-      `Pick the one to ${MAX_SUBJECTS} categories the task is genuinely about. One is usually the honest answer — these are used to count coverage, so a wide guess is worse than a narrow truth.`
+      `Pick 1-${MAX_SUBJECTS} subjects.`
     ),
     chosen,
     select,

@@ -29,6 +29,29 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("AWS_ACCESS_KEY_ID", environment)
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", environment)
 
+    def test_prepare_command_routes_pc_runs_to_pc_queue(self):
+        args = argparse.Namespace(
+            runs_dir=Path("/runs"), output_dir=Path("/out"),
+            aws_cli="aws", queue="pc", agent="", model="gemini-test",
+            run_label="", task_id=[], limit=None, creator_map=Path("/creator-map.json"),
+        )
+        command = run.prepare_command(args, Path("/out/eval.json"), "bucket")
+        self.assertIn("--queue", command)
+        self.assertEqual(command[command.index("--queue") + 1], "pc")
+        self.assertEqual(command[command.index("--creator-map") + 1], "/creator-map.json")
+
+    def test_judge_plan_queue_validation_rejects_cross_app_tasks(self):
+        run.validate_judge_plan_queue({"task_ids": ["pc_task-1"]}, "pc")
+        run.validate_judge_plan_queue({"task_ids": ["v2/alice/internal/task-1"]}, "v2")
+        with self.assertRaises(run.RunnerError):
+            run.validate_judge_plan_queue({"task_ids": ["pc_task-1"]}, "v2")
+        with self.assertRaises(run.RunnerError):
+            run.validate_judge_plan_queue({"task_ids": ["v2/alice/internal/task-1"]}, "pc")
+
+    def test_judge_plan_requires_task_ids(self):
+        with self.assertRaises(run.RunnerError):
+            run.validate_judge_plan_queue({}, "v2")
+
 
 if __name__ == "__main__":
     unittest.main()

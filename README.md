@@ -71,5 +71,4 @@ Before a production batch, follow `.agents/skills/review-live-web-feasibility/SK
 
 This repository contains source and synthetic fixtures only. It must not contain participant exports, email/calendar records, browsing history, model-run screenshots, AWS objects, browser logs, production API keys, reviewer/reporting tokens, model-provider keys, or Chrome-extension signing keys.
 
-The GitHub repository is private. Application access, GitHub access, AWS roles, Vercel access, and read-only reporting credentials are granted separately according to role.
-
+This is a public, code-only repository. Production data, participant exports, browser records, model-run artifacts, and every credential remain outside Git. Application administration, AWS roles, Vercel access, and read-only reporting credentials are granted separately according to role.
