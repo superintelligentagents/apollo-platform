@@ -132,10 +132,11 @@ describe("review rubric editor", () => {
     expect(root.textContent).toContain("The task can be completed at any later date");
   });
 
-  it("shows the original author's rationale on an appeal without naming the first reviewer", () => {
+  it("shows the earlier rejection and author's rationale on an appeal without naming the first reviewer", () => {
     const task = claimedTask();
     task.appeal_of_sub_key = "prolific/journeys/author/rejected.json";
     task.appeal_number = 1;
+    task.appeal_rejection_reason = "The request did not specify which market or sources should be used.";
     task.appeal_reason = "The prompt already specifies the market and current first-party sources.";
     const state = initialState();
     state.reviewKey = "test-key";
@@ -154,9 +155,13 @@ describe("review rubric editor", () => {
 
     const context = root.querySelector<HTMLElement>('[aria-label="Author appeal"]')!;
     expect(context.textContent).toContain("Author appeal · fresh review required");
+    expect(context.textContent).toContain("Earlier rejection:");
+    expect(context.textContent).toContain(task.appeal_rejection_reason);
+    expect(context.textContent).toContain("Author's appeal:");
     expect(context.textContent).toContain(task.appeal_reason);
     expect(context.textContent).toContain("reviewer who rejected it is excluded");
     expect(context.textContent).not.toMatch(/reviewed by/i);
+    expect(context.textContent).not.toContain("Hidden Reviewer");
   });
 
   it("requires both every step and the evergreen QC confirmation before approval", () => {

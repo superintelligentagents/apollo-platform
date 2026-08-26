@@ -1,6 +1,7 @@
-// Production smoke test for rejection feedback and one-appeal routing. Creates
-// one synthetic rejected task, appeals it, proves the rejecting PID does not
-// gain a claimable task while another reviewer does, then cleans up exactly.
+// Production smoke test for the complete one-appeal lifecycle. Creates one
+// synthetic rejected task, appeals it, proves the fresh reviewer receives both
+// anonymous reasons, rejects it a second time into rejected-twice/, verifies
+// there is no third chance, then cleans up exactly.
 
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
@@ -60,6 +61,8 @@ const rejectedKey = `${ROOT}rejected/${safeTaskId}_${createHash("sha256").update
 const mutationLockKey = `${ROOT}author-mutation-locks/${b64url(sourceKey.slice(0, sourceKey.lastIndexOf("/")))}.json`;
 const cleanup = new Set([sourceKey, inboxKey, doneKey, rejectedKey, mutationLockKey]);
 const appealReason = "The rejected prompt already names the market, time period, and first-party verification requirements.";
+const firstRejectionReason = "The request lacks a market, time period, and first-party verification requirements.";
+const secondRejectionReason = "The appeal still does not make the requested comparison verifiable enough for final acceptance.";
 
 const task = {
   task_title: "Synthetic appeal routing verification",
@@ -91,7 +94,7 @@ try {
     task_id: safeTaskId,
     rejected_by: "Synthetic Rejecter",
     rejected_by_pid: rejecterPid,
-    reason: "The request lacks a market, time period, and first-party verification requirements.",
+    reason: firstRejectionReason,
     review: { rubrics: [{ rubric_id: "rubric-1", kind: "step", title: "Compare", original: "Compare the offers.", final: "Specify a market and verify every offer on first-party pages.", changed: true, checked: false }] },
     review_content_hash: `e2e-rejection-${stamp}`,
     rejected_at: new Date().toISOString(),
@@ -122,6 +125,7 @@ try {
   cleanup.add(appealMarkerKey);
   const [appealSource, appealMarker] = await Promise.all([readJson(appealSourceKey), readJson(appealMarkerKey)]);
   check(appealSource.appeal_of_sub_key === sourceKey, "appeal lineage points to the rejected revision");
+  check(appealSource.appeal_rejection_reason === firstRejectionReason, "fresh reviewer receives the anonymous earlier rejection reason");
   check(appealSource.appeal_reason === appealReason, "appeal source carries the author's rationale for the fresh reviewer");
   check(appealSource.task.agent_request === task.agent_request, "a reason-only appeal may preserve the original task text");
   check(appealMarker.rejected_by_pid === rejecterPid, "appeal marker carries the rejecter PID");
@@ -129,13 +133,13 @@ try {
   const original = cleanTaskSnapshot(appealSource.task);
   const rubrics = cleanRubrics(null, original, null);
   const contentHash = reportingTaskContentHash(original, null, rubrics);
-  const auditKey = `${ROOT}llm_pre_qc_pass/${b64url(rawTaskId)}.${contentHash}.apollo-llm-feasibility-v19.json`;
+  const auditKey = `${ROOT}llm_pre_qc_pass/${b64url(rawTaskId)}.${contentHash}.apollo-llm-feasibility-v22.json`;
   cleanup.add(auditKey);
   const beforeRejecter = await post("/review/status", { reviewer_pid: rejecterPid });
   const beforeSecond = await post("/review/status", { reviewer_pid: secondPid });
   await putJson(auditKey, {
-    schema_version: "apollo-llm-feasibility-artifact-v10",
-    pipeline_version: "apollo-llm-feasibility-v19",
+    schema_version: "apollo-llm-feasibility-artifact-v11",
+    pipeline_version: "apollo-llm-feasibility-v22",
     task_id: rawTaskId,
     task_content_hash: contentHash,
     status: "LLM_PASS",
@@ -149,6 +153,44 @@ try {
   const afterSecond = await post("/review/status", { reviewer_pid: secondPid });
   check(Number(afterRejecter.pending) === Number(beforeRejecter.pending), "rejecting reviewer is not offered the appeal");
   check(Number(afterSecond.pending) === Number(beforeSecond.pending) + 1, "a different reviewer is offered the appeal");
+
+  // Take a disposable lock directly so this test cannot accidentally claim or
+  // decide a real queue item. The reject endpoint still performs its normal
+  // token, freshness, mutation-lock, finalization, and idempotency checks.
+  const secondReviewer = "Synthetic Second Reviewer";
+  const appealLockKey = `${ROOT}locks/${b64url(appealSourceKey)}.json`;
+  const appealDoneKey = `${ROOT}done/${b64url(appealSourceKey)}`;
+  const appealToken = randomUUID();
+  const rejectedTwiceKey = `${ROOT}rejected-twice/${safeTaskId}_${createHash("sha256").update(appealSourceKey).digest("hex").slice(0, 16)}.json`;
+  const secondReviewerCreditKey = `${ROOT}credits/${b64url(secondReviewer.toLowerCase())}/rejected/${createHash("sha256").update(appealSourceKey).digest("hex")}.json`;
+  cleanup.add(appealLockKey);
+  cleanup.add(appealDoneKey);
+  cleanup.add(rejectedTwiceKey);
+  cleanup.add(secondReviewerCreditKey);
+  await putJson(appealLockKey, {
+    reviewer: secondReviewer,
+    reviewer_pid: secondPid,
+    token: appealToken,
+    claimed_at: new Date().toISOString(),
+  });
+  const terminal = await post("/review/reject", {
+    reviewer: secondReviewer,
+    reviewer_pid: secondPid,
+    sub_key: appealSourceKey,
+    token: appealToken,
+    task_id: rawTaskId,
+    reason: secondRejectionReason,
+  });
+  check(terminal.terminal_rejection === true, "second rejection is marked terminal");
+  check(terminal.rejected_key === rejectedTwiceKey, "second rejection is stored under rejected-twice/");
+  const terminalDoc = await readJson(rejectedTwiceKey);
+  check(terminalDoc.terminal_rejection === true && terminalDoc.appeal_number === 1, "terminal record preserves appeal lineage");
+
+  const terminalList = await post("/review/my-tasks", { participant_id: authorPid, offset: 0, limit: 10 });
+  const terminalItem = terminalList.items?.find((item) => item.sub_key === appealSourceKey);
+  check(terminalItem?.status === "rejected", "author sees the final rejection feedback");
+  check(terminalItem?.rejection_count === 2, "author history counts both independent rejections");
+  check(terminalItem?.can_appeal === false, "author receives no further appeal chance");
 } finally {
   for (const key of [...cleanup].reverse()) await remove(key);
   await dynamo.send(new DeleteItemCommand({

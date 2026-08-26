@@ -252,6 +252,8 @@ const finishedHistoryKeyFor = (taskId, revision) =>
 // prior revision without requiring one task-body GET per claim candidate.
 const APPEAL_PREFIX = `${REVIEW_PREFIX}appeals/`;
 const appealKeyFor = (subKey) => `${APPEAL_PREFIX}${b64url(subKey)}.json`;
+const REJECTED_PREFIX = `${REVIEW_PREFIX}rejected/`;
+const REJECTED_TWICE_PREFIX = `${REVIEW_PREFIX}rejected-twice/`;
 export const UNVERIFIED_APPEAL_REJECTER = "__unverified_appeal__";
 const LLM_PASS_PREFIX = `${REVIEW_PREFIX}llm_pass/`;
 const LLM_FAIL_PREFIX = `${REVIEW_PREFIX}llm_fail/`;
@@ -4137,6 +4139,22 @@ export function reviewDecisionIsCurrent({ subKey, storedSubKeys, lock, token, no
     && reviewLockIsActiveForQueue(lock, now, ttlMs);
 }
 
+// Any rejection after the one permitted author appeal is terminal. Keep those
+// immutable outcomes in their own prefix so operators and downstream jobs can
+// distinguish a first rejection from a completed two-review decision without
+// reconstructing source lineage.
+export function isAppealRevision(source) {
+  return Boolean(String(source?.appeal_of_sub_key || "").trim())
+    || Number(source?.appeal_number) > 0;
+}
+
+export function rejectionTargetKey(subKey, taskId, source) {
+  const safeTaskId = String(taskId || "task-unknown").replace(/[^A-Za-z0-9_-]/g, "_");
+  const prefix = isAppealRevision(source) ? REJECTED_TWICE_PREFIX : REJECTED_PREFIX;
+  const suffix = createHash("sha256").update(String(subKey || "")).digest("hex").slice(0, 16);
+  return `${prefix}${safeTaskId}_${suffix}.json`;
+}
+
 export function finalizingOutcomeDescriptor(subKey, source, lock) {
   const rawTaskId = String(source?.task_id || "");
   if (!rawTaskId || !lock?.finalizing || !lock?.content_hash) return null;
@@ -4147,7 +4165,7 @@ export function finalizingOutcomeDescriptor(subKey, source, lock) {
   if (lock.outcome === "rejected") {
     return {
       outcome: "rejected",
-      target: `${REVIEW_PREFIX}rejected/${taskId}_${createHash("sha256").update(subKey).digest("hex").slice(0, 16)}.json`,
+      target: rejectionTargetKey(subKey, taskId, source),
       hashField: "review_content_hash",
       taskId,
     };
@@ -5063,6 +5081,7 @@ function doneOutcome(done) {
   const target = String(done.target || "");
   if (target.startsWith(`${REVIEW_PREFIX}finished/`)) return "approved";
   if (target.startsWith(`${REVIEW_PREFIX}rejected/`)) return "rejected";
+  if (target.startsWith(`${REVIEW_PREFIX}rejected-twice/`)) return "rejected";
   if (target.startsWith(`${REVIEW_PREFIX}returned/`)) return "returned";
   return null;
 }
@@ -5302,10 +5321,11 @@ async function handleReview(path, body) {
   }
 
   if (path === "/review/status") {
-    const [{ pending, lockSet, finalizingSet, counts }, reviewers, rejectedKeys, finishedKeys, rejecters] = await Promise.all([
+    const [{ pending, lockSet, finalizingSet, counts }, reviewers, rejectedKeys, rejectedTwiceKeys, finishedKeys, rejecters] = await Promise.all([
       cachedQueueState(),
       reviewerTotals(),
-      listAll(`${REVIEW_PREFIX}rejected/`),
+      listAll(REJECTED_PREFIX),
+      listAll(REJECTED_TWICE_PREFIX),
       listAll(`${REVIEW_PREFIX}finished/`),
       appealRejecters(),
     ]);
@@ -5320,7 +5340,8 @@ async function handleReview(path, body) {
     const approvedTaskIds = new Set(
       finishedKeys.map((key) => String(key).slice(String(key).lastIndexOf("/") + 1).replace(/\.json$/, ""))
     );
-    const rejected = [...distinctRejectedTaskIds(rejectedKeys)].filter((id) => !approvedTaskIds.has(id)).length;
+    const rejected = [...distinctRejectedTaskIds([...rejectedKeys, ...rejectedTwiceKeys])]
+      .filter((id) => !approvedTaskIds.has(id)).length;
     return respond(200, {
       ...counts,
       locked: availability.locked,
@@ -5751,8 +5772,16 @@ async function handleReview(path, body) {
     if (sanitizedRejectionReview && JSON.stringify(sanitizedRejectionReview).length > 256 * 1024) {
       sanitizedRejectionReview = null;
     }
+    // The immutable source revision, not a browser-provided flag, decides
+    // whether this is the terminal rejection of an appeal. Fail before any
+    // write if that lineage cannot be read safely.
+    const rejectionSource = await readJson(sub_key).then(({ json }) => json).catch(() => null);
+    if (!rejectionSource) {
+      return respond(503, { error: "Task source is temporarily unreadable. Retry before rejecting it." });
+    }
     const rejId = String(task_id || "task-unknown").replace(/[^A-Za-z0-9_-]/g, "_");
-    const rejectedKey = `${REVIEW_PREFIX}rejected/${rejId}_${createHash("sha256").update(sub_key).digest("hex").slice(0, 16)}.json`;
+    const terminalRejection = isAppealRevision(rejectionSource);
+    const rejectedKey = rejectionTargetKey(sub_key, rejId, rejectionSource);
     const contentHash = reviewContentHash({
       task_id: rejId,
       reason: rejectionReason.slice(0, 500),
@@ -5792,7 +5821,12 @@ async function handleReview(path, body) {
         rejection_reason: rejectionReason.slice(0, 500),
         done_target: rejectedKey,
       }).catch((error) => console.error("Dashboard rejection index update failed", error));
-      return respond(200, { ok: true, rejected_key: rejectedKey, idempotent: true });
+      return respond(200, {
+        ok: true,
+        rejected_key: rejectedKey,
+        terminal_rejection: terminalRejection,
+        idempotent: true,
+      });
     }
     let etag = await verifyCurrentReviewDecision(sub_key, token);
     if (!etag) return respond(409, { error: "Lock not held by you (it may have expired)" });
@@ -5806,6 +5840,8 @@ async function handleReview(path, body) {
       rejected_by_pid: decisionPid,
       ...(sanitizedRejectionReview ? { review: sanitizedRejectionReview } : {}),
       reason: rejectionReason.slice(0, 500),
+      terminal_rejection: terminalRejection,
+      appeal_number: terminalRejection ? Math.max(1, Math.floor(Number(rejectionSource.appeal_number) || 1)) : 0,
       review_content_hash: contentHash,
       rejected_at: completedAt,
     };
@@ -5849,7 +5885,11 @@ async function handleReview(path, body) {
       done_target: rejectedKey,
       claimed_at: String(done.claimed_at || claimedAt || ""),
     }).catch((error) => console.error("Dashboard rejection index update failed", error));
-    return respond(200, { ok: true, rejected_key: rejectedKey });
+    return respond(200, {
+      ok: true,
+      rejected_key: rejectedKey,
+      terminal_rejection: terminalRejection,
+    });
     } finally {
       await releaseAuthorMutationLock(sub_key, mutationLock);
     }
@@ -5905,6 +5945,7 @@ async function handleReview(path, body) {
       return respond(404, { error: "Original submission not found" }, { "Cache-Control": "no-store" });
     }
     let verifiedAppealRejecterPid = "";
+    let verifiedAppealRejectionReason = "";
     if (eligibility.appeal) {
       if (!appealReasonIsValid(requestedAppealReason)) {
         return respond(400, {
@@ -5915,6 +5956,7 @@ async function handleReview(path, body) {
         ? await readJson(newestDone.target).then(({ json }) => json).catch(() => null)
         : null;
       verifiedAppealRejecterPid = rejectedByPidFromDocument(rejectedDoc);
+      verifiedAppealRejectionReason = cleanText(rejectedDoc?.reason, 500);
       if (!verifiedAppealRejecterPid) {
         return respond(409, {
           error: "This rejection cannot be appealed yet because its reviewer routing record needs repair. Ask the task lead to unlock it.",
@@ -6025,14 +6067,17 @@ async function handleReview(path, body) {
       newSubmission.appeal_number = rejectionCount;
       newSubmission.appeal_submission = true;
       newSubmission.appeal_reason = requestedAppealReason;
+      newSubmission.appeal_rejection_reason = verifiedAppealRejectionReason;
     } else if (original.appeal_of_sub_key) {
       rejectedByPid = await rejectedByPidForAppeal(newest, original.appeal_of_sub_key, doneByEncodedKey);
       newSubmission.appeal_of_sub_key = original.appeal_of_sub_key;
       newSubmission.appeal_number = Number(original.appeal_number) || 1;
       newSubmission.appeal_reason = cleanAppealReason(original.appeal_reason);
+      newSubmission.appeal_rejection_reason = cleanText(original.appeal_rejection_reason, 500);
       delete newSubmission.appeal_submission;
     } else {
       delete newSubmission.appeal_reason;
+      delete newSubmission.appeal_rejection_reason;
     }
     if (!appealRevisionCanPublish(newSubmission, rejectedByPid)) {
       return respond(409, {

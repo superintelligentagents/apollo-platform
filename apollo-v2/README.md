@@ -96,7 +96,8 @@ See [`../QUALITY_CONTROL.md`](../QUALITY_CONTROL.md) and
   for the dashboard.
 - AWS prefixes are separated by purpose: raw v2 tasks under
   `prolific/journeys/{participant}/v2/`; queue markers under `v2-review/inbox/`, `locks/`, and
-  `done/`; accepted tasks under `v2-review/finished/`; rejections under `v2-review/rejected/`;
+  `done/`; accepted tasks under `v2-review/finished/`; first rejections under `v2-review/rejected/`;
+  terminal second rejections under `v2-review/rejected-twice/`;
   and immutable reviewer receipts under `v2-review/credits/`.
 
 ## Develop

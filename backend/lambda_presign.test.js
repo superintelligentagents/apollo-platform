@@ -28,6 +28,8 @@ import {
   reviewLockCanRelease,
   reviewLockIsActiveForQueue,
   reviewDecisionIsCurrent,
+  isAppealRevision,
+  rejectionTargetKey,
   finalizingOutcomeDescriptor,
   finalizingOutcomeMatches,
   finalizingRecoveryPlan,
@@ -1197,6 +1199,26 @@ test("stale finalization recovery identifies matching durable outcomes", () => {
   });
   assert.equal(finalizingRecoveryPlan("returned").creditOutcome, null);
   assert.equal(finalizingRecoveryPlan("returned").dashboardStatus, "pending");
+});
+
+test("an appealed task's second rejection has a separate terminal target", () => {
+  const firstSubKey = "prolific/journeys/alice/v2/alice/internal/task-12345678/1_long_task.json";
+  const appealSubKey = "prolific/journeys/alice/v2/alice/internal/task-12345678/2_long_task.json";
+  const taskId = "v2/alice/internal/task-12345678";
+  const ordinary = { task_id: taskId };
+  const appeal = { task_id: taskId, appeal_of_sub_key: firstSubKey, appeal_number: 1 };
+
+  assert.equal(isAppealRevision(ordinary), false);
+  assert.equal(isAppealRevision(appeal), true);
+  assert.match(rejectionTargetKey(firstSubKey, taskId, ordinary), /^v2-review\/rejected\//);
+  assert.match(rejectionTargetKey(appealSubKey, taskId, appeal), /^v2-review\/rejected-twice\//);
+
+  const descriptor = finalizingOutcomeDescriptor(appealSubKey, appeal, {
+    finalizing: true,
+    outcome: "rejected",
+    content_hash: "hash-rejected",
+  });
+  assert.match(descriptor.target, /^v2-review\/rejected-twice\//);
 });
 
 test("finalization recovery keeps its lock until credit and index repair succeed", async () => {
