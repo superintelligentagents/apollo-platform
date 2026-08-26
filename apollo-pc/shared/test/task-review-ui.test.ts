@@ -59,5 +59,51 @@ describe("Apollo PC task review", () => {
     expect(root.textContent).toContain("Open & edit");
     root.querySelector<HTMLButtonElement>(".pc-rubric-summary")!.click();
     expect(root.querySelector<HTMLTextAreaElement>(".pc-rubric-text")!.value).toBe(task.task.steps![0].description);
+    // An ordinary task says nothing about appeals.
+    expect(root.querySelector('[aria-label="Author appeal"]')).toBeNull();
+  });
+
+  it("shows the earlier rejection and author's rationale on an appeal without naming the first reviewer", () => {
+    const appealed: ReviewLongTask = {
+      ...task,
+      appeal_of_sub_key: "pc/bob/internal/bundle-87654321/1_review_task_task-b.json",
+      appeal_number: 1,
+      appeal_rejection_reason: "The request did not specify which market or sources should be used.",
+      appeal_reason: "The prompt already specifies the market and current first-party sources.",
+    };
+    const state = initialState();
+    state.reviewKey = "key";
+    state.reviewClaim = { subKey: "pc/review_task.json", token: "token", task: appealed, lockTtlMs: 1_800_000, claimedAtMs: Date.now() };
+    const ctx = { state, adapter: { storage: { get: vi.fn(async () => null), set: vi.fn(async () => {}) } }, actions: { reviewerName: () => "Fresh Reviewer" } } as unknown as Ctx;
+    const root = renderTaskReviewEdit(ctx);
+
+    const context = root.querySelector<HTMLElement>('[aria-label="Author appeal"]')!;
+    expect(context.textContent).toContain("Author appeal · fresh review required");
+    expect(context.textContent).toContain("Earlier rejection:");
+    expect(context.textContent).toContain(appealed.appeal_rejection_reason!);
+    expect(context.textContent).toContain("Author's appeal:");
+    expect(context.textContent).toContain(appealed.appeal_reason!);
+    expect(context.textContent).toContain("reviewer who rejected it is excluded");
+    // Rejections are anonymous to the author and stay anonymous here.
+    expect(context.textContent).not.toMatch(/reviewed by|rejected by/i);
+    // It sits above the work, in the screen header.
+    expect(root.querySelector(".screen-head")!.contains(context)).toBe(true);
+  });
+
+  it("stays silent on an appeal that carries no reason either way", () => {
+    const state = initialState();
+    state.reviewKey = "key";
+    state.reviewClaim = {
+      subKey: "pc/review_task.json",
+      token: "token",
+      task: { ...task, appeal_of_sub_key: "pc/prior.json", appeal_number: 1 },
+      lockTtlMs: 1_800_000,
+      claimedAtMs: Date.now(),
+    };
+    const ctx = { state, adapter: { storage: { get: vi.fn(async () => null), set: vi.fn(async () => {}) } }, actions: { reviewerName: () => "Fresh Reviewer" } } as unknown as Ctx;
+
+    // An appeal filed before the server copied the reason across has nothing to
+    // show. An empty amber box would only be noise.
+    expect(renderTaskReviewEdit(ctx).querySelector('[aria-label="Author appeal"]')).toBeNull();
   });
 });

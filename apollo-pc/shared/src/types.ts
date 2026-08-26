@@ -204,6 +204,14 @@ export type ReviewLongTask = {
     attached_urls: string[];
   };
   quality_signals?: unknown;
+  // Present only on an author appeal revision. The rejecting reviewer is
+  // excluded server-side; the fresh reviewer sees the author's rationale.
+  appeal_of_sub_key?: string;
+  appeal_number?: number;
+  appeal_reason?: string;
+  // Server-copied from the immutable first rejection. Shown anonymously to
+  // the fresh appeal reviewer beside the author's rationale.
+  appeal_rejection_reason?: string;
 };
 
 // ---------------------------------------------------------------------------

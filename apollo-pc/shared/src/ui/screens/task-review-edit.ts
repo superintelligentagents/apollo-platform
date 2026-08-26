@@ -1,5 +1,6 @@
 import { reviewLlmFeedback, reviewReject, reviewRelease, reviewSubmit, saveClaimSnapshot, seedRubrics, upgradeRubrics, type LlmReviewForHuman, type RubricRow } from "../../review-client";
 import { el } from "../components/helpers";
+import type { ReviewLongTask } from "../../types";
 import type { Ctx } from "../context";
 
 const MIN_REJECT_REASON = 40;
@@ -35,6 +36,23 @@ export function conciseReviewText(value: string | null | undefined, maxChars = 2
   return `${concise}…`;
 }
 
+// PC reviewers claim from the same queue as Apollo v2, so an appeal reaches
+// them too — and until now arrived looking like any other task, with no way to
+// check the one thing an appeal turns on: whether the author fixed what was
+// flagged. Same fields, same copy as the v2 reviewer screen; the two apps
+// should not disagree about what a reviewer is told.
+function appealContext(task: ReviewLongTask): HTMLElement | null {
+  if (!task.appeal_of_sub_key) return null;
+  const appealReason = task.appeal_reason?.trim() ?? "";
+  const earlierRejectionReason = task.appeal_rejection_reason?.trim() ?? "";
+  if (!appealReason && !earlierRejectionReason) return null;
+  return el("section", { class: "notice info author-appeal-context", "aria-label": "Author appeal" },
+    el("strong", null, "Author appeal · fresh review required"),
+    ...(earlierRejectionReason ? [el("p", null, el("strong", null, "Earlier rejection: "), earlierRejectionReason)] : []),
+    ...(appealReason ? [el("p", null, el("strong", null, "Author's appeal: "), appealReason)] : []),
+    el("small", null, "Review the current task independently. The reviewer who rejected it is excluded from this queue item."));
+}
+
 export function renderTaskReviewEdit(ctx: Ctx): HTMLElement {
   const { state } = ctx;
   const claim = state.reviewClaim;
@@ -66,6 +84,7 @@ export function renderTaskReviewEdit(ctx: Ctx): HTMLElement {
     lockLine,
     el("h2", { class: "display" }, "Review task"),
     el("p", { class: "screen-sub" }, "Review in two passes. Preserve the author's intent and only change what is needed."),
+    appealContext(task),
     el("div", { class: "pc-review-instructions", "aria-label": "Review instructions" },
       instruction("01", "Task prompt", "Read the full request. It should be clear, coherent, realistic, and possible at any later date."),
       instruction("02", "Rubrics", "Open every step. Confirm it fits the request, works on the live web, and gives a reviewer concrete evidence to check.")
