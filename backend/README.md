@@ -138,9 +138,8 @@ by approved plus rejected), appealed tasks, terminal second rejections, and
 non-appeal author requeues. Trainer-facing dashboards do not expose this
 rollup.
 
-An appeal rejected by its fresh second reviewer uses the normal immutable
-`v2-review/rejected/` outcome plus the appeal revision's `v2-review/done/`
-marker. It is classified as “Rejected twice” from the revision's appeal
-lineage and cannot be appealed again; there is no separate competing terminal
-directory. Re-run the V2 dashboard index backfill after deploying these fields
-so historical appeal lineage is reflected in DynamoDB.
+An appeal rejected by its fresh second reviewer writes its immutable terminal
+outcome under `v2-review/rejected-twice/` plus the appeal revision's normal
+`v2-review/done/` marker. The author sees the final feedback but receives no
+further appeal action. Re-run the V2 dashboard index backfill after deploying
+these fields so historical appeal lineage is reflected in DynamoDB.

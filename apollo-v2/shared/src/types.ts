@@ -144,6 +144,9 @@ export type LongTask = {
   appeal_of_sub_key?: string;
   appeal_number?: number;
   appeal_reason?: string;
+  // Server-copied from the immutable first rejection. Shown anonymously to
+  // the fresh appeal reviewer beside the author's rationale.
+  appeal_rejection_reason?: string;
 };
 
 export type ValidationResult = {

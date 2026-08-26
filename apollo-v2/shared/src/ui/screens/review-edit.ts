@@ -181,13 +181,19 @@ export function renderReviewEdit(ctx: Ctx): HTMLElement {
   );
 
   const appealReason = task.appeal_of_sub_key ? task.appeal_reason?.trim() : "";
-  if (appealReason) {
+  const earlierRejectionReason = task.appeal_of_sub_key ? task.appeal_rejection_reason?.trim() : "";
+  if (appealReason || earlierRejectionReason) {
     root.append(
       el(
         "section",
         { class: "notice info author-appeal-context", "aria-label": "Author appeal" },
         el("strong", null, "Author appeal · fresh review required"),
-        el("p", null, appealReason),
+        ...(earlierRejectionReason
+          ? [el("p", null, el("strong", null, "Earlier rejection: "), earlierRejectionReason)]
+          : []),
+        ...(appealReason
+          ? [el("p", null, el("strong", null, "Author's appeal: "), appealReason)]
+          : []),
         el(
           "small",
           null,
