@@ -123,6 +123,16 @@ html, body {
 .notice.ok { background: var(--green-wash); border-color: #bfe3d3; color: var(--green); }
 .notice.err { background: var(--red-wash); border-color: #ecc8c4; color: var(--red); }
 .notice.info { background: var(--amber-wash); border-color: #ecd9ae; color: #7a5a12; }
+.author-appeal-context {
+  display: flex;
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 5px;
+  margin: 0 0 20px;
+  padding: 14px 16px;
+}
+.author-appeal-context p { margin: 0; max-width: 76ch; color: var(--ink); line-height: 1.5; }
+.author-appeal-context small { color: var(--ink-soft); }
 
 /* ---------- shared blocks ---------- */
 
