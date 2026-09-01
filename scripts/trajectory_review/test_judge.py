@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ class _FakeCompletions:
         self.text = text
 
     async def create(self, **_kwargs):
+        self.calls = getattr(self, "calls", 0) + 1
         message = SimpleNamespace(content=self.text)
         return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
@@ -74,6 +76,20 @@ class JudgeTests(unittest.TestCase):
         (run_dir / "shot.png").write_bytes(b"second")
         self.assertNotEqual(first, judge.assignment_hash(run_dir, task))
 
+    def test_screenshot_cap_samples_the_whole_trajectory(self):
+        paths = [Path(f"step-{index}.png") for index in range(1, 74)]
+        selected = judge._sample_evenly(paths, 12)
+        self.assertEqual(len(selected), 12)
+        self.assertEqual(selected[0], paths[0])
+        self.assertEqual(selected[-1], paths[-1])
+        self.assertEqual(len(set(selected)), 12)
+
+    def test_infers_path_safe_apollo_task_id(self):
+        task_id = "v2/alice/internal/task-12345678"
+        encoded = base64.urlsafe_b64encode(task_id.encode("utf-8")).decode("ascii").rstrip("=")
+        self.assertEqual(judge.infer_task_id(Path(f"apollo_b64_{encoded}")), task_id)
+        self.assertEqual(judge.infer_task_id(Path(f"apollo_b64_{encoded}bad")), f"apollo_b64_{encoded}bad")
+
     def test_evaluates_each_rubric_and_emits_compatible_result(self):
         run_dir = self.root / "abc"
         run_dir.mkdir()
@@ -106,6 +122,38 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(result["rubric_results"][0]["judge_status"], "ERROR")
         self.assertEqual(result["rubric_scores"], {})
         self.assertIsNone(result["average_rubric_score"])
+
+    def test_rerun_reuses_valid_rubrics_and_only_retries_errors(self):
+        run_dir = self.root / "abc"
+        run_dir.mkdir()
+        (run_dir / "steps.jsonl").write_text(
+            json.dumps({"step_num": 1, "action": "open"}) + "\n",
+            encoding="utf-8",
+        )
+        task = judge.TaskSpec("abc", "Prompt", (
+            {"id": "R1", "requirement": "First.", "verification": ""},
+            {"id": "R2", "requirement": "Second.", "verification": ""},
+        ), "high")
+        prior = {"rubric_results": [
+            {
+                "rubric_id": "R1", "requirement": "First.", "verification": "",
+                "judge_status": "SUCCESS", "score": 1, "success": True,
+                "final_reasoning": "Existing evidence.",
+            },
+            {
+                "rubric_id": "R2", "requirement": "Second.", "verification": "",
+                "judge_status": "ERROR", "score": None, "success": None,
+                "final_reasoning": "Transient error.",
+            },
+        ]}
+        client = _FakeOpenAI('Evidence: New evidence.\nStatus: "failure"')
+        result = asyncio.run(judge.evaluate_run(
+            run_dir, task, client, "openai", "test-model", 0, 0, 10_000,
+            "c" * 64, prior,
+        ))
+        self.assertEqual(client.chat.completions.calls, 1)
+        self.assertEqual(result["rubric_scores"], {"R1": 1, "R2": 0})
+        self.assertEqual(result["rubric_results"][0]["final_reasoning"], "Existing evidence.")
 
 
 if __name__ == "__main__":

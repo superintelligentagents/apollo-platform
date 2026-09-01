@@ -32,13 +32,19 @@ class RunnerTests(unittest.TestCase):
     def test_prepare_command_routes_pc_runs_to_pc_queue(self):
         args = argparse.Namespace(
             runs_dir=Path("/runs"), output_dir=Path("/out"),
-            aws_cli="aws", queue="pc", agent="", model="gemini-test",
-            run_label="", task_id=[], limit=None, creator_map=Path("/creator-map.json"),
+            aws_cli="aws", queue="pc", agent="OSWorld", model="gemini-test",
+            run_model="Llama-test", run_label="pilot", task_id=["pc_task-1"],
+            limit=1, creator_map=Path("/creator-map.json"),
         )
         command = run.prepare_command(args, Path("/out/eval.json"), "bucket")
         self.assertIn("--queue", command)
         self.assertEqual(command[command.index("--queue") + 1], "pc")
         self.assertEqual(command[command.index("--creator-map") + 1], "/creator-map.json")
+        self.assertEqual(command[command.index("--agent") + 1], "OSWorld")
+        self.assertEqual(command[command.index("--model") + 1], "Llama-test")
+        self.assertEqual(command[command.index("--run-label") + 1], "pilot")
+        self.assertEqual(command[command.index("--task-id") + 1], "pc_task-1")
+        self.assertEqual(command[command.index("--limit") + 1], "1")
 
     def test_judge_plan_queue_validation_rejects_cross_app_tasks(self):
         run.validate_judge_plan_queue({"task_ids": ["pc_task-1"]}, "pc")

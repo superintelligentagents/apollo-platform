@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import binascii
 import hashlib
 import json
 import math
@@ -80,6 +81,19 @@ def clean_text(value: Any, limit: int) -> str:
 def infer_task_id(run_dir: Path) -> str:
     """Match the task-id convention used by the Odysseys runner."""
     name = run_dir.name
+    # Apollo task IDs contain slashes, which cannot be used as one OSWorld run
+    # directory name. The Apollo bridge stores them as canonical base64url and
+    # the judge restores the exact ID before joining against the task source.
+    apollo_prefix = "apollo_b64_"
+    if name.startswith(apollo_prefix):
+        encoded = name[len(apollo_prefix):]
+        try:
+            decoded = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)).decode("utf-8")
+            canonical = base64.urlsafe_b64encode(decoded.encode("utf-8")).decode("ascii").rstrip("=")
+            if canonical == encoded:
+                return decoded
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            pass
     if re.fullmatch(r"[0-9a-f]{32}(?:_\S+)?", name, re.IGNORECASE):
         return name
     match = re.search(r"(?:^|[_-])([0-9a-f]{40}|[0-9a-f]{32})(?:_[0-9]+)?$", name, re.IGNORECASE)
@@ -270,13 +284,24 @@ def make_client(provider: str) -> Any:
     return AsyncOpenAI(**kwargs)
 
 
+def _sample_evenly(paths: Sequence[Path], max_images: int) -> list[Path]:
+    if max_images <= 0 or len(paths) <= max_images:
+        return list(paths)
+    if max_images == 1:
+        return [paths[-1]]
+    return [
+        paths[index * (len(paths) - 1) // (max_images - 1)]
+        for index in range(max_images)
+    ]
+
+
 def _image_assets(run_dir: Path, steps: Sequence[Mapping[str, Any]], max_images: int) -> list[dict[str, Any]]:
     paths: list[Path] = []
     for step in steps:
         screenshot = resolve_screenshot(run_dir, clean_text(step.get("screenshot_source"), 10_000) or None)
         if screenshot and screenshot not in paths:
             paths.append(screenshot)
-    selected = paths[-max_images:] if max_images > 0 else paths
+    selected = _sample_evenly(paths, max_images)
     assets = []
     for path in selected:
         try:
@@ -418,6 +443,7 @@ async def evaluate_run(
     max_steps: int,
     max_history_chars: int,
     input_sha256: str,
+    prior_result: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         steps, _ = load_steps(run_dir)
@@ -430,10 +456,21 @@ async def evaluate_run(
     except (OSError, PackageError, JudgeError) as exc:
         return empty_result(run_dir, task, input_sha256, str(exc))
 
-    results = [
-        await judge_rubric(client, provider, model, task, rubric, history, assets)
-        for rubric in task.rubrics
-    ]
+    prior_by_id = {
+        clean_text(result.get("rubric_id"), 100): result
+        for result in ((prior_result or {}).get("rubric_results") or [])
+        if isinstance(result, Mapping)
+        and result.get("judge_status") in {"SUCCESS", "FAILURE"}
+    }
+    results = []
+    for rubric in task.rubrics:
+        prior = prior_by_id.get(rubric["id"])
+        if prior is not None:
+            results.append(dict(prior))
+        else:
+            results.append(
+                await judge_rubric(client, provider, model, task, rubric, history, assets)
+            )
     scores = {
         result["rubric_id"]: result["score"]
         for result in results
@@ -468,7 +505,7 @@ def atomic_write_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
-def load_completed(path: Path, provider: str, model: str) -> dict[str, dict[str, Any]]:
+def load_existing(path: Path, provider: str, model: str) -> dict[str, dict[str, Any]]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         tasks = raw.get("tasks") if isinstance(raw, Mapping) else None
@@ -484,13 +521,21 @@ def load_completed(path: Path, provider: str, model: str) -> dict[str, dict[str,
             for item in tasks
             if isinstance(item, Mapping)
             and isinstance(item.get("run_dir"), str)
-            and not item.get("error")
             and isinstance(item.get("rubric_results"), list)
-            and item["rubric_results"]
-            and all(result.get("judge_status") in {"SUCCESS", "FAILURE"} for result in item["rubric_results"])
         }
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def result_is_complete(result: Mapping[str, Any] | None, task: TaskSpec) -> bool:
+    if not result or result.get("error"):
+        return False
+    statuses = {
+        clean_text(item.get("rubric_id"), 100): item.get("judge_status")
+        for item in (result.get("rubric_results") or [])
+        if isinstance(item, Mapping)
+    }
+    return all(statuses.get(rubric["id"]) in {"SUCCESS", "FAILURE"} for rubric in task.rubrics)
 
 
 def build_payload(results: Sequence[Mapping[str, Any]], provider: str, model: str) -> dict[str, Any]:
@@ -551,12 +596,15 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         str(run_dir.resolve()): assignment_hash(run_dir, task)
         for run_dir, task in assignments
     }
-    existing = load_completed(args.output, provider, args.model)
+    existing = load_existing(args.output, provider, args.model)
     pending = [
         (run_dir, task)
         for run_dir, task in assignments
-        if str(run_dir.resolve()) not in existing
-        or existing[str(run_dir.resolve())].get("input_sha256") != input_hashes[str(run_dir.resolve())]
+        if (
+            str(run_dir.resolve()) not in existing
+            or existing[str(run_dir.resolve())].get("input_sha256") != input_hashes[str(run_dir.resolve())]
+            or not result_is_complete(existing[str(run_dir.resolve())], task)
+        )
     ]
     semaphore = asyncio.Semaphore(max(1, min(args.num_workers, len(pending) or 1)))
 
@@ -566,6 +614,7 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
                 run_dir, task, client, provider, args.model,
                 args.max_images, args.max_steps, args.max_history_chars,
                 input_hashes[str(run_dir.resolve())],
+                existing.get(str(run_dir.resolve())),
             )
 
     completed: dict[str, dict[str, Any]] = dict(existing)
@@ -588,11 +637,16 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--runs-dir", type=Path, required=True)
     value.add_argument("--task-source-json", type=Path, required=True)
     value.add_argument("--output", type=Path, default=Path(".work/trajectory_review/eval_results_full_traj_per_rubric.json"))
-    value.add_argument("--provider", choices=("auto", "gemini", "openai"), default="auto")
+    value.add_argument("--provider", choices=("auto", "gemini", "openai", "meta"), default="auto")
     value.add_argument("--model", default=DEFAULT_MODEL)
     value.add_argument("--env-file", type=Path, default=None)
     value.add_argument("--num-workers", type=int, default=4)
-    value.add_argument("--max-images", type=int, default=DEFAULT_MAX_IMAGES, help="Last N screenshots; 0 keeps all")
+    value.add_argument(
+        "--max-images",
+        type=int,
+        default=DEFAULT_MAX_IMAGES,
+        help="Evenly sample N chronological screenshots; 0 keeps all",
+    )
     value.add_argument("--max-steps", type=int, default=0, help="First N normalized steps; 0 keeps all")
     value.add_argument("--max-history-chars", type=int, default=DEFAULT_MAX_HISTORY_CHARS)
     value.add_argument("--include-incomplete", action="store_true")

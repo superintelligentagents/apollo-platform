@@ -24,6 +24,7 @@ Both applications expose separate **Review** and **Grade** workspaces. Review is
 - `.agents/skills/review-live-web-feasibility/` — Codex skill contract.
 - `scripts/llm_feasibility/` — resumable Codex CLI pipeline for task/rubric checks.
 - `scripts/trajectory_review/` — Odysseys-compatible trajectory judging, validation, packaging, and AWS publication.
+- `scripts/osworld_runner/` — author-sign-off filtering, OSWorld/Meta execution, and one-command trajectory publication.
 - `QUALITY_CONTROL.md` — ownership and invariants for all QC stages.
 - `docs/APOLLO_FLOW.md` — end-to-end collection and review flow.
 - `docs/TURING_HANDOFF.md` — access, setup, deployment, and security checklist.

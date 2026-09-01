@@ -66,6 +66,20 @@ python3 scripts/llm_feasibility/run.py \
 
 Run the repo-local trajectory judge and publisher on the OSWorld/Odysseys worker. This replaces the need for a separate Odysseys source checkout while keeping compatibility with its evaluator output:
 
+For the local OSWorld checkout at `/home/jykoh/OSWorld`, the integrated bridge
+fetches only approved tasks with a completed author sign-off, skips tasks that
+already have a trajectory by default, runs upstream OSWorld `MuseSparkAgent`
+against Meta's OpenAI-compatible `api.ai.meta.com` Responses API, and invokes
+the same judge/publisher. Only the scoped model key reaches the OSWorld host
+process; reporting and AWS environment credentials remain stripped, while the
+separate rubric judge stays behind the key-isolating loopback proxy:
+
+```bash
+python3 scripts/osworld_runner/run.py --stage all --queue v2 --limit 1
+```
+
+See `scripts/osworld_runner/README.md` for staged dry-run and credential setup.
+
 ```bash
 python3 scripts/trajectory_review/run.py \
   --runs-dir /path/to/osworld-runs \

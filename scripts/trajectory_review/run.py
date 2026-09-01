@@ -128,8 +128,21 @@ def prepare_command(args: argparse.Namespace, eval_results: Path, bucket: str | 
         "--output-dir", str(args.output_dir),
         "--aws-cli", args.aws_cli,
         "--queue", args.queue,
-        "--model", args.model,
     ]
+    agent = getattr(args, "agent", None)
+    if agent:
+        command.extend(["--agent", agent])
+    run_model = getattr(args, "run_model", None)
+    if run_model:
+        command.extend(["--model", run_model])
+    run_label = getattr(args, "run_label", None)
+    if run_label:
+        command.extend(["--run-label", run_label])
+    for task_id in getattr(args, "task_id", []) or []:
+        command.extend(["--task-id", task_id])
+    limit = getattr(args, "limit", None)
+    if limit is not None:
+        command.extend(["--limit", str(limit)])
     if bucket:
         command.extend(["--s3-bucket", bucket])
     creator_map = getattr(args, "creator_map", None)
@@ -146,7 +159,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--task-source-json", type=Path, required=True)
     value.add_argument("--output-dir", type=Path, default=Path(".work/trajectory_review"))
     value.add_argument("--eval-results", type=Path, default=None)
-    value.add_argument("--provider", choices=("auto", "gemini", "openai"), default="auto")
+    value.add_argument("--provider", choices=("auto", "gemini", "openai", "meta"), default="auto")
     value.add_argument("--model", default="gemini-3.1-flash-lite-preview")
     value.add_argument(
         "--queue",
@@ -160,6 +173,11 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--max-steps", type=int, default=0)
     value.add_argument("--max-history-chars", type=int, default=400_000)
     value.add_argument("--include-incomplete", action="store_true")
+    value.add_argument("--agent", default="", help="Agent or runner name stored in the review package")
+    value.add_argument("--run-model", default="", help="Agent model stored in the review package")
+    value.add_argument("--run-label", default="", help="Experiment label stored in the review package")
+    value.add_argument("--task-id", action="append", default=[], help="Judge and publish only this exact task ID")
+    value.add_argument("--limit", type=int, default=None, help="Judge and publish at most this many selected runs")
     value.add_argument(
         "--creator-map",
         type=Path,
