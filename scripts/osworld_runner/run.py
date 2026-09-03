@@ -13,6 +13,7 @@ import base64
 import hashlib
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -39,7 +40,11 @@ DEFAULT_META_BASE_URL = "https://api.ai.meta.com/v1"
 DEFAULT_META_SESSION_ID = "terminal-bench-2.1--123456"
 DEFAULT_MUSE_REQUEST_TIMEOUT = 600.0
 DEFAULT_MUSE_MAX_RETRIES = 3
-META_JUDGE_SCREENSHOT_SAMPLE = 12
+# 0 = every screenshot in the trajectory, matching Odysseys' canonical
+# run_full_trajectory_per_rubric.py. The old value of 12 evenly sampled frames
+# was a concession to Meta's request-size limits and could hide the one frame
+# that proves a rubric; OpenAI has no such pressure.
+JUDGE_SCREENSHOT_SAMPLE = 0
 META_JUDGE_MIN_OUTPUT_TOKENS = 16_384
 META_JUDGE_REASONING_EFFORT = "low"
 OSWORLD_MODEL_ALIAS = DEFAULT_META_MODEL
@@ -48,6 +53,17 @@ MUSE_SPARK_FILES = {
     "mm_agents/muse_spark_agent.py": "e98023fb55265bc68a086e6ea77bd4e8f37aa613818bca421e793fc6158d19de",
     "scripts/python/run_multienv_muse_spark.py": "dd9887a4f138a87136caab683126b57f0a7c56b8e141fed5d22ed6acf34fd003",
 }
+# OpenAI backend: upstream OSWorld's GPT-5.4-style computer-use agent, pinned
+# at the commit that added the [INFEASIBLE] protocol and dropped the output cap.
+GPT54_COMMIT = "fc31a9049664292fcb35d6e501ee1dc839f2cf6d"
+GPT54_FILES = {
+    "mm_agents/gpt54_agent.py": "cf27dd0b2244e34a40586d21fd892d77cacb558427c8852e5ce03900eb5c467c",
+    "scripts/python/run_multienv_gpt54.py": "3710dbd75892e188512395ca62db2ddea9edaa9f0f3b93e889d5bb2741c3f15e",
+}
+AGENT_BACKENDS = ("muse-spark", "openai")
+DEFAULT_OPENAI_MODEL = "gpt-5.6-luna"
+DEFAULT_OPENAI_REASONING_EFFORT = "medium"
+DEFAULT_OPENAI_JUDGE_MODEL = "gpt-5.4-mini"
 DEFAULT_OSWORLD_ROOT = Path("/home/jykoh/OSWorld")
 DEFAULT_VM_PATH = DEFAULT_OSWORLD_ROOT / "vmware_vm_data/Ubuntu0/Ubuntu0.vmx"
 DEFAULT_DOCKER_VM_PATH = Path("/home/ljang/osworld_src/docker_vm_data/Ubuntu.qcow2")
@@ -193,7 +209,9 @@ def trajectory_reporting_url(api_url: str, *, offset: int, limit: int = 1_000) -
     ))
 
 
-def get_json(url: str, token: str, timeout: float = 60.0) -> Mapping[str, Any]:
+def get_json(
+    url: str, token: str, timeout: float = 60.0, attempts: int = 6
+) -> Mapping[str, Any]:
     request = Request(
         url,
         headers={
@@ -202,13 +220,30 @@ def get_json(url: str, token: str, timeout: float = 60.0) -> Mapping[str, Any]:
             "User-Agent": "apollo-osworld-runner/1",
         },
     )
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            value = json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        raise BridgeError(f"reporting API returned HTTP {exc.code}") from exc
-    except (URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise BridgeError(f"reporting API request failed: {exc}") from exc
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                value = json.loads(response.read().decode("utf-8"))
+            break
+        except HTTPError as exc:
+            # Concurrent shard workers can trip API Gateway throttling; those
+            # responses are transient and safe to retry with backoff.
+            if exc.code in {429, 500, 502, 503, 504} and attempt + 1 < attempts:
+                last_error = exc
+                time.sleep(min(60.0, (2.0**attempt) + random.uniform(0.0, 2.0)))
+                continue
+            raise BridgeError(f"reporting API returned HTTP {exc.code}") from exc
+        except (URLError, TimeoutError) as exc:
+            if attempt + 1 < attempts:
+                last_error = exc
+                time.sleep(min(60.0, (2.0**attempt) + random.uniform(0.0, 2.0)))
+                continue
+            raise BridgeError(f"reporting API request failed: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise BridgeError(f"reporting API request failed: {exc}") from exc
+    else:
+        raise BridgeError(f"reporting API request failed: {last_error}")
     if not isinstance(value, Mapping):
         raise BridgeError("reporting API returned a non-object response")
     return value
@@ -238,7 +273,15 @@ def fetch_reporting_tasks(api_url: str, token: str) -> list[dict[str, Any]]:
     return tasks
 
 
-def fetch_trajectory_task_ids(api_url: str, token: str) -> set[str]:
+def fetch_trajectory_task_ids(
+    api_url: str, token: str, *, model: str | None = None
+) -> set[str]:
+    """Task IDs that already have a trajectory.
+
+    With `model`, only trajectories produced by that model count, so a
+    multi-model campaign can run a second agent over tasks another agent
+    already covered while still terminating once this model has done them all.
+    """
     task_ids: set[str] = set()
     offset = 0
     seen_offsets: set[int] = set()
@@ -254,6 +297,7 @@ def fetch_trajectory_task_ids(api_url: str, token: str) -> set[str]:
             task_id
             for item in items
             if isinstance(item, Mapping)
+            if model is None or _text(item.get("model"), 200) == model
             for task_id in [_text(item.get("task_id"), 300)]
             if task_id
         )
@@ -295,6 +339,19 @@ def runnable_reason(
     return None
 
 
+def read_task_id_list(path: Path | None) -> frozenset[str]:
+    """Read one task ID per line; blank lines and #-comments are ignored."""
+    if path is None:
+        return frozenset()
+    try:
+        lines = path.expanduser().read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise BridgeError(f"cannot read task ID list {path}: {exc}") from exc
+    return frozenset(
+        line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")
+    )
+
+
 def select_tasks(
     tasks: Iterable[dict[str, Any]],
     *,
@@ -305,6 +362,7 @@ def select_tasks(
     existing_task_ids: set[str] | frozenset[str] = frozenset(),
     shard_count: int = 1,
     shard_index: int = 0,
+    excluded_ids: set[str] | frozenset[str] = frozenset(),
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     if shard_count < 1:
         raise BridgeError("--shard-count must be at least 1")
@@ -320,6 +378,9 @@ def select_tasks(
             continue
         if task_id in wanted:
             found.add(task_id)
+        if task_id in excluded_ids:
+            skipped.append({"task_id": task_id, "reason": "excluded by operator list"})
+            continue
         assigned_shard = int.from_bytes(
             hashlib.sha256(task_id.encode("utf-8")).digest()[:8], "big"
         ) % shard_count
@@ -361,7 +422,20 @@ def _https_url(value: Any) -> str | None:
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", parsed.query, ""))
 
 
-def start_urls(task: Mapping[str, Any]) -> list[str]:
+GOOGLE_START_URL = "https://www.google.com/"
+
+
+def start_urls(task: Mapping[str, Any], mode: str = "google") -> list[str]:
+    """Browser tabs the VM opens before the agent's first turn.
+
+    ``google`` (default) starts every run on a blank search page, so the agent
+    has to find its own sources — 132 of Odysseys' 200 canonical configs do
+    this. ``site_scope`` instead pre-opens the task's authored key_urls /
+    site_scope, which is how Apollo's earlier runs were recorded; keep it when
+    comparing against those trajectories.
+    """
+    if mode == "google":
+        return [GOOGLE_START_URL]
     content = task.get("content") if isinstance(task.get("content"), Mapping) else {}
     final = content.get("final") if isinstance(content.get("final"), Mapping) else {}
     values = final.get("key_urls") if isinstance(final.get("key_urls"), list) else []
@@ -374,11 +448,11 @@ def start_urls(task: Mapping[str, Any]) -> list[str]:
     return urls[:12] or ["https://www.google.com/"]
 
 
-def osworld_config(task: Mapping[str, Any], domain: str) -> dict[str, Any]:
+def osworld_config(task: Mapping[str, Any], domain: str, start_url_mode: str = "google") -> dict[str, Any]:
     task_id = _text(task.get("task_id"), 300)
     content = task.get("content") if isinstance(task.get("content"), Mapping) else {}
     final = content.get("final") if isinstance(content.get("final"), Mapping) else {}
-    urls = start_urls(task)
+    urls = start_urls(task, start_url_mode)
     return {
         "id": encode_run_id(task_id),
         "snapshot": "chrome",
@@ -489,13 +563,13 @@ def job_paths(
     )
 
 
-def prepare_job(tasks: Sequence[dict[str, Any]], paths: JobPaths, domain: str) -> dict[str, Any]:
+def prepare_job(tasks: Sequence[dict[str, Any]], paths: JobPaths, domain: str, start_url_mode: str = "google") -> dict[str, Any]:
     examples_dir = paths.configs / "examples" / domain
     examples_dir.mkdir(parents=True, exist_ok=True)
     run_ids: list[str] = []
     mapping: dict[str, str] = {}
     for task in tasks:
-        config = osworld_config(task, domain)
+        config = osworld_config(task, domain, start_url_mode)
         run_id = config["id"]
         run_ids.append(run_id)
         mapping[run_id] = _text(task.get("task_id"), 300)
@@ -807,24 +881,31 @@ def muse_child_environment(
     return environment
 
 
-def ensure_muse_spark_overlay(paths: JobPaths) -> Path:
-    overlay = paths.root / "upstream_osworld" / MUSE_SPARK_COMMIT
-    for relative, expected_sha256 in MUSE_SPARK_FILES.items():
+def ensure_upstream_overlay(
+    paths: JobPaths,
+    commit: str,
+    files: Mapping[str, str],
+    entry: str,
+    label: str,
+) -> Path:
+    """Download SHA-pinned upstream OSWorld files into a PYTHONPATH overlay."""
+    overlay = paths.root / "upstream_osworld" / commit
+    for relative, expected_sha256 in files.items():
         destination = overlay / relative
         if destination.is_file():
             current = hashlib.sha256(destination.read_bytes()).hexdigest()
             if current == expected_sha256:
                 continue
-        url = f"https://raw.githubusercontent.com/xlang-ai/OSWorld/{MUSE_SPARK_COMMIT}/{relative}"
+        url = f"https://raw.githubusercontent.com/xlang-ai/OSWorld/{commit}/{relative}"
         request = Request(url, headers={"User-Agent": "apollo-osworld-runner/1"})
         try:
             with urlopen(request, timeout=60) as response:
                 content = response.read()
         except (HTTPError, URLError, TimeoutError) as exc:
-            raise BridgeError(f"could not fetch pinned Muse Spark source: {relative}") from exc
+            raise BridgeError(f"could not fetch pinned {label} source: {relative}") from exc
         actual_sha256 = hashlib.sha256(content).hexdigest()
         if actual_sha256 != expected_sha256:
-            raise BridgeError(f"pinned Muse Spark source hash mismatch: {relative}")
+            raise BridgeError(f"pinned {label} source hash mismatch: {relative}")
         write_private_bytes(destination, content)
     package_init = overlay / "mm_agents/__init__.py"
     if not package_init.is_file():
@@ -832,7 +913,28 @@ def ensure_muse_spark_overlay(paths: JobPaths) -> Path:
             package_init,
             b"from pkgutil import extend_path\n__path__ = extend_path(__path__, __name__)\n",
         )
-    return overlay / "scripts/python/run_multienv_muse_spark.py"
+    return overlay / entry
+
+
+def ensure_muse_spark_overlay(paths: JobPaths) -> Path:
+    return ensure_upstream_overlay(
+        paths, MUSE_SPARK_COMMIT, MUSE_SPARK_FILES,
+        "scripts/python/run_multienv_muse_spark.py", "Muse Spark",
+    )
+
+
+def ensure_gpt54_overlay(paths: JobPaths) -> Path:
+    return ensure_upstream_overlay(
+        paths, GPT54_COMMIT, GPT54_FILES, "scripts/python/run_multienv_gpt54.py", "GPT-5.4",
+    )
+
+
+def agent_model(args: argparse.Namespace) -> str:
+    return args.openai_model if args.agent_backend == "openai" else args.meta_model
+
+
+def agent_label(args: argparse.Namespace) -> str:
+    return "OSWorld GPT54Agent" if args.agent_backend == "openai" else "OSWorld MuseSparkAgent"
 
 
 def validate_osworld(args: argparse.Namespace, paths: JobPaths, muse_runner: Path) -> None:
@@ -846,6 +948,18 @@ def validate_osworld(args: argparse.Namespace, paths: JobPaths, muse_runner: Pat
         raise BridgeError(f"OSWorld checkout lacks Muse Spark support dependencies: {root}")
     if args.provider_name in {"vmware", "docker"} and not args.path_to_vm.expanduser().is_file():
         raise BridgeError(f"{args.provider_name} VM does not exist: {args.path_to_vm}")
+    if args.provider_name == "apptainer":
+        sif = Path(os.environ.get("OSWORLD_APPTAINER_SIF", ""))
+        vms_dir = Path(os.environ.get("OSWORLD_APPTAINER_VMS_DIR", ""))
+        if not sif.is_file():
+            raise BridgeError(f"apptainer SIF is missing: set OSWORLD_APPTAINER_SIF ({sif})")
+        if not (vms_dir / "Ubuntu.qcow2").is_file():
+            raise BridgeError(
+                f"apptainer base VM is missing: {vms_dir / 'Ubuntu.qcow2'};"
+                " stage it before running so the provider cannot re-download it"
+            )
+        if not Path("/dev/kvm").exists():
+            raise BridgeError("/dev/kvm is not available on this host")
     if not paths.tasks.is_file() or not paths.meta.is_file():
         raise BridgeError(f"job is not prepared below {paths.root}; run --stage fetch first")
 
@@ -885,18 +999,63 @@ def osworld_command(args: argparse.Namespace, paths: JobPaths) -> list[str]:
     return command
 
 
-def run_osworld(args: argparse.Namespace, paths: JobPaths, meta_key: str) -> None:
-    muse_runner = ensure_muse_spark_overlay(paths)
-    validate_osworld(args, paths, muse_runner)
+def openai_osworld_command(args: argparse.Namespace, paths: JobPaths) -> list[str]:
+    """Drive upstream's run_multienv_gpt54.py through the same launcher shim."""
+    root = args.osworld_root.expanduser().resolve()
+    command = [
+        str(root / ".venv/bin/python"),
+        str(Path(__file__).with_name("muse_spark_launcher.py")),
+        "--provider_name", args.provider_name,
+        "--headless",
+        "--action_space", "pyautogui",
+        "--observation_type", "screenshot",
+        "--model", args.openai_model,
+        "--reasoning_effort", args.openai_reasoning_effort,
+        "--max_steps", str(args.max_steps),
+        "--max_trajectory_length", str(args.max_trajectory_length),
+        "--num_envs", str(args.num_envs),
+        "--sleep_after_execution", str(args.sleep_after_execution),
+        "--result_dir", str(paths.results),
+        "--test_config_base_dir", str(paths.configs),
+        "--test_all_meta_path", str(paths.meta),
+        "--domain", args.domain,
+        "--client_password", args.client_password,
+    ]
+    if args.provider_name in {"vmware", "docker"}:
+        command.extend(["--path_to_vm", str(args.path_to_vm.expanduser().resolve())])
+    if args.provider_name == "aws":
+        command.extend(["--region", args.aws_region])
+    return command
+
+
+def openai_child_environment(openai_key: str, runner: Path, osworld_root: Path) -> dict[str, str]:
+    environment = sanitized_environment()
+    overlay_root = runner.parents[2]
+    pythonpath = [str(overlay_root), str(osworld_root.expanduser().resolve())]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment.update({
+        "OPENAI_API_KEY": openai_key,
+        "MUSE_SPARK_RUNNER_PATH": str(runner),
+        "PYTHONPATH": os.pathsep.join(pythonpath),
+    })
+    return environment
+
+
+def run_osworld(args: argparse.Namespace, paths: JobPaths, agent_key: str) -> None:
+    if args.agent_backend == "openai":
+        runner = ensure_gpt54_overlay(paths)
+        command = openai_osworld_command(args, paths)
+        environment = openai_child_environment(agent_key, runner, args.osworld_root)
+    else:
+        runner = ensure_muse_spark_overlay(paths)
+        command = osworld_command(args, paths)
+        environment = muse_child_environment(args, agent_key, runner)
+    validate_osworld(args, paths, runner)
     ensure_muse_spark_vm_prerequisite(paths)
     if args.provider_name == "vmware" and args.num_envs != 1:
         raise BridgeError("an explicit VMware VM can run only one environment at a time")
-    subprocess.run(
-        osworld_command(args, paths),
-        cwd=paths.root,
-        env=muse_child_environment(args, meta_key, muse_runner),
-        check=True,
-    )
+    subprocess.run(command, cwd=paths.root, env=environment, check=True)
     if not paths.runs.is_dir():
         raise BridgeError(f"OSWorld produced no run directory at {paths.runs}")
 
@@ -908,13 +1067,14 @@ def trajectory_command(args: argparse.Namespace, paths: JobPaths, *, plan: bool)
         "--runs-dir", str(paths.runs),
         "--task-source-json", str(paths.tasks),
         "--output-dir", str(paths.trajectory_output),
-        "--provider", "meta",
-        "--model", args.meta_model,
+        "--provider", "openai" if args.agent_backend == "openai" else "meta",
+        "--judge-impl", args.judge_impl,
+        "--model", args.judge_model if args.agent_backend == "openai" else args.meta_model,
         "--queue", args.queue,
         "--num-workers", str(args.judge_workers),
-        "--max-images", str(META_JUDGE_SCREENSHOT_SAMPLE),
-        "--agent", "OSWorld MuseSparkAgent",
-        "--run-model", args.meta_model,
+        "--max-images", str(args.judge_max_images),
+        "--agent", agent_label(args),
+        "--run-model", agent_model(args),
         "--run-label", args.run_label,
         "--aws-region", args.aws_region,
         "--s3-bucket", args.s3_bucket,
@@ -926,14 +1086,20 @@ def trajectory_command(args: argparse.Namespace, paths: JobPaths, *, plan: bool)
     return command
 
 
-def publish_trajectories(args: argparse.Namespace, paths: JobPaths, meta_key: str, *, plan: bool) -> None:
+def publish_trajectories(args: argparse.Namespace, paths: JobPaths, agent_key: str, *, plan: bool) -> None:
     if not paths.runs.is_dir():
         raise BridgeError(f"OSWorld runs do not exist: {paths.runs}")
     if plan:
         subprocess.run(trajectory_command(args, paths, plan=True), check=True)
         return
+    if args.agent_backend == "openai":
+        # The judge talks to OpenAI directly; only the scoped key is forwarded.
+        environment = sanitized_environment()
+        environment["OPENAI_API_KEY"] = agent_key
+        subprocess.run(trajectory_command(args, paths, plan=False), check=True, env=environment)
+        return
     with meta_proxy(
-        meta_key,
+        agent_key,
         args.meta_model,
         args.meta_base_url,
         args.meta_session_id,
@@ -962,6 +1128,12 @@ def require_meta_key() -> str:
     )
 
 
+def require_agent_key(args: argparse.Namespace) -> str:
+    if args.agent_backend == "openai":
+        return require_secret("OPENAI_API_KEY")
+    return require_meta_key()
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description="Fetch author-signed Apollo tasks, run them in OSWorld with Meta Llama, and publish trajectories."
@@ -970,14 +1142,35 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--queue", choices=("v2", "pc"), default="v2")
     value.add_argument("--api-url", default=None)
     value.add_argument("--task-id", action="append", default=[])
+    value.add_argument(
+        "--exclude-task-ids-file",
+        type=Path,
+        default=None,
+        help="file of task IDs (one per line) to never select, e.g. known content-filter rejects",
+    )
     value.add_argument("--limit", type=int, default=1)
     value.add_argument("--include-existing-trajectories", action="store_true")
+    value.add_argument(
+        "--dedupe-by-model",
+        action="store_true",
+        help="skip a task only when THIS model already has a trajectory for it "
+             "(multi-model coverage); default skips tasks with any trajectory",
+    )
     value.add_argument("--shard-count", type=int, default=1)
     value.add_argument("--shard-index", type=int, default=0)
     value.add_argument("--work-dir", type=Path, default=DEFAULT_WORK_DIR)
     value.add_argument("--domain", default="apollo_chrome")
+    value.add_argument(
+        "--start-url-mode",
+        choices=("google", "site_scope"),
+        default="google",
+        help="browser tabs opened before the run: a blank Google search (default, "
+             "matching most Odysseys configs) or the task's authored key_urls/site_scope",
+    )
     value.add_argument("--osworld-root", type=Path, default=DEFAULT_OSWORLD_ROOT)
-    value.add_argument("--provider-name", choices=("vmware", "docker", "aws"), default="docker")
+    value.add_argument(
+        "--provider-name", choices=("vmware", "docker", "aws", "apptainer"), default="docker"
+    )
     value.add_argument("--path-to-vm", type=Path, default=None)
     value.add_argument("--num-envs", type=int, default=1)
     value.add_argument("--max-steps", type=int, default=100)
@@ -1002,6 +1195,35 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--meta-base-url", default=DEFAULT_META_BASE_URL)
     value.add_argument("--meta-session-id", default=DEFAULT_META_SESSION_ID)
     value.add_argument(
+        "--agent-backend",
+        choices=AGENT_BACKENDS,
+        default="muse-spark",
+        help="desktop agent: Meta Muse Spark (default) or upstream OSWorld's OpenAI GPT-5.4-style agent",
+    )
+    value.add_argument("--openai-model", default=DEFAULT_OPENAI_MODEL)
+    value.add_argument(
+        "--openai-reasoning-effort",
+        choices=("none", "low", "medium", "high", "xhigh"),
+        default=DEFAULT_OPENAI_REASONING_EFFORT,
+    )
+    value.add_argument(
+        "--judge-model",
+        default=DEFAULT_OPENAI_JUDGE_MODEL,
+        help="rubric judge model for the openai backend (the meta backend judges with --meta-model)",
+    )
+    value.add_argument(
+        "--judge-impl",
+        choices=("repo", "canonical"),
+        default="canonical",
+        help="which rubric judge to run: Odysseys' canonical file (default) or the in-tree counterpart",
+    )
+    value.add_argument(
+        "--judge-max-images",
+        type=int,
+        default=JUDGE_SCREENSHOT_SAMPLE,
+        help="screenshots per rubric judgment; 0 = the whole trajectory (Odysseys canonical behaviour)",
+    )
+    value.add_argument(
         "--reasoning-effort",
         choices=("none", "low", "medium", "high", "xhigh"),
         default="high",
@@ -1020,7 +1242,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     args.api_url = args.api_url or DEFAULT_APIS[args.queue]
     if args.path_to_vm is None:
         args.path_to_vm = DEFAULT_DOCKER_VM_PATH if args.provider_name == "docker" else DEFAULT_VM_PATH
-    paths = job_paths(args.work_dir, domain=args.domain, model=args.meta_model)
+    paths = job_paths(args.work_dir, domain=args.domain, model=agent_model(args))
     try:
         if args.num_envs < 1:
             raise BridgeError("--num-envs must be at least 1")
@@ -1042,7 +1264,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             all_tasks = fetch_reporting_tasks(args.api_url, token)
             existing_task_ids = (
                 set() if args.include_existing_trajectories
-                else fetch_trajectory_task_ids(args.api_url, token)
+                else fetch_trajectory_task_ids(
+                    args.api_url,
+                    token,
+                    model=agent_model(args) if args.dedupe_by_model else None,
+                )
             )
             selected, skipped = select_tasks(
                 all_tasks,
@@ -1053,10 +1279,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 existing_task_ids=existing_task_ids,
                 shard_count=args.shard_count,
                 shard_index=args.shard_index,
+                excluded_ids=read_task_id_list(args.exclude_task_ids_file),
             )
             if not selected:
                 raise BridgeError("no author-signed tasks without existing trajectories are available")
-            manifest = prepare_job(selected, paths, args.domain)
+            manifest = prepare_job(selected, paths, args.domain, args.start_url_mode)
             print(json.dumps({
                 "stage": "fetch",
                 "job": manifest,
@@ -1065,12 +1292,11 @@ def main(argv: Sequence[str] | None = None) -> None:
             }, indent=2))
 
         if args.stage in {"run", "all"} and not args.plan:
-            meta_key = require_meta_key()
-            run_osworld(args, paths, meta_key)
+            run_osworld(args, paths, require_agent_key(args))
 
         if args.stage in {"publish", "all"}:
-            meta_key = "" if args.plan else require_meta_key()
-            publish_trajectories(args, paths, meta_key, plan=args.plan)
+            agent_key = "" if args.plan else require_agent_key(args)
+            publish_trajectories(args, paths, agent_key, plan=args.plan)
     except (BridgeError, OSError, subprocess.CalledProcessError) as exc:
         raise SystemExit(f"error: {exc}") from exc
 

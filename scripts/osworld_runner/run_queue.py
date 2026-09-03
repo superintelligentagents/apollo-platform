@@ -33,6 +33,7 @@ from scripts.osworld_runner.run import (
     fetch_reporting_tasks,
     fetch_trajectory_task_ids,
     get_json,
+    read_task_id_list,
     select_tasks,
     trajectory_reporting_url,
     write_private_json,
@@ -83,10 +84,12 @@ def available_tasks(
     *,
     shard_count: int,
     shard_index: int,
+    excluded_ids: frozenset[str] = frozenset(),
+    dedupe_model: str | None = None,
 ) -> tuple[int, int]:
     api_url = DEFAULT_APIS[queue]
     tasks = fetch_reporting_tasks(api_url, token)
-    existing = fetch_trajectory_task_ids(api_url, token)
+    existing = fetch_trajectory_task_ids(api_url, token, model=dedupe_model)
     selected, _ = select_tasks(
         tasks,
         queue=queue,
@@ -95,6 +98,7 @@ def available_tasks(
         existing_task_ids=existing,
         shard_count=shard_count,
         shard_index=shard_index,
+        excluded_ids=excluded_ids,
     )
     return len(selected), len(existing)
 
@@ -283,7 +287,33 @@ def recover_published_batches(
             continue
         if not (batch_dir / "job.json").exists():
             continue
-        if not (batch_dir / "trajectory_review/prepare-summary.json").exists():
+        summary_path = batch_dir / "trajectory_review/prepare-summary.json"
+        if not summary_path.exists():
+            continue
+        # prepare.py writes its summary even when it publishes nothing, so a
+        # batch whose uploads all failed would otherwise make every restart die
+        # here — wedging the shard forever. Record it and move on; its tasks
+        # stay runnable and get picked up by a later batch.
+        try:
+            prepared = read_json(summary_path).get("prepared")
+        except (OSError, json.JSONDecodeError):
+            prepared = None
+        if not prepared:
+            write_private_json(
+                batch_dir / "failed.json",
+                {
+                    "reason": "publish produced no trajectories",
+                    "task_ids": (read_json(batch_dir / "job.json").get("task_ids") or []),
+                    "recorded_at_utc": utc_now(),
+                },
+            )
+            write_private_json(
+                batch_dir / "verified.json",
+                {"runs": [], "requested_task_count": 0, "published_task_count": 0,
+                 "failed_task_ids": (read_json(batch_dir / "job.json").get("task_ids") or [])},
+            )
+            compact_batch(batch_dir)
+            log(f"recovered {batch_dir.name}: published nothing; continuing")
             continue
         verified = verify_batch(
             batch_dir,
@@ -318,8 +348,56 @@ def compact_batch(batch_dir: Path) -> None:
             path.unlink()
 
 
+def batch_ran_empty(command_log: Path) -> bool:
+    """True when publish failed because every task in the batch failed to run."""
+    try:
+        tail = command_log.read_bytes()[-20_000:].decode("utf-8", "replace")
+    except OSError:
+        return False
+    return "no eligible trajectory runs found" in tail
+
+
+def publish_batch_with_retry(
+    base: Sequence[str],
+    judges: int,
+    run_label: str,
+    command_log: Path,
+    *,
+    attempts: int = 3,
+    delay: float = 30.0,
+) -> QueueRunError | None:
+    """Retry publish so one transient judge error cannot stop the shard.
+
+    The judge resumes incrementally (errored rubric results are re-judged on
+    rerun) and prepare's uploads are idempotent, so retrying the whole stage is
+    safe. Returns the final error for an all-tasks-failed batch instead of
+    raising, so the caller can record the batch and continue.
+    """
+    error: QueueRunError | None = None
+    for attempt in range(attempts):
+        try:
+            run_command(
+                [
+                    *base,
+                    "--stage", "publish",
+                    "--judge-workers", str(judges),
+                    "--run-label", run_label,
+                ],
+                command_log,
+            )
+            return None
+        except QueueRunError as exc:
+            error = exc
+            if batch_ran_empty(command_log):
+                return error
+            if attempt + 1 < attempts:
+                log(f"publish attempt {attempt + 1} failed; retrying: {exc}")
+                time.sleep(delay)
+    return error
+
+
 def command_base(args: argparse.Namespace, batch_dir: Path) -> list[str]:
-    return [
+    command = [
         sys.executable,
         str(Path(__file__).resolve().with_name("run.py")),
         "--queue", args.queue,
@@ -335,7 +413,19 @@ def command_base(args: argparse.Namespace, batch_dir: Path) -> list[str]:
         "--meta-session-id", args.meta_session_id,
         "--shard-count", str(args.shard_count),
         "--shard-index", str(args.shard_index),
+        "--agent-backend", args.agent_backend,
+        "--openai-model", args.openai_model,
+        "--openai-reasoning-effort", args.openai_reasoning_effort,
+        "--judge-model", args.judge_model,
+        "--judge-max-images", str(args.judge_max_images),
+        "--judge-impl", args.judge_impl,
+        "--start-url-mode", args.start_url_mode,
     ]
+    if args.dedupe_by_model:
+        command.append("--dedupe-by-model")
+    if args.exclude_task_ids_file is not None:
+        command.extend(["--exclude-task-ids-file", str(args.exclude_task_ids_file)])
+    return command
 
 
 def parser() -> argparse.ArgumentParser:
@@ -352,12 +442,33 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--work-root", type=Path, required=True)
     value.add_argument("--s3-bucket", default="journeys-prolific")
     value.add_argument("--osworld-root", type=Path, default=DEFAULT_OSWORLD_ROOT)
-    value.add_argument("--provider-name", choices=("vmware", "docker", "aws"), default="docker")
+    value.add_argument(
+        "--provider-name", choices=("vmware", "docker", "aws", "apptainer"), default="docker"
+    )
     value.add_argument("--path-to-vm", type=Path, default=DEFAULT_DOCKER_VM_PATH)
     value.add_argument("--meta-session-id", default=DEFAULT_META_SESSION_ID)
     value.add_argument("--shard-count", type=int, default=1)
     value.add_argument("--shard-index", type=int, default=0)
     value.add_argument("--max-batches", type=int, default=0)
+    value.add_argument("--exclude-task-ids-file", type=Path, default=None)
+    value.add_argument("--agent-backend", choices=("muse-spark", "openai"), default="muse-spark")
+    value.add_argument("--openai-model", default="gpt-5.6-luna")
+    value.add_argument(
+        "--openai-reasoning-effort",
+        choices=("none", "low", "medium", "high", "xhigh"),
+        default="medium",
+    )
+    value.add_argument("--judge-model", default="gpt-5.4-mini")
+    value.add_argument("--dedupe-by-model", action="store_true")
+    value.add_argument("--judge-max-images", type=int, default=0)
+    value.add_argument("--judge-impl", choices=("repo", "canonical"), default="canonical")
+    value.add_argument("--start-url-mode", choices=("google", "site_scope"), default="google")
+    value.add_argument(
+        "--block-marker",
+        type=Path,
+        default=None,
+        help="stop before each batch if this file exists (written when Meta blocks the key)",
+    )
     value.add_argument("--reporting-attempts", type=int, default=12)
     value.add_argument("--reporting-delay", type=float, default=5.0)
     return value
@@ -370,9 +481,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.shard_count < 1 or args.shard_index < 0 or args.shard_index >= args.shard_count:
         raise SystemExit("shard index must be between 0 and shard-count - 1")
     token = os.environ.get("APOLLO_REPORTING_TOKEN", "").strip()
-    meta_key = os.environ.get("MUSE_SPARK_API_KEY", "").strip()
-    if not token or not meta_key:
-        raise SystemExit("APOLLO_REPORTING_TOKEN and MUSE_SPARK_API_KEY are required")
+    key_name = "OPENAI_API_KEY" if args.agent_backend == "openai" else "MUSE_SPARK_API_KEY"
+    agent_key = os.environ.get(key_name, "").strip()
+    if not token or not agent_key:
+        raise SystemExit(f"APOLLO_REPORTING_TOKEN and {key_name} are required")
 
     root = args.work_root.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -427,7 +539,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             reporting_attempts=args.reporting_attempts,
             reporting_delay=args.reporting_delay,
         )
+        consecutive_empty_batches = 0
+        excluded_ids = read_task_id_list(args.exclude_task_ids_file)
         while not args.max_batches or state["batches_completed"] < args.max_batches:
+            if args.block_marker is not None and args.block_marker.exists():
+                state["status"] = "meta_blocked"
+                state["stop_reason"] = (
+                    f"Meta block marker present: {args.block_marker}; "
+                    "remove it once access is restored"
+                )
+                log(state["stop_reason"])
+                break
             free_gib = disk_free_gib(root)
             if free_gib < args.min_free_gib:
                 state["status"] = "low_disk"
@@ -442,6 +564,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 token,
                 shard_count=args.shard_count,
                 shard_index=args.shard_index,
+                excluded_ids=excluded_ids,
+                dedupe_model=(
+                    (args.openai_model if args.agent_backend == "openai" else None)
+                    if args.dedupe_by_model else None
+                ),
             )
             state["remaining_runnable"] = remaining
             state["existing_trajectory_task_ids"] = existing
@@ -460,8 +587,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             batch_dir = root / f"batch-{batch_number:06d}"
             command_log = batch_dir / "command.log"
             selected_count = min(args.batch_size, remaining)
+            vendor = "OpenAI" if args.agent_backend == "openai" else "Meta"
             run_label = (
-                f"Apollo author-approved Meta production shard "
+                f"Apollo author-approved {vendor} production shard "
                 f"{args.shard_index + 1}/{args.shard_count} batch {batch_number:06d}"
             )
             log(
@@ -470,10 +598,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
 
             base = command_base(args, batch_dir)
-            run_command(
-                [*base, "--stage", "fetch", "--limit", str(selected_count)],
-                command_log,
-            )
+            try:
+                run_command(
+                    [*base, "--stage", "fetch", "--limit", str(selected_count)],
+                    command_log,
+                )
+            except QueueRunError:
+                # The runnable count and the fetch are separate API calls, so a
+                # shard that just drained its slice (its last publishes became
+                # visible in between) fails the fetch. That is completion, not
+                # an error — otherwise the shard would be resubmitted forever.
+                if "no author-signed tasks" in command_log.read_text(
+                    encoding="utf-8", errors="replace"
+                )[-4000:]:
+                    # Only trust this when our own count agrees. A child that
+                    # was launched with different selection flags (e.g. missing
+                    # --dedupe-by-model) also reports "no tasks", and marking
+                    # the shard complete there would silently abandon work.
+                    still, _ = available_tasks(
+                        args.queue, token,
+                        shard_count=args.shard_count, shard_index=args.shard_index,
+                        excluded_ids=excluded_ids,
+                        dedupe_model=(
+                            (args.openai_model if args.agent_backend == "openai" else None)
+                            if args.dedupe_by_model else None
+                        ),
+                    )
+                    if still == 0:
+                        state["status"] = "complete"
+                        state["remaining_runnable"] = 0
+                        log("queue complete: shard slice is drained")
+                        break
+                    raise QueueRunError(
+                        f"fetch found no tasks but {still} remain for this shard; "
+                        "child selection flags likely differ from the queue's"
+                    )
+                raise
             job = read_json(batch_dir / "job.json")
             task_count = int(job["task_count"])
             workers = min(args.num_envs, task_count)
@@ -487,15 +647,41 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ],
                 command_log,
             )
-            run_command(
-                [
-                    *base,
-                    "--stage", "publish",
-                    "--judge-workers", str(judges),
-                    "--run-label", run_label,
-                ],
-                command_log,
+            publish_error = publish_batch_with_retry(
+                base, judges, run_label, command_log
             )
+            if publish_error is not None:
+                if not batch_ran_empty(command_log):
+                    raise publish_error
+                # Every task in this batch failed to produce a trajectory
+                # (e.g. an upstream API outage). Record it and keep draining
+                # the queue; a run of empty batches means a real outage, so
+                # stop rather than churn through the shard marking failures.
+                consecutive_empty_batches += 1
+                write_private_json(
+                    batch_dir / "failed.json",
+                    {
+                        "reason": "no eligible trajectory runs",
+                        "task_ids": job.get("task_ids") or [],
+                        "recorded_at_utc": utc_now(),
+                    },
+                )
+                state["failed_batches"] = int(state.get("failed_batches", 0)) + 1
+                state["updated_at_utc"] = utc_now()
+                write_private_json(state_path, state)
+                log(
+                    f"batch {batch_number} produced no trajectories "
+                    f"({consecutive_empty_batches} empty in a row); continuing"
+                )
+                if consecutive_empty_batches >= 3:
+                    state["status"] = "error"
+                    state["stop_reason"] = (
+                        "3 consecutive batches produced no trajectories"
+                    )
+                    log(state["stop_reason"])
+                    break
+                continue
+            consecutive_empty_batches = 0
             verified = verify_batch(
                 batch_dir,
                 bucket=args.s3_bucket,

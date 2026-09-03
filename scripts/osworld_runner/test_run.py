@@ -96,15 +96,22 @@ class OSWorldBridgeTests(unittest.TestCase):
                 limit=1,
             )
 
-    def test_osworld_config_uses_final_request_and_public_start_urls(self):
+    def test_osworld_config_uses_final_request_and_google_start_by_default(self):
         config = run.osworld_config(task(), "apollo_chrome")
         self.assertEqual(config["instruction"], "Research the topic and summarize it.")
         self.assertEqual(config["config"][0]["type"], "command")
         self.assertIn("command -v xclip", config["config"][0]["parameters"]["command"])
         self.assertEqual(config["config"][1]["type"], "execute_with_verification")
+        # Default: the agent starts on a blank search page and has to find its
+        # own sources, as most Odysseys configs do.
+        tabs = config["config"][-1]["parameters"]["urls_to_open"]
+        self.assertEqual(tabs, ["https://www.google.com/"])
+        self.assertEqual(config["metadata"]["apollo_task_id"], "v2/alice/internal/task-1")
+
+    def test_osworld_config_can_preopen_authored_site_scope(self):
+        config = run.osworld_config(task(), "apollo_chrome", "site_scope")
         tabs = config["config"][-1]["parameters"]["urls_to_open"]
         self.assertEqual(tabs, ["https://example.com/start", "https://example.org/"])
-        self.assertEqual(config["metadata"]["apollo_task_id"], "v2/alice/internal/task-1")
 
     def test_existing_job_gets_muse_spark_vm_prerequisite_once(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -247,11 +254,20 @@ class OSWorldBridgeTests(unittest.TestCase):
         retries_index = command.index("--max_retries")
         self.assertEqual(command[retries_index + 1], "3")
 
-    def test_trajectory_judge_is_labeled_meta_and_respects_image_limit(self):
+    def test_trajectory_judge_is_labeled_meta_and_judges_whole_trajectory(self):
         args = run.parser().parse_args(["--stage", "publish"])
         paths = run.job_paths(Path("/tmp/job"), model=args.meta_model)
         command = run.trajectory_command(args, paths, plan=False)
         self.assertIn("meta", command)
+        # 0 = every screenshot, matching the canonical Odysseys judge; sampling
+        # a subset could hide the frame that proves a rubric.
+        index = command.index("--max-images")
+        self.assertEqual(command[index + 1], "0")
+
+    def test_trajectory_judge_image_limit_is_overridable(self):
+        args = run.parser().parse_args(["--stage", "publish", "--judge-max-images", "12"])
+        paths = run.job_paths(Path("/tmp/job"), model=args.meta_model)
+        command = run.trajectory_command(args, paths, plan=False)
         index = command.index("--max-images")
         self.assertEqual(command[index + 1], "12")
 

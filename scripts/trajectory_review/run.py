@@ -70,6 +70,28 @@ def check_bucket(args: argparse.Namespace, bucket: str) -> None:
 
 
 def judge_command(args: argparse.Namespace, eval_results: Path, *, plan: bool | None = None) -> list[str]:
+    wants_plan = args.plan if plan is None else plan
+    if getattr(args, "judge_impl", "repo") == "canonical":
+        # Odysseys' own run_full_trajectory_per_rubric.py, fetched and hash-
+        # checked by the adapter; it has no provider/history flags of its own.
+        command = [
+            sys.executable,
+            str(SCRIPT_DIR / "canonical_judge.py"),
+            "--runs-dir", str(args.runs_dir),
+            "--task-source-json", str(args.task_source_json),
+            "--output", str(eval_results),
+            "--model", args.model,
+            "--num-workers", str(args.num_workers),
+            "--max-images", str(args.max_images),
+            "--max-steps", str(args.max_steps),
+        ]
+        if os.getenv("OPENAI_BASE_URL"):
+            command.extend(["--api-base", os.environ["OPENAI_BASE_URL"]])
+        if args.include_incomplete:
+            command.append("--include-incomplete")
+        if wants_plan:
+            command.append("--plan")
+        return command
     command = [
         sys.executable,
         str(SCRIPT_DIR / "judge.py"),
@@ -112,7 +134,11 @@ def judge_plan(args: argparse.Namespace, eval_results: Path) -> dict[str, object
         )
         plan = json.loads(result.stdout)
     except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
-        raise RunnerError(f"trajectory assignment plan failed: {exc}") from exc
+        stderr = getattr(exc, "stderr", "") or ""
+        raise RunnerError(
+            f"trajectory assignment plan failed: {exc}"
+            + (f"; judge stderr: {stderr.strip()[-2000:]}" if stderr.strip() else "")
+        ) from exc
     if not isinstance(plan, dict):
         raise RunnerError("trajectory judge plan must be a JSON object")
     validate_judge_plan_queue(plan, args.queue)
@@ -160,6 +186,14 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--output-dir", type=Path, default=Path(".work/trajectory_review"))
     value.add_argument("--eval-results", type=Path, default=None)
     value.add_argument("--provider", choices=("auto", "gemini", "openai", "meta"), default="auto")
+    value.add_argument(
+        "--judge-impl",
+        choices=("repo", "canonical"),
+        default="repo",
+        help="'canonical' runs Odysseys' own run_full_trajectory_per_rubric.py "
+             "(fetched and SHA-256 pinned); 'repo' runs the in-tree counterpart, "
+             "which additionally supports --provider meta and --max-history-chars",
+    )
     value.add_argument("--model", default="gemini-3.1-flash-lite-preview")
     value.add_argument(
         "--queue",
@@ -241,7 +275,19 @@ def main(argv: Sequence[str] | None = None) -> None:
 
         args.output_dir.mkdir(parents=True, exist_ok=True)
         if not args.skip_judge:
-            subprocess.run(judge_command(args, eval_results, plan=False), check=True)
+            judge_result = subprocess.run(judge_command(args, eval_results, plan=False))
+            if judge_result.returncode == 2:
+                # Exit 2 means the judge finished but some tasks or rubrics
+                # errored (for example a trajectory over the history-size
+                # limit). Those tasks stay unpublished; prepare packages the
+                # rest, and its own exit 2 still fails an all-errored batch.
+                print(
+                    "warning: judge completed with errored tasks; "
+                    "publishing the successfully judged trajectories",
+                    file=sys.stderr,
+                )
+            elif judge_result.returncode:
+                raise RunnerError(f"judge exited {judge_result.returncode}")
         subprocess.run(
             prepare_command(args, eval_results, bucket),
             check=True,
