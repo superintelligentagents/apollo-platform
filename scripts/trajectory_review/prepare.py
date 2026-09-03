@@ -16,11 +16,13 @@ import json
 import mimetypes
 import re
 import shutil
+import random
 import subprocess
+import time
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 
 SCHEMA_VERSION = "apollo-trajectory-review-package-v1"
@@ -387,6 +389,39 @@ def put_object_if_absent(
     raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout, stderr=result.stderr)
 
 
+def run_aws_with_retry(
+    command: Sequence[str],
+    *,
+    attempts: int = 4,
+    delay: float = 5.0,
+    stdout: Any = None,
+) -> None:
+    """Run an AWS CLI command, retrying transient failures.
+
+    A whole batch used to be lost when one `s3 cp` hit throttling or a network
+    blip: every task in it was skipped and the queue worker stopped. S3 writes
+    here are idempotent (content-addressed keys), so retrying is safe.
+    """
+    last: subprocess.CalledProcessError | None = None
+    for attempt in range(attempts):
+        result = subprocess.run(
+            list(command), check=False, capture_output=stdout is None, text=True
+        )
+        if result.returncode == 0:
+            return
+        last = subprocess.CalledProcessError(
+            result.returncode, result.args,
+            output=getattr(result, "stdout", None), stderr=getattr(result, "stderr", None),
+        )
+        if attempt + 1 < attempts:
+            time.sleep(delay * (2**attempt) + random.uniform(0.0, 2.0))
+    detail = (getattr(last, "stderr", "") or "").strip()[-500:]
+    raise PackageError(
+        f"AWS command failed after {attempts} attempts: {' '.join(command[:4])}…"
+        + (f"; stderr: {detail}" if detail else "")
+    )
+
+
 def upload_package(
     manifest_path: Path,
     manifest: dict[str, Any],
@@ -410,10 +445,10 @@ def upload_package(
     s3_prefix = f"{s3_root}/{_encoded(task_id)}/{run_id}"
     screens_dir = package_dir / "screens"
     if screens_dir.is_dir():
-        subprocess.run([
+        run_aws_with_retry([
             aws_cli, "s3", "cp", str(screens_dir), f"s3://{bucket}/{s3_prefix}/screens/",
             "--recursive", "--only-show-errors",
-        ], check=True)
+        ])
     manifest_key = f"{s3_prefix}/manifest.json"
     put_object_if_absent(
         manifest_path,
@@ -426,10 +461,10 @@ def upload_package(
     with tempfile.NamedTemporaryFile("w", encoding="utf-8") as marker:
         marker.write(manifest_key)
         marker.flush()
-        subprocess.run([
+        run_aws_with_retry([
             aws_cli, "s3api", "put-object", "--bucket", bucket, "--key", marker_key,
             "--body", marker.name, "--content-type", "text/plain",
-        ], check=True, stdout=subprocess.DEVNULL)
+        ], stdout=subprocess.DEVNULL)
     return manifest_key
 
 

@@ -235,12 +235,63 @@ const authorSignoffKeyFor = (subKey) => `${AUTHOR_SIGNOFF_PREFIX}${b64url(subKey
 // look. Unlike the compact sign-off receipt, this prefix is directly usable
 // by downstream consumers that only want author-approved final gold.
 const AUTHOR_APPROVED_PREFIX = `${REVIEW_PREFIX}author-approved/`;
+const AUTHOR_APPROVED_SHOWCASE_KEY = `${REVIEW_PREFIX}cache/author_approved_showcase.json`;
 export const authorApprovedKeyFor = (taskId) => {
   const safeTaskId = String(taskId || "")
     .replace(/[^A-Za-z0-9_-]/g, "_")
     .slice(0, 300) || "task-unknown";
   return `${AUTHOR_APPROVED_PREFIX}${safeTaskId}.json`;
 };
+export function isAuthorApprovedShowcaseCatalog(value) {
+  if (!value || typeof value !== "object") return false;
+  if (value.schema_version !== "apollo-admin-author-approved-showcase-v1") return false;
+  if (!Number.isInteger(value.source_tasks) || value.source_tasks < 1) return false;
+  if (!Number.isInteger(value.selected_tasks) || value.selected_tasks < 10 || value.selected_tasks > 100) return false;
+  const summary = value.summary;
+  if (!summary || typeof summary !== "object") return false;
+  if (!Number.isInteger(summary.total_category_assignments) || summary.total_category_assignments < value.source_tasks) return false;
+  if (!Number.isFinite(summary.average_categories_per_task) || summary.average_categories_per_task < 1 || summary.average_categories_per_task > 3) return false;
+  if (!Number.isInteger(summary.primary_categories_used) || summary.primary_categories_used < 1) return false;
+  if (!Number.isInteger(summary.top_level_categories_used) || summary.top_level_categories_used < 1) return false;
+  if (!Number.isInteger(summary.tasks_with_websites) || summary.tasks_with_websites < 0) return false;
+  if (!Number.isInteger(summary.tasks_without_websites) || summary.tasks_without_websites < 0) return false;
+  if (summary.tasks_with_websites + summary.tasks_without_websites !== value.source_tasks) return false;
+  if (!Number.isFinite(summary.website_coverage_share) || summary.website_coverage_share < 0 || summary.website_coverage_share > 1) return false;
+  if (!Number.isInteger(summary.website_mentions) || summary.website_mentions < 0) return false;
+  if (!Number.isInteger(summary.unique_websites) || summary.unique_websites < 0) return false;
+  if (!Array.isArray(summary.category_count_distribution) || !summary.category_count_distribution.length) return false;
+  if (!Array.isArray(summary.confidence_distribution) || !summary.confidence_distribution.length) return false;
+  if (!Array.isArray(summary.top_websites)) return false;
+  const categoryCountsValid = summary.category_count_distribution.every((row) =>
+    row && Number.isInteger(row.category_count) && row.category_count >= 1 && row.category_count <= 3
+    && Number.isInteger(row.count) && row.count > 0
+    && Number.isFinite(row.share) && row.share > 0 && row.share <= 1
+  );
+  const confidenceValid = summary.confidence_distribution.every((row) =>
+    row && ["high", "medium", "low"].includes(row.confidence)
+    && Number.isInteger(row.count) && row.count > 0
+    && Number.isFinite(row.share) && row.share > 0 && row.share <= 1
+  );
+  if (!Array.isArray(value.primary_top_level_distribution) || !value.primary_top_level_distribution.length) return false;
+  if (!Array.isArray(value.examples) || value.examples.length !== value.selected_tasks) return false;
+  const distributionsValid = value.primary_top_level_distribution.every((row) =>
+    row && typeof row.category === "string" && row.category.trim()
+    && Number.isInteger(row.count) && row.count > 0
+    && Number.isFinite(row.share) && row.share > 0 && row.share <= 1
+  );
+  const examplesValid = value.examples.every((example) =>
+    example && typeof example.task_id === "string" && example.task_id.trim()
+    && typeof example.review_content_hash === "string" && /^[a-f0-9]{64}$/i.test(example.review_content_hash)
+    && typeof example.title === "string" && example.title.trim()
+    && typeof example.request === "string"
+    && typeof example.primary_category === "string" && example.primary_category.trim()
+    && typeof example.top_level_category === "string" && example.top_level_category.trim()
+    && Array.isArray(example.categories) && example.categories.length >= 1 && example.categories.length <= 3
+    && Array.isArray(example.steps) && Array.isArray(example.rubrics) && Array.isArray(example.websites)
+  );
+  return Boolean(categoryCountsValid && confidenceValid && distributionsValid && examplesValid);
+}
+
 const AUTHOR_MUTATION_LOCK_PREFIX = `${REVIEW_PREFIX}author-mutation-locks/`;
 export const authorMutationLockKeyFor = (subKey) =>
   `${AUTHOR_MUTATION_LOCK_PREFIX}${b64url(reviewUnitForKey(subKey))}.json`;
@@ -274,6 +325,23 @@ const TRAJECTORY_EDIT_LINKS_PREFIX = `${REVIEW_PREFIX}trajectory-edit-links/`;
 const trajectoryLockKeyFor = (manifestKey) => `${TRAJECTORY_LOCKS_PREFIX}${b64url(manifestKey)}.json`;
 const trajectoryDoneKeyFor = (manifestKey) => `${TRAJECTORY_DONE_PREFIX}${b64url(manifestKey)}`;
 const trajectoryJudgmentKeyFor = (manifestKey) => `${TRAJECTORY_JUDGMENTS_PREFIX}${b64url(manifestKey)}.json`;
+
+/**
+ * A manifest's screenshot path, or "" when it must not be signed.
+ *
+ * The previous check appended the path to the run prefix and then asserted the
+ * result still started with that prefix, which is true by construction and so
+ * never rejected anything. Validate the path itself instead: it has to stay a
+ * relative path inside its own run directory.
+ */
+export function safeTrajectoryAssetPath(value) {
+  const path = String(value ?? "").trim();
+  if (!path || path.length > 300) return "";
+  if (path.startsWith("/") || path.includes("\\") || path.includes("://")) return "";
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) return "";
+  return path;
+}
 
 export function taskIdFromTrajectoryManifestKey(key, reviewPrefix = REVIEW_PREFIX) {
   const runsPrefix = `${String(reviewPrefix).replace(/\/*$/, "/")}trajectory-runs/`;
@@ -2456,6 +2524,17 @@ export function buildAdminItemFromDocuments({
 }
 
 let adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
+let authorApprovedShowcaseCache = { catalog: null, checkedAt: 0 };
+
+async function authorApprovedShowcase() {
+  if (authorApprovedShowcaseCache.catalog && Date.now() - authorApprovedShowcaseCache.checkedAt < 60_000) {
+    return authorApprovedShowcaseCache.catalog;
+  }
+  const { json } = await readJson(AUTHOR_APPROVED_SHOWCASE_KEY);
+  if (!isAuthorApprovedShowcaseCatalog(json)) throw new Error("Author-approved showcase catalog is invalid");
+  authorApprovedShowcaseCache = { catalog: json, checkedAt: Date.now() };
+  return json;
+}
 
 // The full S3-built dashboard (every source doc + outcome) takes ~25s at
 // ~1.8k tasks — right under API Gateway's 30s cut-off and growing with the
@@ -4638,9 +4717,9 @@ async function signedTrajectoryManifest(manifestKey) {
   if (!manifest || taskIdFromTrajectoryManifestKey(manifestKey) !== manifest.task_id) return null;
   const base = manifestKey.slice(0, manifestKey.lastIndexOf("/") + 1);
   const steps = await Promise.all(manifest.steps.map(async (step) => {
-    if (!step.screenshot_path) return { ...step, screenshot_url: null };
-    const assetKey = `${base}${step.screenshot_path}`;
-    if (!assetKey.startsWith(base)) return { ...step, screenshot_url: null };
+    const relative = safeTrajectoryAssetPath(step.screenshot_path);
+    if (!relative) return { ...step, screenshot_url: null };
+    const assetKey = `${base}${relative}`;
     const screenshotUrl = await getSignedUrl(s3, new GetObjectCommand({ Bucket: S3_BUCKET, Key: assetKey }), { expiresIn: 3600 });
     return { ...step, screenshot_url: screenshotUrl };
   }));
@@ -4977,7 +5056,11 @@ export function buildTrajectoryReportingReport(items, generatedAt = new Date().t
     (!requestedTaskId || item.task_id === requestedTaskId) && (!requestedStatus || item.status === requestedStatus)
   );
   const offset = Math.max(0, Number(options.offset) || 0);
-  const limit = Math.min(options.includeContent ? 10 : 1_000, Math.max(1, Number(options.limit) || (options.includeContent ? 10 : 1_000)));
+  // Content rows carry every step and rubric, so they stay capped well below
+  // the metadata page size — but 10 made bulk pulls need ~200 round trips.
+  const contentLimit = options.includeScreenshots ? 25 : 50;
+  const maxLimit = options.includeContent ? contentLimit : 1_000;
+  const limit = Math.min(maxLimit, Math.max(1, Number(options.limit) || maxLimit));
   const page = filtered.slice(offset, offset + limit);
   const totals = { submitted: filtered.length, pending: 0, in_review: 0, reviewed: 0 };
   for (const item of filtered) totals[item.status] += 1;
@@ -4994,6 +5077,9 @@ export function buildTrajectoryReportingReport(items, generatedAt = new Date().t
       reviewed_at: item.reviewed_at ?? "",
       llm_average_rubric_score: item.llm_average_rubric_score,
       llm_perfect: item.llm_perfect,
+      llm_judge_errors: item.llm_judge_errors ?? 0,
+      llm_rubrics_total: item.llm_rubrics_total ?? null,
+      llm_rubrics_scored: item.llm_rubrics_scored ?? null,
       agent: item.agent ?? null,
       model: item.model ?? null,
       run_label: item.run_label ?? null,
@@ -5019,11 +5105,12 @@ async function handleTrajectoryReporting(event) {
   const params = event.queryStringParameters ?? {};
   const includes = new Set(String(params.include || "").split(",").map((value) => value.trim()).filter(Boolean));
   const includeContent = includes.has("content") || includes.has("full");
+  const includeScreenshots = includes.has("screenshots");
   const includeOsworld = includes.has("osworld");
   const formatOsworld = cleanText(params.format, 30).toLowerCase() === "osworld";
   // The OSWorld view is built from manifest + judgment even when the caller
   // did not ask for the raw content, so hydrate whenever either is needed.
-  const loadContent = includeContent || includeOsworld || formatOsworld;
+  const loadContent = includeContent || includeScreenshots || includeOsworld || formatOsworld;
   const state = await trajectoryQueueState();
   const items = [];
   for (let offset = 0; offset < state.manifests.length; offset += 25) {
@@ -5046,6 +5133,15 @@ async function handleTrajectoryReporting(event) {
         reviewed_at: done?.completed_at ?? "",
         llm_average_rubric_score: manifest.metrics.average_rubric_score,
         llm_perfect: manifest.metrics.perfect,
+        // average_rubric_score is the mean over rubrics the judge actually
+        // scored; rubrics that errored are dropped from that denominator, so
+        // a 1.0 can rest on a subset. Surface the counts beside it so callers
+        // can tell a full pass from a partial one without fetching content.
+        llm_judge_errors: manifest.metrics.judge_errors ?? 0,
+        llm_rubrics_total: Array.isArray(manifest.rubrics) ? manifest.rubrics.length : null,
+        llm_rubrics_scored: Array.isArray(manifest.rubrics)
+          ? manifest.rubrics.filter((rubric) => rubric?.llm_status !== "ERROR").length
+          : null,
         agent: manifest.source.agent,
         model: manifest.source.model,
         run_label: manifest.source.run_label,
@@ -5060,7 +5156,8 @@ async function handleTrajectoryReporting(event) {
     items.push(...batch.filter(Boolean));
   }
   const reportOptions = {
-    includeContent,
+    includeContent: includeContent || includeScreenshots,
+    includeScreenshots,
     includeOsworld,
     snapshot: /^[a-z0-9_-]{1,40}$/i.test(String(params.snapshot || "")) ? String(params.snapshot) : "chrome",
     grade: cleanText(params.grade, 10).toLowerCase(),
@@ -5072,6 +5169,31 @@ async function handleTrajectoryReporting(event) {
   const report = formatOsworld
     ? buildOsworldExportReport(items, new Date().toISOString(), reportOptions)
     : buildTrajectoryReportingReport(items, new Date().toISOString(), reportOptions);
+  if (includeScreenshots && Array.isArray(report.trajectories)) {
+    // Sign only the rows this page returns; screenshot_path is validated as a
+    // relative path inside the run's own prefix before a key is built.
+    report.trajectories = await Promise.all(report.trajectories.map(async (row) => {
+      const steps = row?.manifest?.steps;
+      if (!row.manifest_key || !Array.isArray(steps)) return row;
+      const base = row.manifest_key.slice(0, row.manifest_key.lastIndexOf("/") + 1);
+      const signed = await Promise.all(steps.map(async (step) => {
+        const relative = safeTrajectoryAssetPath(step?.screenshot_path);
+        if (!relative) return { ...step, screenshot_url: null };
+        const assetKey = `${base}${relative}`;
+        try {
+          const screenshotUrl = await getSignedUrl(
+            s3,
+            new GetObjectCommand({ Bucket: S3_BUCKET, Key: assetKey }),
+            { expiresIn: 3600 },
+          );
+          return { ...step, screenshot_url: screenshotUrl };
+        } catch (err) {
+          return { ...step, screenshot_url: null };
+        }
+      }));
+      return { ...row, manifest: { ...row.manifest, steps: signed } };
+    }));
+  }
   return respond(200, report, { "Cache-Control": "no-store" });
 }
 
@@ -5359,6 +5481,15 @@ async function handleReview(path, body) {
 
   if (path === "/review/admin") {
     if (!isAllowedAdminEmail(body.admin_email)) return respond(403, { error: "Admin access required" });
+    if (body.action === "showcase") {
+      if (APP_SCOPE !== "primary") return respond(404, { error: "Showcase is not available for this app" });
+      try {
+        return respond(200, await authorApprovedShowcase(), { "Cache-Control": "no-store" });
+      } catch (error) {
+        console.error("Author-approved showcase failed to load", error);
+        return respond(503, { error: "Showcase is temporarily unavailable" }, { "Cache-Control": "no-store" });
+      }
+    }
     if (body.action === "reopen") {
       const result = await reopenReviewOutcome(body.task_id, body.admin_email, body.reason);
       return respond(result.status, result.body, { "Cache-Control": "no-store" });

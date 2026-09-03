@@ -40,6 +40,7 @@ DEFAULT_MODEL = "gemini-3.1-flash-lite-preview"
 DEFAULT_MAX_IMAGES = 0
 DEFAULT_MAX_HISTORY_CHARS = 400_000
 MAX_COMPLETION_TOKENS = 4_096
+REASONING_MAX_COMPLETION_TOKENS = 16_384
 
 SYSTEM_PROMPT = """You are an independent evaluator of a web-navigation agent trajectory.
 
@@ -261,6 +262,21 @@ def resolve_provider(model: str, requested: str) -> str:
     return "gemini" if model.lower().startswith("gemini") else "openai"
 
 
+def is_openai_reasoning_model(model: str) -> bool:
+    name = model.lower()
+    return name.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def openai_sampling_params(model: str) -> dict[str, Any]:
+    """Reasoning models reject temperature and spend output budget on thinking."""
+    if is_openai_reasoning_model(model):
+        return {
+            "max_completion_tokens": REASONING_MAX_COMPLETION_TOKENS,
+            "reasoning_effort": "low",
+        }
+    return {"max_completion_tokens": MAX_COMPLETION_TOKENS, "temperature": 0}
+
+
 def make_client(provider: str) -> Any:
     if provider == "gemini":
         api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -391,10 +407,27 @@ async def judge_rubric(
                         *[{"type": "image_url", "image_url": {"url": asset["data_url"], "detail": "high"}} for asset in assets],
                     ]},
                 ],
-                max_completion_tokens=MAX_COMPLETION_TOKENS,
-                temperature=0,
+                **openai_sampling_params(model),
             )
             raw = clean_text(response.choices[0].message.content, 40_000)
+            try:  # billable split for cost accounting; never let logging break a judgment
+                usage = getattr(response, "usage", None)
+                details = getattr(usage, "prompt_tokens_details", None)
+                line = "Judge usage billable: input=%s cached=%s output=%s" % (
+                    getattr(usage, "prompt_tokens", 0),
+                    getattr(details, "cached_tokens", 0) or 0,
+                    getattr(usage, "completion_tokens", 0),
+                )
+                print(line, file=sys.stderr, flush=True)
+                # Batch logs are deleted after publish; keep a copy beside the
+                # judge output, which survives compaction.
+                usage_log = os.environ.get("JUDGE_USAGE_LOG_PATH")
+                if usage_log:
+                    Path(usage_log).parent.mkdir(parents=True, exist_ok=True)
+                    with open(usage_log, "a", encoding="utf-8") as handle:
+                        handle.write(f"{model} {line}\n")
+            except Exception:
+                pass
         status, evidence = parse_judgment(raw)
         return {
             "rubric_id": rubric["id"],
@@ -596,6 +629,10 @@ async def run(args: argparse.Namespace) -> dict[str, Any]:
         str(run_dir.resolve()): assignment_hash(run_dir, task)
         for run_dir, task in assignments
     }
+    # Default the usage log next to the judge output so it outlives batch compaction.
+    os.environ.setdefault(
+        "JUDGE_USAGE_LOG_PATH", str(args.output.resolve().parent / "judge-usage.log")
+    )
     existing = load_existing(args.output, provider, args.model)
     pending = [
         (run_dir, task)

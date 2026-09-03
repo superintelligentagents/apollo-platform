@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.trajectory_review import run
+from scripts.trajectory_review import canonical_judge, run
 
 
 class RunnerTests(unittest.TestCase):
@@ -58,6 +58,64 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(run.RunnerError):
             run.validate_judge_plan_queue({}, "v2")
 
+
+
+class CanonicalJudgeTests(unittest.TestCase):
+    def test_selects_the_canonical_odysseys_judge(self):
+        args = argparse.Namespace(
+            runs_dir=Path("/runs"), task_source_json=Path("/tasks.json"),
+            provider="openai", model="gpt-5.6-luna", num_workers=4,
+            max_images=0, max_steps=0, max_history_chars=1000,
+            env_file=None, include_incomplete=False, plan=False,
+            judge_impl="canonical",
+        )
+        command = run.judge_command(args, Path("/out/eval.json"))
+        self.assertIn("canonical_judge.py", " ".join(command))
+        # The canonical file has no provider/history flags of its own.
+        self.assertNotIn("--provider", command)
+        self.assertNotIn("--max-history-chars", command)
+        self.assertEqual(command[command.index("--max-images") + 1], "0")
+
+    def test_repo_judge_remains_the_explicit_alternative(self):
+        args = argparse.Namespace(
+            runs_dir=Path("/runs"), task_source_json=Path("/tasks.json"),
+            provider="meta", model="super_nova_ext", num_workers=1,
+            max_images=12, max_steps=0, max_history_chars=1000,
+            env_file=None, include_incomplete=False, plan=False,
+            judge_impl="repo",
+        )
+        command = run.judge_command(args, Path("/out/eval.json"))
+        self.assertIn("judge.py", " ".join(command))
+        self.assertIn("--provider", command)
+
+    def test_judge_errors_stay_separate_from_agent_failures(self):
+        # The canonical judge records a provider failure as success=False;
+        # Apollo must not read that as the agent failing the rubric.
+        payload = {"tasks": [{"task_id": "t", "run_dir": "/x", "rubric_results": [
+            {"rubric_id": "R1", "score": 1, "success": True, "final_reasoning": "Step 3 proves it."},
+            {"rubric_id": "R2", "score": 0, "success": False,
+             "final_reasoning": "Error judging rubric R2: 429 rate limit"},
+            {"rubric_id": "R3", "score": 0, "success": False, "final_reasoning": "Never saved the file."},
+        ]}]}
+        task = canonical_judge.restore_judge_status(payload, "gpt-5.6-luna")["tasks"][0]
+        statuses = {r["rubric_id"]: r["judge_status"] for r in task["rubric_results"]}
+        self.assertEqual(statuses, {"R1": "SUCCESS", "R2": "ERROR", "R3": "FAILURE"})
+        errored = next(r for r in task["rubric_results"] if r["rubric_id"] == "R2")
+        self.assertIsNone(errored["score"])
+        # 1 pass / 1 fail; the unjudged rubric is excluded from the denominator.
+        self.assertEqual(task["average_rubric_score"], 0.5)
+        self.assertEqual(task["judge_errors"], 1)
+        self.assertFalse(task["perfect"])
+
+    def test_perfect_requires_every_rubric_to_be_judged(self):
+        payload = {"tasks": [{"task_id": "t", "run_dir": "/x", "rubric_results": [
+            {"rubric_id": "R1", "score": 1, "success": True, "final_reasoning": "ok"},
+            {"rubric_id": "R2", "score": 0, "success": False,
+             "final_reasoning": "Error judging rubric R2: timeout"},
+        ]}]}
+        task = canonical_judge.restore_judge_status(payload, "m")["tasks"][0]
+        self.assertEqual(task["average_rubric_score"], 1.0)
+        self.assertFalse(task["perfect"])  # a 1.0 that rests on one of two rubrics
 
 if __name__ == "__main__":
     unittest.main()

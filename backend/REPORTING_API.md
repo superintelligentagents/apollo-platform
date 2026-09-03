@@ -330,11 +330,14 @@ Query parameters:
 - `status=pending|in_review|reviewed`
 - `task_id=<exact task id>`
 - `limit=<n>` and `offset=<n>`
-- `include=full` (or `include=content`) to include the complete normalized run package and human judgment; full pages are capped at 10
+- `include=full` (or `include=content`) to include the complete normalized run package and human judgment; content pages are capped at 50. `manifest.rubrics[]` carries the per-rubric verdicts (`rubric_id`, `requirement`, `llm_status`, `llm_score`, `llm_reasoning`) — use it, not `osworld_task.apollo.rubrics[]`, which is the criteria export and holds no verdicts.
+- `include=screenshots` adds a presigned `screenshot_url` (1-hour expiry) to every step alongside `screenshot_path`, so a client can render a run without S3 credentials. Implies `include=content`; pages are capped at 25.
 - `include=osworld` to add `osworld_task` to every row: the original task rendered as a stock OSWorld task config (see below). Composable with `include=full` (`include=full,osworld`).
 - `format=osworld` to receive the whole set as the OSWorld export bundle instead of rows (see below). Accepts the same `status`/`task_id`/`limit`/`offset` filters plus `grade=any` and `snapshot=<name>` (default `chrome`).
 
-The default response contains run identity, queue status, runner/model/run label, reviewer/timestamp, LLM aggregate score, and `human_final_grade`. New final grades are `YES`, `NO`, `EDIT_NEEDED`, or `NEEDS_RERUN`. The immutable `apollo-human-trajectory-judgment-v3` document stores that value as `trajectory.overall_outcome`; it also retains the older three-way `trajectory.task_satisfied` alias. The existing API field `human_outcome` remains unchanged for compatibility, while `human_final_grade` gives both old and new records the normalized four-way value. `EDIT_NEEDED` and `NEEDS_RERUN` require at least 10 characters in `trajectory.notes` explaining the edit or rerun.
+`llm_average_rubric_score` is the mean over rubrics the judge actually scored: an `ERROR` rubric is dropped from that denominator, so a run with 4 errors and 1 pass reports `1.0`. `llm_perfect` is stricter — it requires every rubric to have been scored *and* passed — so the two are not interchangeable, and `llm_perfect` is the safer pass signal. Every row therefore also carries `llm_judge_errors`, `llm_rubrics_total`, and `llm_rubrics_scored`; treat an average whose `llm_rubrics_scored < llm_rubrics_total` as partial coverage rather than a clean score.
+
+The default response contains run identity, queue status, runner/model/run label, reviewer/timestamp, LLM aggregate score with the coverage counts above, and `human_final_grade`. New final grades are `YES`, `NO`, `EDIT_NEEDED`, or `NEEDS_RERUN`. The immutable `apollo-human-trajectory-judgment-v3` document stores that value as `trajectory.overall_outcome`; it also retains the older three-way `trajectory.task_satisfied` alias. The existing API field `human_outcome` remains unchanged for compatibility, while `human_final_grade` gives both old and new records the normalized four-way value. `EDIT_NEEDED` and `NEEDS_RERUN` require at least 10 characters in `trajectory.notes` explaining the edit or rerun.
 
 Trajectory Grade is assigned to the task's original creator. A new package
 must therefore include `manifest.creator_pid` (current Apollo task IDs can be
