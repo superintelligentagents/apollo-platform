@@ -701,6 +701,56 @@ test("trajectory reporting separates metadata from opt-in full content", () => {
   assert.equal(full.schema_version, "apollo-trajectory-reporting-v2");
 });
 
+test("trajectory reporting exposes judge coverage beside the average score", () => {
+  // A 1.0 average can rest on a subset when rubrics error, so the row has to
+  // carry the counts that distinguish a full pass from a partial one.
+  const items = [{
+    manifest_key: "manifest-a",
+    task_id: "task-a",
+    run_id: "run-a",
+    status: "pending",
+    llm_average_rubric_score: 1,
+    llm_perfect: false,
+    llm_judge_errors: 4,
+    llm_rubrics_total: 5,
+    llm_rubrics_scored: 1,
+  }];
+  const row = buildTrajectoryReportingReport(items, "2026-08-11T00:01:00Z").trajectories[0];
+  assert.equal(row.llm_average_rubric_score, 1);
+  assert.equal(row.llm_perfect, false);
+  assert.equal(row.llm_judge_errors, 4);
+  assert.equal(row.llm_rubrics_total, 5);
+  assert.equal(row.llm_rubrics_scored, 1);
+
+  const clean = buildTrajectoryReportingReport(
+    [{ manifest_key: "b", task_id: "t", run_id: "r", status: "pending" }],
+    "2026-08-11T00:01:00Z",
+  ).trajectories[0];
+  assert.equal(clean.llm_judge_errors, 0);
+  assert.equal(clean.llm_rubrics_total, null);
+});
+
+test("trajectory reporting content pages are larger than the old ten-row cap", () => {
+  const items = Array.from({ length: 60 }, (_, index) => ({
+    manifest_key: `manifest-${index}`,
+    task_id: `task-${index}`,
+    run_id: `run-${index}`,
+    status: "pending",
+    manifest: { task_prompt: "prompt" },
+  }));
+  const content = buildTrajectoryReportingReport(items, "2026-08-11T00:01:00Z", { includeContent: true });
+  assert.equal(content.trajectories.length, 50);
+  assert.equal(content.page.next_offset, 50);
+  // Screenshot signing is heavier per row, so that view stays smaller.
+  const shots = buildTrajectoryReportingReport(items, "2026-08-11T00:01:00Z", {
+    includeContent: true,
+    includeScreenshots: true,
+  });
+  assert.equal(shots.trajectories.length, 25);
+  // Metadata-only paging is unchanged.
+  assert.equal(buildTrajectoryReportingReport(items, "2026-08-11T00:01:00Z").trajectories.length, 60);
+});
+
 test("uses collision-free task ids for LLM pass and attention artifacts", () => {
   const taskId = "v2/alice/internal/task-12345678";
   const encoded = Buffer.from(taskId, "utf8").toString("base64url");

@@ -4977,7 +4977,11 @@ export function buildTrajectoryReportingReport(items, generatedAt = new Date().t
     (!requestedTaskId || item.task_id === requestedTaskId) && (!requestedStatus || item.status === requestedStatus)
   );
   const offset = Math.max(0, Number(options.offset) || 0);
-  const limit = Math.min(options.includeContent ? 10 : 1_000, Math.max(1, Number(options.limit) || (options.includeContent ? 10 : 1_000)));
+  // Content rows carry every step and rubric, so they stay capped well below
+  // the metadata page size — but 10 made bulk pulls need ~200 round trips.
+  const contentLimit = options.includeScreenshots ? 25 : 50;
+  const maxLimit = options.includeContent ? contentLimit : 1_000;
+  const limit = Math.min(maxLimit, Math.max(1, Number(options.limit) || maxLimit));
   const page = filtered.slice(offset, offset + limit);
   const totals = { submitted: filtered.length, pending: 0, in_review: 0, reviewed: 0 };
   for (const item of filtered) totals[item.status] += 1;
@@ -4994,6 +4998,9 @@ export function buildTrajectoryReportingReport(items, generatedAt = new Date().t
       reviewed_at: item.reviewed_at ?? "",
       llm_average_rubric_score: item.llm_average_rubric_score,
       llm_perfect: item.llm_perfect,
+      llm_judge_errors: item.llm_judge_errors ?? 0,
+      llm_rubrics_total: item.llm_rubrics_total ?? null,
+      llm_rubrics_scored: item.llm_rubrics_scored ?? null,
       agent: item.agent ?? null,
       model: item.model ?? null,
       run_label: item.run_label ?? null,
@@ -5019,11 +5026,12 @@ async function handleTrajectoryReporting(event) {
   const params = event.queryStringParameters ?? {};
   const includes = new Set(String(params.include || "").split(",").map((value) => value.trim()).filter(Boolean));
   const includeContent = includes.has("content") || includes.has("full");
+  const includeScreenshots = includes.has("screenshots");
   const includeOsworld = includes.has("osworld");
   const formatOsworld = cleanText(params.format, 30).toLowerCase() === "osworld";
   // The OSWorld view is built from manifest + judgment even when the caller
   // did not ask for the raw content, so hydrate whenever either is needed.
-  const loadContent = includeContent || includeOsworld || formatOsworld;
+  const loadContent = includeContent || includeScreenshots || includeOsworld || formatOsworld;
   const state = await trajectoryQueueState();
   const items = [];
   for (let offset = 0; offset < state.manifests.length; offset += 25) {
@@ -5046,6 +5054,15 @@ async function handleTrajectoryReporting(event) {
         reviewed_at: done?.completed_at ?? "",
         llm_average_rubric_score: manifest.metrics.average_rubric_score,
         llm_perfect: manifest.metrics.perfect,
+        // average_rubric_score is the mean over rubrics the judge actually
+        // scored; rubrics that errored are dropped from that denominator, so
+        // a 1.0 can rest on a subset. Surface the counts beside it so callers
+        // can tell a full pass from a partial one without fetching content.
+        llm_judge_errors: manifest.metrics.judge_errors ?? 0,
+        llm_rubrics_total: Array.isArray(manifest.rubrics) ? manifest.rubrics.length : null,
+        llm_rubrics_scored: Array.isArray(manifest.rubrics)
+          ? manifest.rubrics.filter((rubric) => rubric?.llm_status !== "ERROR").length
+          : null,
         agent: manifest.source.agent,
         model: manifest.source.model,
         run_label: manifest.source.run_label,
@@ -5060,7 +5077,8 @@ async function handleTrajectoryReporting(event) {
     items.push(...batch.filter(Boolean));
   }
   const reportOptions = {
-    includeContent,
+    includeContent: includeContent || includeScreenshots,
+    includeScreenshots,
     includeOsworld,
     snapshot: /^[a-z0-9_-]{1,40}$/i.test(String(params.snapshot || "")) ? String(params.snapshot) : "chrome",
     grade: cleanText(params.grade, 10).toLowerCase(),
@@ -5072,6 +5090,32 @@ async function handleTrajectoryReporting(event) {
   const report = formatOsworld
     ? buildOsworldExportReport(items, new Date().toISOString(), reportOptions)
     : buildTrajectoryReportingReport(items, new Date().toISOString(), reportOptions);
+  if (includeScreenshots && Array.isArray(report.trajectories)) {
+    // Sign only the rows this page returns; the manifest's screenshot_path is
+    // relative to its own prefix, and the startsWith guard keeps a crafted
+    // path from signing anything outside that run's directory.
+    report.trajectories = await Promise.all(report.trajectories.map(async (row) => {
+      const steps = row?.manifest?.steps;
+      if (!row.manifest_key || !Array.isArray(steps)) return row;
+      const base = row.manifest_key.slice(0, row.manifest_key.lastIndexOf("/") + 1);
+      const signed = await Promise.all(steps.map(async (step) => {
+        if (!step?.screenshot_path) return { ...step, screenshot_url: null };
+        const assetKey = `${base}${step.screenshot_path}`;
+        if (!assetKey.startsWith(base)) return { ...step, screenshot_url: null };
+        try {
+          const screenshotUrl = await getSignedUrl(
+            s3,
+            new GetObjectCommand({ Bucket: S3_BUCKET, Key: assetKey }),
+            { expiresIn: 3600 },
+          );
+          return { ...step, screenshot_url: screenshotUrl };
+        } catch (err) {
+          return { ...step, screenshot_url: null };
+        }
+      }));
+      return { ...row, manifest: { ...row.manifest, steps: signed } };
+    }));
+  }
   return respond(200, report, { "Cache-Control": "no-store" });
 }
 
