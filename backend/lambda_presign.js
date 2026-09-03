@@ -235,12 +235,63 @@ const authorSignoffKeyFor = (subKey) => `${AUTHOR_SIGNOFF_PREFIX}${b64url(subKey
 // look. Unlike the compact sign-off receipt, this prefix is directly usable
 // by downstream consumers that only want author-approved final gold.
 const AUTHOR_APPROVED_PREFIX = `${REVIEW_PREFIX}author-approved/`;
+const AUTHOR_APPROVED_SHOWCASE_KEY = `${REVIEW_PREFIX}cache/author_approved_showcase.json`;
 export const authorApprovedKeyFor = (taskId) => {
   const safeTaskId = String(taskId || "")
     .replace(/[^A-Za-z0-9_-]/g, "_")
     .slice(0, 300) || "task-unknown";
   return `${AUTHOR_APPROVED_PREFIX}${safeTaskId}.json`;
 };
+export function isAuthorApprovedShowcaseCatalog(value) {
+  if (!value || typeof value !== "object") return false;
+  if (value.schema_version !== "apollo-admin-author-approved-showcase-v1") return false;
+  if (!Number.isInteger(value.source_tasks) || value.source_tasks < 1) return false;
+  if (!Number.isInteger(value.selected_tasks) || value.selected_tasks < 10 || value.selected_tasks > 100) return false;
+  const summary = value.summary;
+  if (!summary || typeof summary !== "object") return false;
+  if (!Number.isInteger(summary.total_category_assignments) || summary.total_category_assignments < value.source_tasks) return false;
+  if (!Number.isFinite(summary.average_categories_per_task) || summary.average_categories_per_task < 1 || summary.average_categories_per_task > 3) return false;
+  if (!Number.isInteger(summary.primary_categories_used) || summary.primary_categories_used < 1) return false;
+  if (!Number.isInteger(summary.top_level_categories_used) || summary.top_level_categories_used < 1) return false;
+  if (!Number.isInteger(summary.tasks_with_websites) || summary.tasks_with_websites < 0) return false;
+  if (!Number.isInteger(summary.tasks_without_websites) || summary.tasks_without_websites < 0) return false;
+  if (summary.tasks_with_websites + summary.tasks_without_websites !== value.source_tasks) return false;
+  if (!Number.isFinite(summary.website_coverage_share) || summary.website_coverage_share < 0 || summary.website_coverage_share > 1) return false;
+  if (!Number.isInteger(summary.website_mentions) || summary.website_mentions < 0) return false;
+  if (!Number.isInteger(summary.unique_websites) || summary.unique_websites < 0) return false;
+  if (!Array.isArray(summary.category_count_distribution) || !summary.category_count_distribution.length) return false;
+  if (!Array.isArray(summary.confidence_distribution) || !summary.confidence_distribution.length) return false;
+  if (!Array.isArray(summary.top_websites)) return false;
+  const categoryCountsValid = summary.category_count_distribution.every((row) =>
+    row && Number.isInteger(row.category_count) && row.category_count >= 1 && row.category_count <= 3
+    && Number.isInteger(row.count) && row.count > 0
+    && Number.isFinite(row.share) && row.share > 0 && row.share <= 1
+  );
+  const confidenceValid = summary.confidence_distribution.every((row) =>
+    row && ["high", "medium", "low"].includes(row.confidence)
+    && Number.isInteger(row.count) && row.count > 0
+    && Number.isFinite(row.share) && row.share > 0 && row.share <= 1
+  );
+  if (!Array.isArray(value.primary_top_level_distribution) || !value.primary_top_level_distribution.length) return false;
+  if (!Array.isArray(value.examples) || value.examples.length !== value.selected_tasks) return false;
+  const distributionsValid = value.primary_top_level_distribution.every((row) =>
+    row && typeof row.category === "string" && row.category.trim()
+    && Number.isInteger(row.count) && row.count > 0
+    && Number.isFinite(row.share) && row.share > 0 && row.share <= 1
+  );
+  const examplesValid = value.examples.every((example) =>
+    example && typeof example.task_id === "string" && example.task_id.trim()
+    && typeof example.review_content_hash === "string" && /^[a-f0-9]{64}$/i.test(example.review_content_hash)
+    && typeof example.title === "string" && example.title.trim()
+    && typeof example.request === "string"
+    && typeof example.primary_category === "string" && example.primary_category.trim()
+    && typeof example.top_level_category === "string" && example.top_level_category.trim()
+    && Array.isArray(example.categories) && example.categories.length >= 1 && example.categories.length <= 3
+    && Array.isArray(example.steps) && Array.isArray(example.rubrics) && Array.isArray(example.websites)
+  );
+  return Boolean(categoryCountsValid && confidenceValid && distributionsValid && examplesValid);
+}
+
 const AUTHOR_MUTATION_LOCK_PREFIX = `${REVIEW_PREFIX}author-mutation-locks/`;
 export const authorMutationLockKeyFor = (subKey) =>
   `${AUTHOR_MUTATION_LOCK_PREFIX}${b64url(reviewUnitForKey(subKey))}.json`;
@@ -2473,6 +2524,17 @@ export function buildAdminItemFromDocuments({
 }
 
 let adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
+let authorApprovedShowcaseCache = { catalog: null, checkedAt: 0 };
+
+async function authorApprovedShowcase() {
+  if (authorApprovedShowcaseCache.catalog && Date.now() - authorApprovedShowcaseCache.checkedAt < 60_000) {
+    return authorApprovedShowcaseCache.catalog;
+  }
+  const { json } = await readJson(AUTHOR_APPROVED_SHOWCASE_KEY);
+  if (!isAuthorApprovedShowcaseCatalog(json)) throw new Error("Author-approved showcase catalog is invalid");
+  authorApprovedShowcaseCache = { catalog: json, checkedAt: Date.now() };
+  return json;
+}
 
 // The full S3-built dashboard (every source doc + outcome) takes ~25s at
 // ~1.8k tasks — right under API Gateway's 30s cut-off and growing with the
@@ -5419,6 +5481,15 @@ async function handleReview(path, body) {
 
   if (path === "/review/admin") {
     if (!isAllowedAdminEmail(body.admin_email)) return respond(403, { error: "Admin access required" });
+    if (body.action === "showcase") {
+      if (APP_SCOPE !== "primary") return respond(404, { error: "Showcase is not available for this app" });
+      try {
+        return respond(200, await authorApprovedShowcase(), { "Cache-Control": "no-store" });
+      } catch (error) {
+        console.error("Author-approved showcase failed to load", error);
+        return respond(503, { error: "Showcase is temporarily unavailable" }, { "Cache-Control": "no-store" });
+      }
+    }
     if (body.action === "reopen") {
       const result = await reopenReviewOutcome(body.task_id, body.admin_email, body.reason);
       return respond(result.status, result.body, { "Cache-Control": "no-store" });
