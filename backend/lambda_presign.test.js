@@ -125,6 +125,7 @@ import {
   trajectoryEditReviewSeed,
   llmReviewForHuman,
   buildTrajectoryReportingReport,
+  safeTrajectoryAssetPath,
   buildOsworldExportReport,
   osworldTaskForItem,
   osworldTaskIdFor,
@@ -699,6 +700,28 @@ test("trajectory reporting separates metadata from opt-in full content", () => {
   const full = buildTrajectoryReportingReport(items, "2026-08-11T00:01:00Z", { includeContent: true });
   assert.equal(full.trajectories[0].manifest.task_prompt, "private prompt");
   assert.equal(full.schema_version, "apollo-trajectory-reporting-v2");
+});
+
+test("only relative in-run screenshot paths are signed", () => {
+  // The old check appended the path to the prefix and then asserted the result
+  // still began with it, which is true by construction and rejected nothing.
+  assert.equal(safeTrajectoryAssetPath("screens/00001.png"), "screens/00001.png");
+  assert.equal(safeTrajectoryAssetPath("a/b/c.png"), "a/b/c.png");
+  for (const bad of [
+    "../other-run/manifest.json",
+    "screens/../../escape.png",
+    "/v2-review/absolute.png",
+    "https://example.com/x.png",
+    "screens\\windows.png",
+    "screens//double.png",
+    "./here.png",
+    "",
+    null,
+    undefined,
+  ]) {
+    assert.equal(safeTrajectoryAssetPath(bad), "", `expected ${JSON.stringify(bad)} to be rejected`);
+  }
+  assert.equal(safeTrajectoryAssetPath("x".repeat(301)), "");
 });
 
 test("trajectory reporting exposes judge coverage beside the average score", () => {

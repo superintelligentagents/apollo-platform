@@ -275,6 +275,23 @@ const trajectoryLockKeyFor = (manifestKey) => `${TRAJECTORY_LOCKS_PREFIX}${b64ur
 const trajectoryDoneKeyFor = (manifestKey) => `${TRAJECTORY_DONE_PREFIX}${b64url(manifestKey)}`;
 const trajectoryJudgmentKeyFor = (manifestKey) => `${TRAJECTORY_JUDGMENTS_PREFIX}${b64url(manifestKey)}.json`;
 
+/**
+ * A manifest's screenshot path, or "" when it must not be signed.
+ *
+ * The previous check appended the path to the run prefix and then asserted the
+ * result still started with that prefix, which is true by construction and so
+ * never rejected anything. Validate the path itself instead: it has to stay a
+ * relative path inside its own run directory.
+ */
+export function safeTrajectoryAssetPath(value) {
+  const path = String(value ?? "").trim();
+  if (!path || path.length > 300) return "";
+  if (path.startsWith("/") || path.includes("\\") || path.includes("://")) return "";
+  const segments = path.split("/");
+  if (segments.some((segment) => segment === "" || segment === "." || segment === "..")) return "";
+  return path;
+}
+
 export function taskIdFromTrajectoryManifestKey(key, reviewPrefix = REVIEW_PREFIX) {
   const runsPrefix = `${String(reviewPrefix).replace(/\/*$/, "/")}trajectory-runs/`;
   const raw = String(key);
@@ -4638,9 +4655,9 @@ async function signedTrajectoryManifest(manifestKey) {
   if (!manifest || taskIdFromTrajectoryManifestKey(manifestKey) !== manifest.task_id) return null;
   const base = manifestKey.slice(0, manifestKey.lastIndexOf("/") + 1);
   const steps = await Promise.all(manifest.steps.map(async (step) => {
-    if (!step.screenshot_path) return { ...step, screenshot_url: null };
-    const assetKey = `${base}${step.screenshot_path}`;
-    if (!assetKey.startsWith(base)) return { ...step, screenshot_url: null };
+    const relative = safeTrajectoryAssetPath(step.screenshot_path);
+    if (!relative) return { ...step, screenshot_url: null };
+    const assetKey = `${base}${relative}`;
     const screenshotUrl = await getSignedUrl(s3, new GetObjectCommand({ Bucket: S3_BUCKET, Key: assetKey }), { expiresIn: 3600 });
     return { ...step, screenshot_url: screenshotUrl };
   }));
@@ -5091,17 +5108,16 @@ async function handleTrajectoryReporting(event) {
     ? buildOsworldExportReport(items, new Date().toISOString(), reportOptions)
     : buildTrajectoryReportingReport(items, new Date().toISOString(), reportOptions);
   if (includeScreenshots && Array.isArray(report.trajectories)) {
-    // Sign only the rows this page returns; the manifest's screenshot_path is
-    // relative to its own prefix, and the startsWith guard keeps a crafted
-    // path from signing anything outside that run's directory.
+    // Sign only the rows this page returns; screenshot_path is validated as a
+    // relative path inside the run's own prefix before a key is built.
     report.trajectories = await Promise.all(report.trajectories.map(async (row) => {
       const steps = row?.manifest?.steps;
       if (!row.manifest_key || !Array.isArray(steps)) return row;
       const base = row.manifest_key.slice(0, row.manifest_key.lastIndexOf("/") + 1);
       const signed = await Promise.all(steps.map(async (step) => {
-        if (!step?.screenshot_path) return { ...step, screenshot_url: null };
-        const assetKey = `${base}${step.screenshot_path}`;
-        if (!assetKey.startsWith(base)) return { ...step, screenshot_url: null };
+        const relative = safeTrajectoryAssetPath(step?.screenshot_path);
+        if (!relative) return { ...step, screenshot_url: null };
+        const assetKey = `${base}${relative}`;
         try {
           const screenshotUrl = await getSignedUrl(
             s3,
