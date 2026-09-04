@@ -426,6 +426,43 @@ export function trajectoryJudgmentView(manifest, rejudgment) {
   };
 }
 
+const TRAJECTORY_SUBSETS_PREFIX = `${REVIEW_PREFIX}subsets/`;
+
+/**
+ * A named list of task IDs published alongside the corpus, or null.
+ *
+ * Curated sets (an eval slice, a showcase set) otherwise live only as a file
+ * someone has to be handed, leaving every consumer to intersect IDs by hand.
+ * Naming one here lets both reporting endpoints answer for it directly, and
+ * keeps the membership in S3 where it is versioned rather than in code.
+ */
+export function cleanSubsetName(value) {
+  const name = cleanText(value, 60).toLowerCase();
+  return /^[a-z0-9][a-z0-9._-]{0,59}$/.test(name) ? name : "";
+}
+
+export function subsetKeyFor(name) {
+  return `${TRAJECTORY_SUBSETS_PREFIX}${name}.json`;
+}
+
+export function cleanSubsetDocument(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = Array.isArray(value.task_ids) ? value.task_ids : null;
+  if (!raw || !raw.length || raw.length > 20_000) return null;
+  const taskIds = [];
+  for (const entry of raw) {
+    const taskId = cleanText(entry, 300);
+    if (taskId) taskIds.push(taskId);
+  }
+  if (!taskIds.length) return null;
+  return {
+    name: cleanText(value.name, 60),
+    description: cleanText(value.description, 400),
+    created_at_utc: cleanText(value.created_at_utc, 40),
+    task_ids: taskIds,
+  };
+}
+
 /**
  * A manifest's screenshot path, or "" when it must not be signed.
  *
@@ -3433,9 +3470,11 @@ export function selectReportingPage(dashboard, options = {}) {
   const requestedStatus = ["pending", "in_review", "approved", "rejected"].includes(options.status)
     ? options.status
     : "";
+  const subsetIds = options.subsetIds instanceof Set ? options.subsetIds : null;
   const filteredItems = (dashboard.items ?? []).filter((item) =>
     (!requestedTaskId || item.task_id === requestedTaskId) &&
-    (!requestedStatus || item.status === requestedStatus)
+    (!requestedStatus || item.status === requestedStatus) &&
+    (!subsetIds || subsetIds.has(item.task_id))
   );
   const offset = requestedTaskId ? 0 : Math.max(0, Number(options.offset) || 0);
   const requestedLimit = Number(options.limit);
@@ -4696,6 +4735,18 @@ function bearerToken(headers = {}) {
   return match?.[1]?.trim() || "";
 }
 
+async function loadSubset(params) {
+  const requested = cleanText(params.subset, 60);
+  if (!requested) return { name: "", ids: null, error: null };
+  const name = cleanSubsetName(requested);
+  if (!name) return { name: requested, ids: null, error: "subset name is not a valid identifier" };
+  const document = cleanSubsetDocument(
+    await readJson(subsetKeyFor(name)).then(({ json }) => json).catch(() => null),
+  );
+  if (!document) return { name, ids: null, error: `no published subset named "${name}"` };
+  return { name, ids: new Set(document.task_ids), document, error: null };
+}
+
 async function handleReporting(event) {
   if (!reportingKeyMatches(bearerToken(event.headers))) {
     return respond(401, { error: "Bad or missing reporting bearer token" }, { "Cache-Control": "no-store" });
@@ -4711,6 +4762,8 @@ async function handleReporting(event) {
   const maxLimit = includeLlmReviews ? 25 : includeLlmFlags ? 200 : includeContent ? 150 : 5_000;
   const limit = Math.min(maxLimit, Math.max(1, Number(params.limit) || defaultLimit));
   const offset = Math.max(0, Number(params.offset) || 0);
+  const subset = await loadSubset(params);
+  if (subset.error) return respond(404, { error: subset.error }, { "Cache-Control": "no-store" });
   const [dashboard, aliases, skipCounts] = await Promise.all([adminDashboard(), participantAliases(), reviewSkipCounts()]);
   const options = {
     includeContent,
@@ -4720,12 +4773,19 @@ async function handleReporting(event) {
     status,
     limit,
     offset,
+    subsetIds: subset.ids,
     participantAliases: aliases,
     skipCounts,
   };
   if (includeLlmReviews) await hydrateReportingLlmReviews(dashboard, options);
   if (includeLlmFlags) await hydrateReportingLlmFlags(dashboard, options);
-  return respond(200, buildReportingReport(dashboard, new Date().toISOString(), options), { "Cache-Control": "no-store" });
+  const report = buildReportingReport(dashboard, new Date().toISOString(), options);
+  if (subset.ids) {
+    // Say which named set answered, so a caller can tell an empty page from a
+    // filter that silently matched nothing.
+    report.subset = { name: subset.name, task_ids: subset.ids.size, description: subset.document.description };
+  }
+  return respond(200, report, { "Cache-Control": "no-store" });
 }
 
 async function preQcReviewForClaimedTask(subKey) {
@@ -5117,9 +5177,11 @@ export function buildOsworldExportReport(items, generatedAt = new Date().toISOSt
   const requestedStatus = ["pending", "in_review", "reviewed"].includes(options.status) ? options.status : "";
   const anyGrade = options.grade === "any";
   const snapshot = /^[a-z0-9_-]{1,40}$/i.test(String(options.snapshot || "")) ? String(options.snapshot) : "chrome";
+  const subsetIds = options.subsetIds instanceof Set ? options.subsetIds : null;
   const filtered = items.filter((item) =>
     (!requestedTaskId || item.task_id === requestedTaskId)
     && (!requestedStatus || item.status === requestedStatus)
+    && (!subsetIds || subsetIds.has(item.task_id))
     && (anyGrade || acceptedHumanPass(item))
   );
   const selected = selectLatestRunPerTask(filtered);
@@ -5152,8 +5214,11 @@ export function buildOsworldExportReport(items, generatedAt = new Date().toISOSt
 export function buildTrajectoryReportingReport(items, generatedAt = new Date().toISOString(), options = {}) {
   const requestedTaskId = cleanText(options.taskId, 300);
   const requestedStatus = ["pending", "in_review", "reviewed"].includes(options.status) ? options.status : "";
+  const subsetIds = options.subsetIds instanceof Set ? options.subsetIds : null;
   const filtered = items.filter((item) =>
-    (!requestedTaskId || item.task_id === requestedTaskId) && (!requestedStatus || item.status === requestedStatus)
+    (!requestedTaskId || item.task_id === requestedTaskId)
+    && (!requestedStatus || item.status === requestedStatus)
+    && (!subsetIds || subsetIds.has(item.task_id))
   );
   const offset = Math.max(0, Number(options.offset) || 0);
   // Content rows carry every step and rubric, so they stay capped well below
@@ -5218,10 +5283,17 @@ async function handleTrajectoryReporting(event) {
   // The OSWorld view is built from manifest + judgment even when the caller
   // did not ask for the raw content, so hydrate whenever either is needed.
   const loadContent = includeContent || includeScreenshots || includeOsworld || formatOsworld;
+  const subset = await loadSubset(params);
+  if (subset.error) return respond(404, { error: subset.error }, { "Cache-Control": "no-store" });
   const state = await trajectoryQueueState();
+  // Narrow before hydrating, not after: every manifest costs S3 reads, and a
+  // named subset is usually a small slice of the corpus.
+  const manifests = subset.ids
+    ? state.manifests.filter((key) => subset.ids.has(taskIdFromTrajectoryManifestKey(key) || ""))
+    : state.manifests;
   const items = [];
-  for (let offset = 0; offset < state.manifests.length; offset += 25) {
-    const batch = await Promise.all(state.manifests.slice(offset, offset + 25).map(async (manifestKey) => {
+  for (let offset = 0; offset < manifests.length; offset += 25) {
+    const batch = await Promise.all(manifests.slice(offset, offset + 25).map(async (manifestKey) => {
       const encoded = b64url(manifestKey);
       const [manifestRaw, done, lock, rejudgmentRaw] = await Promise.all([
         readJson(manifestKey).then(({ json }) => json).catch(() => null),
@@ -5277,6 +5349,7 @@ async function handleTrajectoryReporting(event) {
     grade: cleanText(params.grade, 10).toLowerCase(),
     taskId: cleanText(params.task_id, 300),
     status: cleanText(params.status, 30),
+    subsetIds: subset.ids,
     limit: params.limit,
     offset: params.offset,
   };
@@ -5307,6 +5380,11 @@ async function handleTrajectoryReporting(event) {
       }));
       return { ...row, manifest: { ...row.manifest, steps: signed } };
     }));
+  }
+  if (subset.ids) {
+    // Name the set that answered, so an empty page is distinguishable from a
+    // filter that matched nothing.
+    report.subset = { name: subset.name, task_ids: subset.ids.size, description: subset.document.description };
   }
   return respond(200, report, { "Cache-Control": "no-store" });
 }

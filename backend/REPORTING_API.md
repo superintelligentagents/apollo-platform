@@ -328,6 +328,7 @@ Trajectory manifests expose each rubric's advisory `llm_status` as `SUCCESS`, `F
 Query parameters:
 
 - `status=pending|in_review|reviewed`
+- `subset=<name>` restricts the response to a published named set of task IDs (see below)
 - `task_id=<exact task id>`
 - `limit=<n>` and `offset=<n>`
 - `include=full` (or `include=content`) to include the complete normalized run package and human judgment; content pages are capped at 50. `manifest.rubrics[]` carries the per-rubric verdicts (`rubric_id`, `requirement`, `llm_status`, `llm_score`, `llm_reasoning`) — use it, not `osworld_task.apollo.rubrics[]`, which is the criteria export and holds no verdicts.
@@ -363,6 +364,32 @@ used to infer it; legacy external IDs require `prepare.py --creator-map`). An
 Review pipeline after Codex live audit; it does not overwrite the source task,
 accepted gold, run, or judgment. `NEEDS_RERUN` waits for a new immutable run
 package.
+
+### Named task subsets
+
+`subset=<name>` narrows either endpoint to a curated list of task IDs published
+at `v2-review/subsets/<name>.json`. The response then carries a `subset` object
+naming the set and its size, so an empty page is distinguishable from a filter
+that matched nothing; an unknown name is a 404 rather than a silent full
+listing. Names are lowercase `[a-z0-9._-]` and address nothing outside that
+prefix.
+
+Published sets:
+
+| Name | Tasks | What it is |
+|---|---:|---|
+| `hard-100-v1` | 100 | Tasks where `gpt-5.6-luna` scored below 0.35, screened for fairness (not merely difficulty) and stratified across the SimilarWeb taxonomy. Built to compare stronger browser agents against a weak baseline. |
+
+```bash
+curl -s -H "Authorization: Bearer $APOLLO_REPORTING_TOKEN" \
+  "$API/reporting/tasks?subset=hard-100-v1&include=content&limit=100" | jq '.subset, (.tasks|length)'
+
+curl -s -H "Authorization: Bearer $APOLLO_REPORTING_TOKEN" \
+  "$API/reporting/trajectories?subset=hard-100-v1" | jq '.subset'
+```
+
+A subset filters membership only; `status`, `include`, `limit`/`offset` and the
+OSWorld export format all still apply on top of it.
 
 ### OSWorld-style task view
 
