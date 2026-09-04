@@ -75,6 +75,9 @@ exec "$python_bin" scripts/osworld_runner/run_queue.py \
   --judge-impl "${OSWORLD_JUDGE_IMPL:-canonical}" \
   --start-url-mode "${OSWORLD_START_URL_MODE:-google}" \
   ${OSWORLD_EXCLUDE_TASKS_FILE:+--exclude-task-ids-file "$OSWORLD_EXCLUDE_TASKS_FILE"} \
+  ${OSWORLD_RUBRIC_OVERLAY_JSON:+--rubric-overlay-json "$OSWORLD_RUBRIC_OVERLAY_JSON"} \
+  ${OSWORLD_DEDUPE_RUN_LABEL_PREFIX:+--dedupe-by-run-label-prefix "$OSWORLD_DEDUPE_RUN_LABEL_PREFIX"} \
+  ${OSWORLD_RUN_LABEL_PREFIX:+--run-label-prefix "$OSWORLD_RUN_LABEL_PREFIX"} \
   ${OSWORLD_META_BLOCK_MARKER:+--block-marker "$OSWORLD_META_BLOCK_MARKER"} \
   --min-free-gib "$min_free_gib" \
   --osworld-root "$osworld_root" \

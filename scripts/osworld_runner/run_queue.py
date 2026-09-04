@@ -32,6 +32,8 @@ from scripts.osworld_runner.run import (
     DEFAULT_OSWORLD_ROOT,
     fetch_reporting_tasks,
     fetch_trajectory_task_ids,
+    load_rubric_overlay,
+    apply_rubric_overlay,
     get_json,
     read_task_id_list,
     select_tasks,
@@ -86,10 +88,17 @@ def available_tasks(
     shard_index: int,
     excluded_ids: frozenset[str] = frozenset(),
     dedupe_model: str | None = None,
+    dedupe_run_label_prefix: str | None = None,
+    rubric_overlay_json: Path | None = None,
 ) -> tuple[int, int]:
     api_url = DEFAULT_APIS[queue]
     tasks = fetch_reporting_tasks(api_url, token)
-    existing = fetch_trajectory_task_ids(api_url, token, model=dedupe_model)
+    overlay = load_rubric_overlay(rubric_overlay_json)
+    if overlay:
+        tasks, _ = apply_rubric_overlay(tasks, overlay)
+    existing = fetch_trajectory_task_ids(
+        api_url, token, model=dedupe_model, run_label_prefix=dedupe_run_label_prefix
+    )
     selected, _ = select_tasks(
         tasks,
         queue=queue,
@@ -425,6 +434,10 @@ def command_base(args: argparse.Namespace, batch_dir: Path) -> list[str]:
         command.append("--dedupe-by-model")
     if args.exclude_task_ids_file is not None:
         command.extend(["--exclude-task-ids-file", str(args.exclude_task_ids_file)])
+    if args.rubric_overlay_json is not None:
+        command.extend(["--rubric-overlay-json", str(args.rubric_overlay_json)])
+    if args.dedupe_by_run_label_prefix:
+        command.extend(["--dedupe-by-run-label-prefix", args.dedupe_by_run_label_prefix])
     return command
 
 
@@ -460,6 +473,9 @@ def parser() -> argparse.ArgumentParser:
     )
     value.add_argument("--judge-model", default="gpt-5.4-mini")
     value.add_argument("--dedupe-by-model", action="store_true")
+    value.add_argument("--rubric-overlay-json", type=Path, default=None)
+    value.add_argument("--dedupe-by-run-label-prefix", default="")
+    value.add_argument("--run-label-prefix", default="Apollo author-approved")
     value.add_argument("--judge-max-images", type=int, default=0)
     value.add_argument("--judge-impl", choices=("repo", "canonical"), default="canonical")
     value.add_argument("--start-url-mode", choices=("google", "site_scope"), default="google")
@@ -569,6 +585,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     (args.openai_model if args.agent_backend == "openai" else None)
                     if args.dedupe_by_model else None
                 ),
+                dedupe_run_label_prefix=args.dedupe_by_run_label_prefix or None,
+                rubric_overlay_json=args.rubric_overlay_json,
             )
             state["remaining_runnable"] = remaining
             state["existing_trajectory_task_ids"] = existing
@@ -589,7 +607,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             selected_count = min(args.batch_size, remaining)
             vendor = "OpenAI" if args.agent_backend == "openai" else "Meta"
             run_label = (
-                f"Apollo author-approved {vendor} production shard "
+                f"{args.run_label_prefix} {vendor} production shard "
                 f"{args.shard_index + 1}/{args.shard_count} batch {batch_number:06d}"
             )
             log(
@@ -623,6 +641,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                             (args.openai_model if args.agent_backend == "openai" else None)
                             if args.dedupe_by_model else None
                         ),
+                        dedupe_run_label_prefix=args.dedupe_by_run_label_prefix or None,
+                        rubric_overlay_json=args.rubric_overlay_json,
                     )
                     if still == 0:
                         state["status"] = "complete"

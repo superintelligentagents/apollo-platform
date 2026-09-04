@@ -30,6 +30,88 @@ def task(task_id="v2/alice/internal/task-1", **overrides):
     return value
 
 
+class RubricOverlayTests(unittest.TestCase):
+    """Clean rubric proposals replace what the judge scores, and nothing else."""
+
+    def _overlay(self, **overrides):
+        entry = {
+            "task_id": "v2/alice/internal/task-1",
+            "confirmed_task": "Research the topic and summarize it.",
+            "rubrics": [{
+                "rubric_id": "rubric-1",
+                "requirement": "The summary reports the cited source's current figure.",
+                "verification": "Open the source and compare.",
+            }],
+        }
+        entry.update(overrides)
+        return {"tasks": [entry]}
+
+    def _apply(self, overlay_value, tasks=None):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "overlay.json"
+            path.write_text(json.dumps(overlay_value), encoding="utf-8")
+            overlay = run.load_rubric_overlay(path)
+        return run.apply_rubric_overlay(tasks if tasks is not None else [task()], overlay)
+
+    def test_the_clean_rubric_replaces_the_packaged_one(self):
+        updated, rejected = self._apply(self._overlay())
+        self.assertEqual(rejected, [])
+        rubric = updated[0]["content"]["rubrics"][0]
+        # The judge reads `requirement` first and `final` as a fallback, so both
+        # must carry the clean text or the two paths would score different text.
+        self.assertEqual(rubric["final"], "The summary reports the cited source's current figure.")
+        self.assertEqual(rubric["requirement"], rubric["final"])
+        self.assertEqual(rubric["verification"], "Open the source and compare.")
+        # Approval provenance is untouched: the overlay never grants runnability.
+        self.assertEqual(updated[0]["status"], "approved")
+        self.assertEqual(updated[0]["content"]["task_content_hash"], "a" * 64)
+
+    def test_the_overlay_restricts_the_run_to_the_tasks_it_names(self):
+        other = task("v2/alice/internal/task-2")
+        updated, _ = self._apply(self._overlay(), [task(), other])
+        self.assertEqual([item["task_id"] for item in updated], ["v2/alice/internal/task-1"])
+
+    def test_a_stale_overlay_is_dropped_rather_than_run(self):
+        # Written against a request that has since been amended.
+        updated, rejected = self._apply(self._overlay(confirmed_task="A different request."))
+        self.assertEqual(updated, [])
+        self.assertIn("prompt differs", rejected[0]["reason"])
+
+        # Written against a rubric set the approved task no longer has.
+        updated, rejected = self._apply(self._overlay(rubrics=[
+            {"rubric_id": "rubric-9", "requirement": "Something nobody approved."},
+        ]))
+        self.assertEqual(updated, [])
+        self.assertIn("rubric IDs differ", rejected[0]["reason"])
+
+    def test_an_overlay_without_rubrics_is_refused_at_load(self):
+        with self.assertRaises(run.BridgeError):
+            self._apply(self._overlay(rubrics=[]))
+
+
+class CampaignDedupTests(unittest.TestCase):
+    def test_only_this_campaign_s_trajectories_count_as_done(self):
+        page = {"trajectories": [
+            {"task_id": "v2/alice/internal/task-1", "model": "gpt-5.6-luna",
+             "run_label": "Apollo author-approved OpenAI production shard 1/14 batch 000001"},
+            {"task_id": "v2/alice/internal/task-2", "model": "gpt-5.6-luna",
+             "run_label": "Apollo cleaned-rubric OpenAI production shard 1/5 batch 000001"},
+        ], "page": {"next_offset": None}}
+        with patch.object(run, "get_json", return_value=page):
+            # Without the prefix a re-run campaign would see every task as done.
+            self.assertEqual(
+                run.fetch_trajectory_task_ids("https://api.test/reporting/tasks", "secret",
+                                              model="gpt-5.6-luna"),
+                {"v2/alice/internal/task-1", "v2/alice/internal/task-2"},
+            )
+            self.assertEqual(
+                run.fetch_trajectory_task_ids("https://api.test/reporting/tasks", "secret",
+                                              model="gpt-5.6-luna",
+                                              run_label_prefix="Apollo cleaned-rubric"),
+                {"v2/alice/internal/task-2"},
+            )
+
+
 class OSWorldBridgeTests(unittest.TestCase):
     def test_run_id_round_trip_is_path_safe(self):
         task_id = "v2/alice/internal/task-1"

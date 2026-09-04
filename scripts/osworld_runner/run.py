@@ -274,13 +274,18 @@ def fetch_reporting_tasks(api_url: str, token: str) -> list[dict[str, Any]]:
 
 
 def fetch_trajectory_task_ids(
-    api_url: str, token: str, *, model: str | None = None
+    api_url: str, token: str, *, model: str | None = None, run_label_prefix: str | None = None
 ) -> set[str]:
     """Task IDs that already have a trajectory.
 
     With `model`, only trajectories produced by that model count, so a
     multi-model campaign can run a second agent over tasks another agent
     already covered while still terminating once this model has done them all.
+
+    With `run_label_prefix`, only trajectories from that campaign count. A
+    re-run of tasks the same model already covered needs this: dedup by model
+    alone would report every task as done, and no dedup at all never marks
+    anything done, so the shards would re-select the same tasks every batch.
     """
     task_ids: set[str] = set()
     offset = 0
@@ -298,6 +303,8 @@ def fetch_trajectory_task_ids(
             for item in items
             if isinstance(item, Mapping)
             if model is None or _text(item.get("model"), 200) == model
+            if run_label_prefix is None
+            or _text(item.get("run_label"), 240).startswith(run_label_prefix)
             for task_id in [_text(item.get("task_id"), 300)]
             if task_id
         )
@@ -310,6 +317,89 @@ def fetch_trajectory_task_ids(
         except (TypeError, ValueError) as exc:
             raise BridgeError("trajectory reporting API returned an invalid next_offset") from exc
     return task_ids
+
+
+def load_rubric_overlay(path: Path | None) -> dict[str, dict[str, Any]]:
+    """Clean rubric proposals to run instead of the packaged ones, by task ID.
+
+    The proposals are advisory: they carry status PENDING_AUTHOR_CONFIRMATION
+    and do not amend accepted gold. So they never decide whether a task may
+    run -- the reporting API stays the only source of approval, sign-off, and
+    the task prompt -- and this supplies only the rubric text the judge scores.
+    """
+    if path is None:
+        return {}
+    try:
+        raw = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BridgeError(f"cannot read rubric overlay {path}: {exc}") from exc
+    values = raw.get("tasks") if isinstance(raw, Mapping) else raw
+    if not isinstance(values, list) or not values:
+        raise BridgeError("rubric overlay must be an array or an object with a tasks array")
+    overlay: dict[str, dict[str, Any]] = {}
+    for position, value in enumerate(values):
+        if not isinstance(value, Mapping):
+            raise BridgeError(f"rubric overlay item {position} is not an object")
+        task_id = _text(value.get("task_id"), 300)
+        rubrics = value.get("rubrics")
+        if not task_id or not isinstance(rubrics, list) or not rubrics:
+            raise BridgeError(f"rubric overlay item {position} needs a task_id and rubrics")
+        if task_id in overlay:
+            raise BridgeError(f"duplicate task_id in rubric overlay: {task_id}")
+        overlay[task_id] = {
+            "prompt": _text(value.get("confirmed_task") or value.get("task"), 200_000),
+            "rubrics": [rubric for rubric in rubrics if isinstance(rubric, Mapping)],
+        }
+    return overlay
+
+
+def apply_rubric_overlay(
+    tasks: Sequence[dict[str, Any]], overlay: Mapping[str, Mapping[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Swap in the clean rubrics, refusing any task the overlay disagrees about.
+
+    A proposal is only meaningful against the request it was written for, and
+    only for the exact rubrics that request was approved with. If either has
+    moved since the proposal was generated, the overlay is stale for that task
+    and it is dropped rather than run against rubrics nobody proposed.
+    """
+    updated: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    for task in tasks:
+        task_id = _text(task.get("task_id"), 300)
+        proposal = overlay.get(task_id)
+        if proposal is None:
+            continue
+        content = task.get("content") if isinstance(task.get("content"), Mapping) else {}
+        final = content.get("final") if isinstance(content.get("final"), Mapping) else {}
+        packaged = content.get("rubrics") if isinstance(content.get("rubrics"), list) else []
+        prompt = _text(final.get("request"), 200_000)
+        if proposal["prompt"] and proposal["prompt"].strip() != prompt.strip():
+            rejected.append({"task_id": task_id, "reason": "overlay prompt differs from the approved request"})
+            continue
+        proposed = {_text(rubric.get("rubric_id"), 100): rubric for rubric in proposal["rubrics"]}
+        packaged_ids = [_text(rubric.get("rubric_id"), 100) for rubric in packaged if isinstance(rubric, Mapping)]
+        if sorted(proposed) != sorted(packaged_ids) or len(packaged_ids) != len(set(packaged_ids)):
+            rejected.append({"task_id": task_id, "reason": "overlay rubric IDs differ from the approved set"})
+            continue
+        rubrics = []
+        for rubric in packaged:
+            replacement = proposed[_text(rubric.get("rubric_id"), 100)]
+            requirement = _text(replacement.get("requirement") or replacement.get("final"), 30_000)
+            if not requirement:
+                rubrics = []
+                break
+            rubrics.append({
+                **rubric,
+                "final": requirement,
+                "requirement": requirement,
+                "verification": _text(replacement.get("verification"), 20_000),
+            })
+        if not rubrics:
+            rejected.append({"task_id": task_id, "reason": "overlay rubric text is empty"})
+            continue
+        updated.append({**task, "content": {**content, "rubrics": rubrics}})
+    return updated, rejected
 
 
 def runnable_reason(
@@ -1151,6 +1241,20 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--limit", type=int, default=1)
     value.add_argument("--include-existing-trajectories", action="store_true")
     value.add_argument(
+        "--rubric-overlay-json",
+        type=Path,
+        default=None,
+        help="clean rubric proposals to judge against instead of the packaged rubrics; "
+             "restricts the run to the task IDs it names. Approval and the task prompt "
+             "still come from the reporting API",
+    )
+    value.add_argument(
+        "--dedupe-by-run-label-prefix",
+        default="",
+        help="count a task as already done only when it has a trajectory whose run_label "
+             "starts with this prefix, so a campaign re-running covered tasks terminates",
+    )
+    value.add_argument(
         "--dedupe-by-model",
         action="store_true",
         help="skip a task only when THIS model already has a trajectory for it "
@@ -1262,12 +1366,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.stage in {"fetch", "all"} and not args.plan:
             token = require_secret("APOLLO_REPORTING_TOKEN")
             all_tasks = fetch_reporting_tasks(args.api_url, token)
+            overlay = load_rubric_overlay(args.rubric_overlay_json)
+            overlay_rejected: list[dict[str, str]] = []
+            if overlay:
+                all_tasks, overlay_rejected = apply_rubric_overlay(all_tasks, overlay)
             existing_task_ids = (
                 set() if args.include_existing_trajectories
                 else fetch_trajectory_task_ids(
                     args.api_url,
                     token,
                     model=agent_model(args) if args.dedupe_by_model else None,
+                    run_label_prefix=args.dedupe_by_run_label_prefix or None,
                 )
             )
             selected, skipped = select_tasks(
@@ -1289,6 +1398,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "job": manifest,
                 "skipped_count": len(skipped),
                 "existing_trajectory_tasks": len(existing_task_ids),
+                "rubric_overlay_tasks": len(overlay),
+                "rubric_overlay_rejected": overlay_rejected,
             }, indent=2))
 
         if args.stage in {"run", "all"} and not args.plan:

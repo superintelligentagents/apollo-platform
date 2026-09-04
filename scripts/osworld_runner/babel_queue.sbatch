@@ -96,6 +96,12 @@ export OSWORLD_OPENAI_REASONING_EFFORT=${OSWORLD_OPENAI_REASONING_EFFORT:-medium
 export OSWORLD_JUDGE_MODEL=${OSWORLD_JUDGE_MODEL:-gpt-5.4-mini}
 # Multi-model coverage: skip a task only when THIS model already ran it.
 export OSWORLD_DEDUPE_BY_MODEL=${OSWORLD_DEDUPE_BY_MODEL:-}
+# Re-run campaigns: judge against a clean rubric proposal, restrict the run to
+# the tasks it names, and count a task done only once THIS campaign has run it
+# (dedup by model alone would call every already-covered task done).
+export OSWORLD_RUBRIC_OVERLAY_JSON=${OSWORLD_RUBRIC_OVERLAY_JSON:-}
+export OSWORLD_RUN_LABEL_PREFIX=${OSWORLD_RUN_LABEL_PREFIX:-}
+export OSWORLD_DEDUPE_RUN_LABEL_PREFIX=${OSWORLD_DEDUPE_RUN_LABEL_PREFIX:-}
 if [[ "$OSWORLD_AGENT_BACKEND" != "openai" && -e "$OSWORLD_META_BLOCK_MARKER" ]]; then
   echo "Meta block marker present ($OSWORLD_META_BLOCK_MARKER); not starting"
   exit 0
