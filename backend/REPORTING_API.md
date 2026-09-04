@@ -337,6 +337,23 @@ Query parameters:
 
 `llm_average_rubric_score` is the mean over rubrics the judge actually scored: an `ERROR` rubric is dropped from that denominator, so a run with 4 errors and 1 pass reports `1.0`. `llm_perfect` is stricter — it requires every rubric to have been scored *and* passed — so the two are not interchangeable, and `llm_perfect` is the safer pass signal. Every row therefore also carries `llm_judge_errors`, `llm_rubrics_total`, and `llm_rubrics_scored`; treat an average whose `llm_rubrics_scored < llm_rubrics_total` as partial coverage rather than a clean score.
 
+A run's package is immutable once published, so a later judging pass cannot
+correct the scores inside it. When one has run, its verdicts are written to
+`rejudgment.json` beside the manifest and **the API reports those** — the
+`llm_*` fields above then describe the re-judgment, and `llm_judge_source` says
+so (`canonical_full_trajectory` vs `packaged`), with `llm_judge` giving the
+judge's repo, commit, SHA-256, model, and how many screenshots it saw. Nothing
+is lost: the package's original judgment stays on every row as
+`llm_original_average_rubric_score` and `llm_original_perfect`. Under
+`include=content`, `manifest.rubrics[]` carries the re-judged verdicts and
+reasoning so per-rubric review matches the headline number. A re-judgment whose
+rubric IDs do not match the package's exactly is ignored and the packaged
+judgment stands, so a sidecar left behind by an amended task cannot swap in
+verdicts for a different rubric set.
+
+The 1,589 `gpt-5.6-luna` trajectories were re-judged this way in September 2026,
+on the canonical judge with every screenshot rather than a 12-frame sample.
+
 The default response contains run identity, queue status, runner/model/run label, reviewer/timestamp, LLM aggregate score with the coverage counts above, and `human_final_grade`. New final grades are `YES`, `NO`, `EDIT_NEEDED`, or `NEEDS_RERUN`. The immutable `apollo-human-trajectory-judgment-v3` document stores that value as `trajectory.overall_outcome`; it also retains the older three-way `trajectory.task_satisfied` alias. The existing API field `human_outcome` remains unchanged for compatibility, while `human_final_grade` gives both old and new records the normalized four-way value. `EDIT_NEEDED` and `NEEDS_RERUN` require at least 10 characters in `trajectory.notes` explaining the edit or rerun.
 
 Trajectory Grade is assigned to the task's original creator. A new package

@@ -327,6 +327,106 @@ const trajectoryDoneKeyFor = (manifestKey) => `${TRAJECTORY_DONE_PREFIX}${b64url
 const trajectoryJudgmentKeyFor = (manifestKey) => `${TRAJECTORY_JUDGMENTS_PREFIX}${b64url(manifestKey)}.json`;
 
 /**
+ * A re-judgment written beside a run's manifest, or null.
+ *
+ * Published manifests are immutable, so a later judging pass cannot correct the
+ * scores inside them. It writes `rejudgment.json` under the same run prefix
+ * instead; when one exists the API reports it, because it was produced by the
+ * canonical judge over every screenshot rather than a sampled subset. The
+ * manifest's original judgment stays available beside it.
+ */
+export function cleanTrajectoryRejudgment(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value.schema_version !== "apollo-trajectory-rejudgment-v1") return null;
+  if (!Array.isArray(value.rubrics) || !value.rubrics.length || value.rubrics.length > 100) return null;
+  const rubrics = value.rubrics.map((rubric) => {
+    const status = cleanText(rubric?.llm_status, 20).toUpperCase();
+    const llmStatus = ["SUCCESS", "FAILURE", "ERROR"].includes(status) ? status : "FAILURE";
+    const llmScore = llmStatus === "ERROR" ? null : (llmStatus === "SUCCESS" ? 1 : 0);
+    return {
+      rubric_id: cleanText(rubric?.rubric_id, 100),
+      requirement: cleanText(rubric?.requirement, 30_000),
+      verification: cleanText(rubric?.verification, 20_000),
+      llm_status: llmStatus,
+      llm_score: llmScore,
+      llm_success: llmScore == null ? null : llmScore === 1,
+      llm_reasoning: cleanText(rubric?.llm_reasoning, 30_000),
+    };
+  }).filter((rubric) => rubric.rubric_id && rubric.requirement);
+  if (!rubrics.length) return null;
+  const scored = rubrics.filter((rubric) => rubric.llm_score !== null);
+  const metrics = value.metrics && typeof value.metrics === "object" ? value.metrics : {};
+  const average = Number(metrics.average_rubric_score);
+  return {
+    schema_version: "apollo-trajectory-rejudgment-v1",
+    judge: {
+      repo: cleanText(value.judge?.repo, 200) || null,
+      commit: cleanText(value.judge?.commit, 64) || null,
+      sha256: cleanText(value.judge?.sha256, 64) || null,
+      model: cleanText(value.judge?.model, 120) || null,
+      screenshots: cleanText(String(value.judge?.screenshots ?? ""), 20) || null,
+    },
+    metrics: {
+      average_rubric_score: Number.isFinite(average)
+        ? average
+        : (scored.length ? scored.filter((r) => r.llm_score === 1).length / scored.length : 0),
+      perfect: metrics.perfect === true,
+      judge_errors: Number(metrics.judge_errors) || 0,
+      rubrics_total: rubrics.length,
+      rubrics_scored: scored.length,
+    },
+    rubrics,
+  };
+}
+
+export function trajectoryRejudgmentKeyFor(manifestKey) {
+  return `${String(manifestKey).slice(0, String(manifestKey).lastIndexOf("/"))}/rejudgment.json`;
+}
+
+/**
+ * The judgment a reader should see, and the rubric list to match it.
+ *
+ * Falls back to the packaged judgment whenever no re-judgment exists or the
+ * two disagree about which rubrics the task has, so a stale sidecar can never
+ * silently swap in verdicts for a different rubric set.
+ */
+export function trajectoryJudgmentView(manifest, rejudgment) {
+  const packaged = {
+    manifest,
+    metrics: {
+      average_rubric_score: manifest.metrics.average_rubric_score,
+      perfect: manifest.metrics.perfect,
+      judge_errors: manifest.metrics.judge_errors ?? 0,
+      rubrics_total: manifest.rubrics.length,
+      rubrics_scored: manifest.rubrics.filter((rubric) => rubric.llm_status !== "ERROR").length,
+    },
+  };
+  if (!rejudgment) return packaged;
+  const packagedIds = manifest.rubrics.map((rubric) => rubric.rubric_id).sort();
+  const rejudgedIds = rejudgment.rubrics.map((rubric) => rubric.rubric_id).sort();
+  if (packagedIds.length !== rejudgedIds.length
+      || packagedIds.some((id, index) => id !== rejudgedIds[index])) {
+    return packaged;
+  }
+  const byId = new Map(rejudgment.rubrics.map((rubric) => [rubric.rubric_id, rubric]));
+  return {
+    manifest: {
+      ...manifest,
+      rubrics: manifest.rubrics.map((rubric) => {
+        const scored = byId.get(rubric.rubric_id);
+        return scored
+          ? { ...rubric, llm_status: scored.llm_status, llm_score: scored.llm_score,
+              llm_success: scored.llm_success, llm_reasoning: scored.llm_reasoning }
+          : rubric;
+      }),
+      metrics: { ...manifest.metrics, ...rejudgment.metrics },
+      rejudgment: { judge: rejudgment.judge, metrics: rejudgment.metrics },
+    },
+    metrics: rejudgment.metrics,
+  };
+}
+
+/**
  * A manifest's screenshot path, or "" when it must not be signed.
  *
  * The previous check appended the path to the run prefix and then asserted the
@@ -5116,13 +5216,16 @@ async function handleTrajectoryReporting(event) {
   for (let offset = 0; offset < state.manifests.length; offset += 25) {
     const batch = await Promise.all(state.manifests.slice(offset, offset + 25).map(async (manifestKey) => {
       const encoded = b64url(manifestKey);
-      const [manifestRaw, done, lock] = await Promise.all([
+      const [manifestRaw, done, lock, rejudgmentRaw] = await Promise.all([
         readJson(manifestKey).then(({ json }) => json).catch(() => null),
         readDoneRecord(manifestKey, trajectoryDoneKeyFor),
         state.lockSet.has(encoded) ? readJson(trajectoryLockKeyFor(manifestKey)).then(({ json }) => json).catch(() => null) : null,
+        readJson(trajectoryRejudgmentKeyFor(manifestKey)).then(({ json }) => json).catch(() => null),
       ]);
       const manifest = cleanTrajectoryManifest(manifestRaw);
       if (!manifest) return null;
+      const rejudgment = cleanTrajectoryRejudgment(rejudgmentRaw);
+      const judged = trajectoryJudgmentView(manifest, rejudgment);
       const judgment = done?.target ? await readJson(done.target).then(({ json }) => json).catch(() => null) : null;
       return {
         manifest_key: manifestKey,
@@ -5131,17 +5234,21 @@ async function handleTrajectoryReporting(event) {
         status: done ? "reviewed" : lock ? "in_review" : "pending",
         reviewer: done?.reviewer ?? lock?.reviewer ?? "",
         reviewed_at: done?.completed_at ?? "",
-        llm_average_rubric_score: manifest.metrics.average_rubric_score,
-        llm_perfect: manifest.metrics.perfect,
+        llm_average_rubric_score: judged.metrics.average_rubric_score,
+        llm_perfect: judged.metrics.perfect,
+        // Which judging these scores came from, and the manifest's original
+        // beside it, so a grader can always see both.
+        llm_judge_source: rejudgment ? "canonical_full_trajectory" : "packaged",
+        llm_judge: rejudgment ? rejudgment.judge : null,
+        llm_original_average_rubric_score: manifest.metrics.average_rubric_score,
+        llm_original_perfect: manifest.metrics.perfect,
         // average_rubric_score is the mean over rubrics the judge actually
         // scored; rubrics that errored are dropped from that denominator, so
         // a 1.0 can rest on a subset. Surface the counts beside it so callers
         // can tell a full pass from a partial one without fetching content.
-        llm_judge_errors: manifest.metrics.judge_errors ?? 0,
-        llm_rubrics_total: Array.isArray(manifest.rubrics) ? manifest.rubrics.length : null,
-        llm_rubrics_scored: Array.isArray(manifest.rubrics)
-          ? manifest.rubrics.filter((rubric) => rubric?.llm_status !== "ERROR").length
-          : null,
+        llm_judge_errors: judged.metrics.judge_errors ?? 0,
+        llm_rubrics_total: judged.metrics.rubrics_total,
+        llm_rubrics_scored: judged.metrics.rubrics_scored,
         agent: manifest.source.agent,
         model: manifest.source.model,
         run_label: manifest.source.run_label,
@@ -5149,7 +5256,7 @@ async function handleTrajectoryReporting(event) {
         // grade beside it so reporting clients can migrate independently.
         human_outcome: judgment?.trajectory?.task_satisfied ?? judgment?.trajectory?.outcome ?? null,
         human_final_grade: trajectoryOverallOutcome(judgment?.trajectory) || null,
-        manifest: loadContent ? manifest : null,
+        manifest: loadContent ? judged.manifest : null,
         human_judgment: loadContent ? judgment : null,
       };
     }));
