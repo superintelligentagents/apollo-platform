@@ -5177,6 +5177,13 @@ export function buildTrajectoryReportingReport(items, generatedAt = new Date().t
       reviewed_at: item.reviewed_at ?? "",
       llm_average_rubric_score: item.llm_average_rubric_score,
       llm_perfect: item.llm_perfect,
+      // Which judging the scores above came from, and the package's own
+      // judgment beside it. Without these a corrected score is
+      // indistinguishable from the original one it replaced.
+      llm_judge_source: item.llm_judge_source ?? "packaged",
+      llm_judge: item.llm_judge ?? null,
+      llm_original_average_rubric_score: item.llm_original_average_rubric_score ?? item.llm_average_rubric_score,
+      llm_original_perfect: item.llm_original_perfect ?? item.llm_perfect,
       llm_judge_errors: item.llm_judge_errors ?? 0,
       llm_rubrics_total: item.llm_rubrics_total ?? null,
       llm_rubrics_scored: item.llm_rubrics_scored ?? null,

@@ -731,6 +731,35 @@ test("a re-judgment replaces the packaged verdicts it supersedes", () => {
   assert.equal(view.manifest.rejudgment.judge.commit, "abc");
 });
 
+test("the reporting row keeps the re-judgment's provenance", () => {
+  // The row builder whitelists fields, so a corrected score can reach the API
+  // with nothing saying it was corrected. Assert the provenance survives.
+  const row = buildTrajectoryReportingReport([{
+    manifest_key: "v2-review/trajectory-runs/a/b/manifest.json",
+    task_id: "t1", run_id: "r1", status: "pending",
+    llm_average_rubric_score: 0.5, llm_perfect: false,
+    llm_judge_source: "canonical_full_trajectory",
+    llm_judge: { model: "gpt-5.6-luna", commit: "abc", screenshots: "all" },
+    llm_original_average_rubric_score: 1, llm_original_perfect: true,
+  }]).trajectories[0];
+  assert.equal(row.llm_average_rubric_score, 0.5);
+  assert.equal(row.llm_judge_source, "canonical_full_trajectory");
+  assert.equal(row.llm_judge.screenshots, "all");
+  assert.equal(row.llm_original_average_rubric_score, 1);
+  assert.equal(row.llm_original_perfect, true);
+
+  // A row with no re-judgment reports itself as packaged, and its "original"
+  // is its own score rather than null, so clients can compare unconditionally.
+  const packaged = buildTrajectoryReportingReport([{
+    manifest_key: "v2-review/trajectory-runs/a/b/manifest.json",
+    task_id: "t2", run_id: "r2", status: "pending",
+    llm_average_rubric_score: 0.8, llm_perfect: false,
+  }]).trajectories[0];
+  assert.equal(packaged.llm_judge_source, "packaged");
+  assert.equal(packaged.llm_judge, null);
+  assert.equal(packaged.llm_original_average_rubric_score, 0.8);
+});
+
 test("a re-judgment for a different rubric set is ignored", () => {
   const manifest = {
     metrics: { average_rubric_score: 1, perfect: true, judge_errors: 0 },
