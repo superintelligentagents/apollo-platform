@@ -50,3 +50,40 @@ class CanonicalJudgePlanTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ImageBudgetTests(unittest.TestCase):
+    """A run too big to send must be thinned, never silently zeroed."""
+
+    def _runs(self, root, shots, size):
+        run = root / "pyautogui" / "screenshot" / "m" / "d" / "task"
+        run.mkdir(parents=True, exist_ok=True)
+        (run / "traj.jsonl").write_text("{}\n", encoding="utf-8")
+        for index in range(shots):
+            (run / f"{index:05d}.png").write_bytes(b"x" * size)
+        return root
+
+    def test_a_run_that_fits_keeps_every_screenshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._runs(Path(temp), shots=20, size=1000)
+            self.assertEqual(canonical_judge.image_cap_for(root, 0), 0)
+            self.assertEqual(canonical_judge.image_cap_for(root, 12), 12)
+
+    def test_an_oversized_run_is_thinned_to_fit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            # 100 shots x 1MB -> ~133MB base64, well over a 40MB budget.
+            root = self._runs(Path(temp), shots=100, size=1_000_000)
+            cap = canonical_judge.image_cap_for(root, 0)
+            self.assertGreater(cap, 0)
+            self.assertLess(cap, 100)
+            # The cap must actually bring the payload under budget.
+            self.assertLessEqual(cap * 1_000_000 * 4 // 3, canonical_judge.IMAGE_PAYLOAD_BUDGET_BYTES)
+
+    def test_an_explicit_smaller_cap_still_wins(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = self._runs(Path(temp), shots=100, size=1_000_000)
+            self.assertEqual(canonical_judge.image_cap_for(root, 5), 5)
+
+    def test_no_screenshots_leaves_the_request_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            self.assertEqual(canonical_judge.image_cap_for(Path(temp), 0), 0)

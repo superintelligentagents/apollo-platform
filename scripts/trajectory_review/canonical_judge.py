@@ -168,6 +168,46 @@ def restore_judge_status(
     }
 
 
+# OpenAI rejects a request whose images total more than 50 MB. Judge every
+# screenshot when they fit -- that is what makes a verdict trustworthy -- and
+# thin them evenly only when they do not.
+IMAGE_PAYLOAD_BUDGET_BYTES = 40_000_000
+
+
+def run_screenshot_totals(runs_dir: Path) -> list[tuple[int, int]]:
+    """(count, base64 bytes) of the screenshots each run would attach."""
+    totals: list[tuple[int, int]] = []
+    run_dirs = {path.parent for name in ("traj.jsonl", "steps.jsonl")
+                for path in runs_dir.rglob(name)}
+    for run_dir in sorted(run_dirs):
+        sizes = [
+            path.stat().st_size
+            for pattern in ("*.png", "*.jpg", "*.jpeg", "*.webp")
+            for path in run_dir.rglob(pattern)
+        ]
+        if sizes:
+            totals.append((len(sizes), sum(sizes) * 4 // 3))  # base64 is what ships
+    return totals
+
+
+def image_cap_for(runs_dir: Path, requested: int, budget: int = IMAGE_PAYLOAD_BUDGET_BYTES) -> int:
+    """A --max-images that keeps every run under the provider's payload limit.
+
+    A trajectory long enough to blow the limit fails every one of its rubrics
+    with a 400, and an all-errored task still reports average_rubric_score 0.0 --
+    a silent zero indistinguishable from a model that did nothing. Capping the
+    count costs some evidence; not capping it costs the whole verdict.
+
+    The cap is set by whichever run is worst off, so one long trajectory cannot
+    take down the batch, and runs that already fit are left alone.
+    """
+    totals = [t for t in run_screenshot_totals(runs_dir) if t[1] > budget]
+    if not totals:
+        return requested
+    fitted = min(max(1, count * budget // payload) for count, payload in totals)
+    return fitted if requested <= 0 else min(requested, fitted)
+
+
 def canonical_command(
     judge_path: Path, args: argparse.Namespace, task_source: Path, raw_output: Path
 ) -> list[str]:
@@ -179,7 +219,7 @@ def canonical_command(
         "--output", str(raw_output),
         "--model", args.model,
         "--num-workers", str(args.num_workers),
-        "--max-images", str(args.max_images),
+        "--max-images", str(image_cap_for(args.runs_dir, args.max_images)),
         "--max-steps", str(args.max_steps),
     ]
     if args.api_base:
