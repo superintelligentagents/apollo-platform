@@ -80,6 +80,19 @@ def run_command(command: Sequence[str], output: Path) -> None:
         )
 
 
+def agent_model_for(args: argparse.Namespace) -> str | None:
+    """The model name trajectories are published under, for this backend.
+
+    Dedup compares against it, so a backend missing here would silently dedupe
+    against no model at all and re-run tasks it had already covered.
+    """
+    if args.agent_backend == "openai":
+        return args.openai_model
+    if args.agent_backend == "anthropic":
+        return args.anthropic_model
+    return None
+
+
 def available_tasks(
     queue: str,
     token: str,
@@ -425,6 +438,8 @@ def command_base(args: argparse.Namespace, batch_dir: Path) -> list[str]:
         "--agent-backend", args.agent_backend,
         "--openai-model", args.openai_model,
         "--openai-reasoning-effort", args.openai_reasoning_effort,
+        "--anthropic-model", args.anthropic_model,
+        "--anthropic-thinking", args.anthropic_thinking,
         "--judge-model", args.judge_model,
         "--judge-max-images", str(args.judge_max_images),
         "--judge-impl", args.judge_impl,
@@ -464,7 +479,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--shard-index", type=int, default=0)
     value.add_argument("--max-batches", type=int, default=0)
     value.add_argument("--exclude-task-ids-file", type=Path, default=None)
-    value.add_argument("--agent-backend", choices=("muse-spark", "openai"), default="muse-spark")
+    value.add_argument("--agent-backend", choices=("muse-spark", "openai", "anthropic"), default="muse-spark")
+    value.add_argument("--anthropic-model", default="claude-opus-5")
+    value.add_argument("--anthropic-thinking", default="adaptive")
     value.add_argument("--openai-model", default="gpt-5.6-luna")
     value.add_argument(
         "--openai-reasoning-effort",
@@ -581,10 +598,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 shard_count=args.shard_count,
                 shard_index=args.shard_index,
                 excluded_ids=excluded_ids,
-                dedupe_model=(
-                    (args.openai_model if args.agent_backend == "openai" else None)
-                    if args.dedupe_by_model else None
-                ),
+                dedupe_model=(agent_model_for(args) if args.dedupe_by_model else None),
                 dedupe_run_label_prefix=args.dedupe_by_run_label_prefix or None,
                 rubric_overlay_json=args.rubric_overlay_json,
             )
@@ -637,10 +651,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.queue, token,
                         shard_count=args.shard_count, shard_index=args.shard_index,
                         excluded_ids=excluded_ids,
-                        dedupe_model=(
-                            (args.openai_model if args.agent_backend == "openai" else None)
-                            if args.dedupe_by_model else None
-                        ),
+                        dedupe_model=(agent_model_for(args) if args.dedupe_by_model else None),
                         dedupe_run_label_prefix=args.dedupe_by_run_label_prefix or None,
                         rubric_overlay_json=args.rubric_overlay_json,
                     )

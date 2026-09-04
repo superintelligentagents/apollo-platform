@@ -91,6 +91,11 @@ export OSWORLD_EXCLUDE_TASKS_FILE=$DATA/apollo-osworld/excluded-tasks.txt
 # Agent backend: muse-spark (Meta) or openai (upstream GPT-5.4-style agent).
 export OSWORLD_AGENT_BACKEND=${OSWORLD_AGENT_BACKEND:-muse-spark}
 export OSWORLD_OPENAI_ENV_FILE=${OSWORLD_OPENAI_ENV_FILE:-$DATA/apollo-osworld/openai.env}
+# The anthropic backend needs its own key AND the OpenAI one: the agent is
+# Claude, the rubric judge stays on OpenAI so scores stay comparable.
+export OSWORLD_ANTHROPIC_ENV_FILE=${OSWORLD_ANTHROPIC_ENV_FILE:-$DATA/apollo-osworld/anthropic.env}
+export OSWORLD_ANTHROPIC_MODEL=${OSWORLD_ANTHROPIC_MODEL:-claude-opus-5}
+export OSWORLD_ANTHROPIC_THINKING=${OSWORLD_ANTHROPIC_THINKING:-adaptive}
 export OSWORLD_OPENAI_MODEL=${OSWORLD_OPENAI_MODEL:-gpt-5.6-luna}
 export OSWORLD_OPENAI_REASONING_EFFORT=${OSWORLD_OPENAI_REASONING_EFFORT:-medium}
 export OSWORLD_JUDGE_MODEL=${OSWORLD_JUDGE_MODEL:-gpt-5.4-mini}

@@ -60,7 +60,26 @@ GPT54_FILES = {
     "mm_agents/gpt54_agent.py": "cf27dd0b2244e34a40586d21fd892d77cacb558427c8852e5ce03900eb5c467c",
     "scripts/python/run_multienv_gpt54.py": "3710dbd75892e188512395ca62db2ddea9edaa9f0f3b93e889d5bb2741c3f15e",
 }
-AGENT_BACKENDS = ("muse-spark", "openai")
+# Anthropic backend: upstream OSWorld's Claude computer-use agent, pinned at the
+# same commit as the OpenAI one. It turns prompt caching on by itself whenever
+# the provider is the direct Anthropic API, which is the only provider used here.
+CLAUDE_COMMIT = GPT54_COMMIT
+CLAUDE_FILES = {
+    "mm_agents/anthropic/__init__.py": "dd6fb1d67dbb1adf90a9eee62efcd251f38db3bb8a2c204650932adb53bfd043",
+    "mm_agents/anthropic/main.py": "809aab83d3492bedcd12c6bcc3318b7939f5e247db469e26934512a719309441",
+    "mm_agents/anthropic/utils.py": "8171db9085fa4f67c2a77c5ae1e970d58b82fb140f0f559aec40d7302e7ea9e8",
+    "mm_agents/anthropic/tools/__init__.py": "75aa9766e55c62e9da3d6db47fc75c2d57e723a5ac602e4708e3640cb74953b5",
+    "mm_agents/anthropic/tools/base.py": "9f73a26a2417ad2d99ec3a25500d29781b2244fa9782e523f86b4c48e0df29ce",
+    "mm_agents/anthropic/tools/collection.py": "4ead1f93f3d0ebdbb3a538576e9a4d49d373f1d2b0ff1db28a85329ba243ec1e",
+    "mm_agents/anthropic/tools/run.py": "a217892ae4e6c1793eca04863c660dd99b4373b7c449cf170d84fbff9f045714",
+    "mm_agents/anthropic/tools/bash.py": "c9a785798b8389957317e287fe342c0a4e09c236cfeacc98eb9a9383bdc45a22",
+    "mm_agents/anthropic/tools/edit.py": "c735ad6e81f3606f00a1151e014d0b93904391ee96e7ecb7762bb40cccf8ec9d",
+    "mm_agents/anthropic/tools/computer.py": "1e52dc2c0e0a8d4f73d4c2e0a9d81616462d3db0e5d1705ec06f036e2cf6ca39",
+    "scripts/python/run_multienv_claude.py": "6f230557ada2f231b71d6d27cc052f85d062d75cc17f82445bbb17be18aa102d",
+}
+AGENT_BACKENDS = ("muse-spark", "openai", "anthropic")
+DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
+DEFAULT_ANTHROPIC_THINKING = "adaptive"
 DEFAULT_OPENAI_MODEL = "gpt-5.6-luna"
 DEFAULT_OPENAI_REASONING_EFFORT = "medium"
 DEFAULT_OPENAI_JUDGE_MODEL = "gpt-5.4-mini"
@@ -1019,12 +1038,26 @@ def ensure_gpt54_overlay(paths: JobPaths) -> Path:
     )
 
 
+def ensure_claude_overlay(paths: JobPaths) -> Path:
+    return ensure_upstream_overlay(
+        paths, CLAUDE_COMMIT, CLAUDE_FILES, "scripts/python/run_multienv_claude.py", "Claude",
+    )
+
+
 def agent_model(args: argparse.Namespace) -> str:
-    return args.openai_model if args.agent_backend == "openai" else args.meta_model
+    if args.agent_backend == "openai":
+        return args.openai_model
+    if args.agent_backend == "anthropic":
+        return args.anthropic_model
+    return args.meta_model
 
 
 def agent_label(args: argparse.Namespace) -> str:
-    return "OSWorld GPT54Agent" if args.agent_backend == "openai" else "OSWorld MuseSparkAgent"
+    if args.agent_backend == "openai":
+        return "OSWorld GPT54Agent"
+    if args.agent_backend == "anthropic":
+        return "OSWorld AnthropicAgent"
+    return "OSWorld MuseSparkAgent"
 
 
 def validate_osworld(args: argparse.Namespace, paths: JobPaths, muse_runner: Path) -> None:
@@ -1118,6 +1151,56 @@ def openai_osworld_command(args: argparse.Namespace, paths: JobPaths) -> list[st
     return command
 
 
+def anthropic_osworld_command(args: argparse.Namespace, paths: JobPaths) -> list[str]:
+    """Drive upstream's run_multienv_claude.py through the same launcher shim.
+
+    The shim is what lets a hash-pinned upstream runner accept the fork's
+    apptainer provider; it patches whichever agent modules import, so the
+    Claude overlay simply skips the OpenAI and Meta patches.
+    """
+    root = args.osworld_root.expanduser().resolve()
+    command = [
+        str(root / ".venv/bin/python"),
+        str(Path(__file__).with_name("muse_spark_launcher.py")),
+        "--provider_name", args.provider_name,
+        "--headless",
+        "--action_space", "pyautogui",
+        "--observation_type", "screenshot",
+        "--model", args.anthropic_model,
+        "--thinking", args.anthropic_thinking,
+        "--max_tokens", str(args.anthropic_max_tokens),
+        "--max_steps", str(args.max_steps),
+        "--max_trajectory_length", str(args.max_trajectory_length),
+        "--num_envs", str(args.num_envs),
+        "--sleep_after_execution", str(args.sleep_after_execution),
+        "--result_dir", str(paths.results),
+        "--test_config_base_dir", str(paths.configs),
+        "--test_all_meta_path", str(paths.meta),
+        "--domain", args.domain,
+        "--client_password", args.client_password,
+    ]
+    if args.provider_name in {"vmware", "docker"}:
+        command.extend(["--path_to_vm", str(args.path_to_vm.expanduser().resolve())])
+    if args.provider_name == "aws":
+        command.extend(["--region", args.aws_region])
+    return command
+
+
+def anthropic_child_environment(api_key: str, runner: Path, osworld_root: Path) -> dict[str, str]:
+    """Only the Anthropic key reaches the child; the judge's key is not needed there."""
+    environment = sanitized_environment()
+    overlay_root = runner.parents[2]
+    pythonpath = [str(overlay_root), str(osworld_root.expanduser().resolve())]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment.update({
+        "ANTHROPIC_API_KEY": api_key,
+        "MUSE_SPARK_RUNNER_PATH": str(runner),
+        "PYTHONPATH": os.pathsep.join(pythonpath),
+    })
+    return environment
+
+
 def openai_child_environment(openai_key: str, runner: Path, osworld_root: Path) -> dict[str, str]:
     environment = sanitized_environment()
     overlay_root = runner.parents[2]
@@ -1137,6 +1220,10 @@ def run_osworld(args: argparse.Namespace, paths: JobPaths, agent_key: str) -> No
         runner = ensure_gpt54_overlay(paths)
         command = openai_osworld_command(args, paths)
         environment = openai_child_environment(agent_key, runner, args.osworld_root)
+    elif args.agent_backend == "anthropic":
+        runner = ensure_claude_overlay(paths)
+        command = anthropic_osworld_command(args, paths)
+        environment = anthropic_child_environment(agent_key, runner, args.osworld_root)
     else:
         runner = ensure_muse_spark_overlay(paths)
         command = osworld_command(args, paths)
@@ -1157,9 +1244,9 @@ def trajectory_command(args: argparse.Namespace, paths: JobPaths, *, plan: bool)
         "--runs-dir", str(paths.runs),
         "--task-source-json", str(paths.tasks),
         "--output-dir", str(paths.trajectory_output),
-        "--provider", "openai" if args.agent_backend == "openai" else "meta",
+        "--provider", "meta" if args.agent_backend == "muse-spark" else "openai",
         "--judge-impl", args.judge_impl,
-        "--model", args.judge_model if args.agent_backend == "openai" else args.meta_model,
+        "--model", args.meta_model if args.agent_backend == "muse-spark" else args.judge_model,
         "--queue", args.queue,
         "--num-workers", str(args.judge_workers),
         "--max-images", str(args.judge_max_images),
@@ -1176,20 +1263,21 @@ def trajectory_command(args: argparse.Namespace, paths: JobPaths, *, plan: bool)
     return command
 
 
-def publish_trajectories(args: argparse.Namespace, paths: JobPaths, agent_key: str, *, plan: bool) -> None:
+def publish_trajectories(args: argparse.Namespace, paths: JobPaths, judge_key: str, *, plan: bool) -> None:
     if not paths.runs.is_dir():
         raise BridgeError(f"OSWorld runs do not exist: {paths.runs}")
     if plan:
         subprocess.run(trajectory_command(args, paths, plan=True), check=True)
         return
-    if args.agent_backend == "openai":
+    if args.agent_backend in {"openai", "anthropic"}:
         # The judge talks to OpenAI directly; only the scoped key is forwarded.
+        # For a Claude run this is deliberately not the agent's key.
         environment = sanitized_environment()
-        environment["OPENAI_API_KEY"] = agent_key
+        environment["OPENAI_API_KEY"] = judge_key
         subprocess.run(trajectory_command(args, paths, plan=False), check=True, env=environment)
         return
     with meta_proxy(
-        agent_key,
+        judge_key,
         args.meta_model,
         args.meta_base_url,
         args.meta_session_id,
@@ -1220,6 +1308,20 @@ def require_meta_key() -> str:
 
 def require_agent_key(args: argparse.Namespace) -> str:
     if args.agent_backend == "openai":
+        return require_secret("OPENAI_API_KEY")
+    if args.agent_backend == "anthropic":
+        return require_secret("ANTHROPIC_API_KEY")
+    return require_meta_key()
+
+
+def require_judge_key(args: argparse.Namespace) -> str:
+    """The judge's key, which is not always the agent's.
+
+    Claude runs are still judged by the OpenAI canonical judge, so that a new
+    agent's scores stay comparable with the corpus the baseline was measured
+    on. Changing the agent must not silently change the judge.
+    """
+    if args.agent_backend in {"openai", "anthropic"}:
         return require_secret("OPENAI_API_KEY")
     return require_meta_key()
 
@@ -1305,6 +1407,12 @@ def parser() -> argparse.ArgumentParser:
         help="desktop agent: Meta Muse Spark (default) or upstream OSWorld's OpenAI GPT-5.4-style agent",
     )
     value.add_argument("--openai-model", default=DEFAULT_OPENAI_MODEL)
+    value.add_argument("--anthropic-model", default=DEFAULT_ANTHROPIC_MODEL)
+    value.add_argument(
+        "--anthropic-thinking", default=DEFAULT_ANTHROPIC_THINKING,
+        help="upstream's thinking mode for the Claude agent (adaptive, none, or a token budget)",
+    )
+    value.add_argument("--anthropic-max-tokens", type=int, default=16_000)
     value.add_argument(
         "--openai-reasoning-effort",
         choices=("none", "low", "medium", "high", "xhigh"),
@@ -1406,8 +1514,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             run_osworld(args, paths, require_agent_key(args))
 
         if args.stage in {"publish", "all"}:
-            agent_key = "" if args.plan else require_agent_key(args)
-            publish_trajectories(args, paths, agent_key, plan=args.plan)
+            judge_key = "" if args.plan else require_judge_key(args)
+            publish_trajectories(args, paths, judge_key, plan=args.plan)
     except (BridgeError, OSError, subprocess.CalledProcessError) as exc:
         raise SystemExit(f"error: {exc}") from exc
 

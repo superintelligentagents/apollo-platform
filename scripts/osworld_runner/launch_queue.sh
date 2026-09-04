@@ -18,6 +18,11 @@ reporting_secret_id="${OSWORLD_REPORTING_SECRET_ID:-apollo/osworld/reporting}"
 
 agent_backend="${OSWORLD_AGENT_BACKEND:-muse-spark}"
 openai_env_file="${OSWORLD_OPENAI_ENV_FILE:-}"
+anthropic_env_file="${OSWORLD_ANTHROPIC_ENV_FILE:-}"
+
+read_env_key() {  # file, variable -> value on stdout; never on a command line
+  sed -n "s/^\(export \)\{0,1\}$2=//p" "$1" | head -1 | tr -d '"'"'"'"'
+}
 
 APOLLO_REPORTING_TOKEN="$(
   aws secretsmanager get-secret-value \
@@ -38,6 +43,29 @@ if [[ "$agent_backend" == "openai" ]]; then
     exit 1
   fi
   OPENAI_API_KEY="$(sed -n 's/^\(export \)\{0,1\}OPENAI_API_KEY=//p' "$openai_env_file" | head -1 | tr -d '"'"'"'"')"
+  if [[ -z "$OPENAI_API_KEY" ]]; then
+    echo "OPENAI_API_KEY is missing from $openai_env_file" >&2
+    exit 1
+  fi
+  export OPENAI_API_KEY
+elif [[ "$agent_backend" == "anthropic" ]]; then
+  # The Claude agent needs its own key; the judge stays on OpenAI so scores
+  # remain comparable with the baseline corpus, so both keys are required.
+  if [[ -z "$anthropic_env_file" || ! -r "$anthropic_env_file" ]]; then
+    echo "OSWORLD_ANTHROPIC_ENV_FILE must point to a readable env file" >&2
+    exit 1
+  fi
+  ANTHROPIC_API_KEY="$(read_env_key "$anthropic_env_file" ANTHROPIC_API_KEY)"
+  if [[ -z "$ANTHROPIC_API_KEY" ]]; then
+    echo "ANTHROPIC_API_KEY is missing from $anthropic_env_file" >&2
+    exit 1
+  fi
+  export ANTHROPIC_API_KEY
+  if [[ -z "$openai_env_file" || ! -r "$openai_env_file" ]]; then
+    echo "OSWORLD_OPENAI_ENV_FILE must also be set: the rubric judge runs on OpenAI" >&2
+    exit 1
+  fi
+  OPENAI_API_KEY="$(read_env_key "$openai_env_file" OPENAI_API_KEY)"
   if [[ -z "$OPENAI_API_KEY" ]]; then
     echo "OPENAI_API_KEY is missing from $openai_env_file" >&2
     exit 1
@@ -70,6 +98,8 @@ exec "$python_bin" scripts/osworld_runner/run_queue.py \
   --agent-backend "$agent_backend" \
   --openai-model "${OSWORLD_OPENAI_MODEL:-gpt-5.6-luna}" \
   --openai-reasoning-effort "${OSWORLD_OPENAI_REASONING_EFFORT:-medium}" \
+  --anthropic-model "${OSWORLD_ANTHROPIC_MODEL:-claude-opus-5}" \
+  --anthropic-thinking "${OSWORLD_ANTHROPIC_THINKING:-adaptive}" \
   --judge-model "${OSWORLD_JUDGE_MODEL:-gpt-5.4-mini}" \
   --judge-max-images "${OSWORLD_JUDGE_MAX_IMAGES:-0}" \
   --judge-impl "${OSWORLD_JUDGE_IMPL:-canonical}" \

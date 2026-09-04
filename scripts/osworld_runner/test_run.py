@@ -403,3 +403,61 @@ class OSWorldBridgeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnthropicBackendTests(unittest.TestCase):
+    def _args(self, **overrides):
+        value = {
+            "agent_backend": "anthropic", "anthropic_model": "claude-opus-5",
+            "anthropic_thinking": "adaptive", "anthropic_max_tokens": 16_000,
+            "openai_model": "gpt-5.6-luna", "meta_model": "super_nova_ext",
+            "judge_model": "gpt-5.6-luna", "provider_name": "apptainer",
+            "max_steps": 120, "max_trajectory_length": 120, "num_envs": 2,
+            "sleep_after_execution": 2.0, "domain": "apollo_chrome",
+            "client_password": "password", "aws_region": "us-east-1",
+            "osworld_root": Path("/osworld"), "path_to_vm": Path("/vm.qcow2"),
+        }
+        value.update(overrides)
+        return SimpleNamespace(**value)
+
+    def test_the_claude_agent_is_launched_with_its_own_model(self):
+        paths = run.job_paths(Path("/work"), model="claude-opus-5")
+        command = run.anthropic_osworld_command(self._args(), paths)
+        self.assertIn("--model", command)
+        self.assertEqual(command[command.index("--model") + 1], "claude-opus-5")
+        self.assertEqual(command[command.index("--thinking") + 1], "adaptive")
+        # Driven through the shim, which is what teaches upstream's pinned
+        # runner about the fork's apptainer provider.
+        self.assertTrue(command[1].endswith("muse_spark_launcher.py"))
+        self.assertEqual(command[command.index("--provider_name") + 1], "apptainer")
+
+    def test_trajectories_are_published_under_the_claude_model(self):
+        args = self._args()
+        self.assertEqual(run.agent_model(args), "claude-opus-5")
+        self.assertEqual(run.agent_label(args), "OSWorld AnthropicAgent")
+
+    def test_only_the_anthropic_key_reaches_the_agent(self):
+        environment = run.anthropic_child_environment(
+            "sk-ant-test", Path("/work/upstream_osworld/abc/scripts/python/run_multienv_claude.py"),
+            Path("/osworld"),
+        )
+        self.assertEqual(environment["ANTHROPIC_API_KEY"], "sk-ant-test")
+        self.assertNotIn("OPENAI_API_KEY", environment)
+        self.assertNotIn("APOLLO_REPORTING_TOKEN", environment)
+
+    def test_a_claude_run_is_still_judged_by_the_openai_judge(self):
+        # Swapping the agent must not silently swap the judge, or the new
+        # model's scores stop being comparable with the baseline corpus.
+        args = self._args(judge_impl="canonical", judge_workers=1, judge_max_images=0,
+                          queue="v2", run_label="x", s3_bucket="b", aws_profile=None)
+        paths = run.job_paths(Path("/work"), model="claude-opus-5")
+        command = run.trajectory_command(args, paths, plan=False)
+        self.assertEqual(command[command.index("--provider") + 1], "openai")
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6-luna")
+        self.assertEqual(command[command.index("--run-model") + 1], "claude-opus-5")
+
+    def test_the_judge_key_and_the_agent_key_are_different_secrets(self):
+        args = self._args()
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant", "OPENAI_API_KEY": "sk-oai"}):
+            self.assertEqual(run.require_agent_key(args), "sk-ant")
+            self.assertEqual(run.require_judge_key(args), "sk-oai")
