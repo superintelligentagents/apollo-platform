@@ -477,3 +477,50 @@ class RequiredKeyTests(unittest.TestCase):
                 self.assertNotIn("MUSE_SPARK_API_KEY", keys)
             if backend == "openai":
                 self.assertNotIn("ANTHROPIC_API_KEY", keys)
+
+
+def _launcher():
+    """Import the launcher without the OSWorld venv's third-party deps.
+
+    It runs inside the OSWorld child, so it imports docker/httpx/openai at
+    module level; the orchestration venv has none of them. Stub them rather
+    than skip -- the helpers under test are pure, and a skipped test here
+    would protect nothing.
+    """
+    import sys as _sys
+    import types as _types
+    for name in ("docker", "docker.models", "docker.models.containers", "httpx", "openai"):
+        if name not in _sys.modules:
+            _sys.modules[name] = _types.ModuleType(name)
+    _sys.modules["docker.models.containers"].Container = type("Container", (), {"remove": lambda self: None})
+    _sys.modules["openai"].OpenAI = object
+    _sys.modules["httpx"].post = lambda *a, **k: None
+    from scripts.osworld_runner import muse_spark_launcher as launcher
+    return launcher
+
+
+class UnconditionalAwsImportTests(unittest.TestCase):
+    def test_the_stub_stands_in_only_off_aws(self):
+        import sys as _sys
+        launcher = _launcher()
+        name = "desktop_env.providers.aws.manager"
+        _sys.modules.pop(name, None)
+        try:
+            # On AWS the real module must be the one that loads.
+            launcher._satisfy_unconditional_aws_import("aws")
+            self.assertNotIn(name, _sys.modules)
+            # Anywhere else, the import upstream makes before it checks the
+            # provider has to succeed or every env process dies at startup.
+            launcher._satisfy_unconditional_aws_import("apptainer")
+            self.assertIn(name, _sys.modules)
+            image_map = _sys.modules[name].IMAGE_ID_MAP
+            self.assertEqual(image_map["us-east-1"][(1920, 1080)], "unused-off-aws")
+            self.assertEqual(image_map["any-region"].get((1280, 720), "fallback"), "fallback")
+        finally:
+            _sys.modules.pop(name, None)
+
+    def test_the_provider_is_read_from_the_child_argv(self):
+        launcher = _launcher()
+        self.assertEqual(launcher._provider_from_argv(["x", "--provider_name", "apptainer"]), "apptainer")
+        self.assertEqual(launcher._provider_from_argv(["x"]), "")
+        self.assertEqual(launcher._provider_from_argv(["x", "--provider_name"]), "")
