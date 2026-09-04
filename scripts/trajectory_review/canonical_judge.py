@@ -220,6 +220,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "judge": "odysseys-canonical",
                 "commit": CANONICAL_COMMIT,
                 "tasks": len(identifiers),
+                # The caller refuses a plan that would judge another Apollo
+                # queue's tasks, and can only check that against the IDs
+                # themselves. Without them the whole canonical path is
+                # unrunnable through run.py, not merely unchecked.
+                "task_ids": sorted(identifiers.values()),
                 "model": args.model,
                 "max_images": args.max_images,
             }, indent=2))
