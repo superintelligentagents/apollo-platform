@@ -461,3 +461,19 @@ class AnthropicBackendTests(unittest.TestCase):
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant", "OPENAI_API_KEY": "sk-oai"}):
             self.assertEqual(run.require_agent_key(args), "sk-ant")
             self.assertEqual(run.require_judge_key(args), "sk-oai")
+
+
+class RequiredKeyTests(unittest.TestCase):
+    def test_each_backend_asks_for_the_keys_it_actually_uses(self):
+        self.assertEqual(run_queue.required_keys("openai"), ("OPENAI_API_KEY",))
+        self.assertEqual(run_queue.required_keys("muse-spark"), ("MUSE_SPARK_API_KEY",))
+        # A Claude run needs both: Anthropic drives the agent, OpenAI the judge.
+        self.assertEqual(run_queue.required_keys("anthropic"), ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"))
+
+    def test_a_backend_never_demands_another_backend_s_key(self):
+        for backend in ("openai", "anthropic", "muse-spark"):
+            keys = run_queue.required_keys(backend)
+            if backend != "muse-spark":
+                self.assertNotIn("MUSE_SPARK_API_KEY", keys)
+            if backend == "openai":
+                self.assertNotIn("ANTHROPIC_API_KEY", keys)

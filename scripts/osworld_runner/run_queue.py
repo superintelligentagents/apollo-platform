@@ -80,6 +80,20 @@ def run_command(command: Sequence[str], output: Path) -> None:
         )
 
 
+def required_keys(agent_backend: str) -> tuple[str, ...]:
+    """Secrets a shard needs before it starts, by backend.
+
+    A Claude run needs two: the agent is Anthropic but the rubric judge stays on
+    OpenAI. Defaulting an unknown backend to the Meta key -- as this check used
+    to -- fails a shard minutes in with the name of a key it never wanted.
+    """
+    if agent_backend == "openai":
+        return ("OPENAI_API_KEY",)
+    if agent_backend == "anthropic":
+        return ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+    return ("MUSE_SPARK_API_KEY",)
+
+
 def agent_model_for(args: argparse.Namespace) -> str | None:
     """The model name trajectories are published under, for this backend.
 
@@ -514,10 +528,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.shard_count < 1 or args.shard_index < 0 or args.shard_index >= args.shard_count:
         raise SystemExit("shard index must be between 0 and shard-count - 1")
     token = os.environ.get("APOLLO_REPORTING_TOKEN", "").strip()
-    key_name = "OPENAI_API_KEY" if args.agent_backend == "openai" else "MUSE_SPARK_API_KEY"
-    agent_key = os.environ.get(key_name, "").strip()
-    if not token or not agent_key:
-        raise SystemExit(f"APOLLO_REPORTING_TOKEN and {key_name} are required")
+    missing = [name for name in required_keys(args.agent_backend) if not os.environ.get(name, "").strip()]
+    if not token:
+        missing.insert(0, "APOLLO_REPORTING_TOKEN")
+    if missing:
+        raise SystemExit(f"{', '.join(missing)} required for the {args.agent_backend} backend")
 
     root = args.work_root.resolve()
     root.mkdir(parents=True, exist_ok=True)
