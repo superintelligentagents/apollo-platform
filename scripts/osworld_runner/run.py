@@ -60,23 +60,13 @@ GPT54_FILES = {
     "mm_agents/gpt54_agent.py": "cf27dd0b2244e34a40586d21fd892d77cacb558427c8852e5ce03900eb5c467c",
     "scripts/python/run_multienv_gpt54.py": "3710dbd75892e188512395ca62db2ddea9edaa9f0f3b93e889d5bb2741c3f15e",
 }
-# Anthropic backend: upstream OSWorld's Claude computer-use agent, pinned at the
-# same commit as the OpenAI one. It turns prompt caching on by itself whenever
-# the provider is the direct Anthropic API, which is the only provider used here.
-CLAUDE_COMMIT = GPT54_COMMIT
-CLAUDE_FILES = {
-    "mm_agents/anthropic/__init__.py": "dd6fb1d67dbb1adf90a9eee62efcd251f38db3bb8a2c204650932adb53bfd043",
-    "mm_agents/anthropic/main.py": "809aab83d3492bedcd12c6bcc3318b7939f5e247db469e26934512a719309441",
-    "mm_agents/anthropic/utils.py": "8171db9085fa4f67c2a77c5ae1e970d58b82fb140f0f559aec40d7302e7ea9e8",
-    "mm_agents/anthropic/tools/__init__.py": "75aa9766e55c62e9da3d6db47fc75c2d57e723a5ac602e4708e3640cb74953b5",
-    "mm_agents/anthropic/tools/base.py": "9f73a26a2417ad2d99ec3a25500d29781b2244fa9782e523f86b4c48e0df29ce",
-    "mm_agents/anthropic/tools/collection.py": "4ead1f93f3d0ebdbb3a538576e9a4d49d373f1d2b0ff1db28a85329ba243ec1e",
-    "mm_agents/anthropic/tools/run.py": "a217892ae4e6c1793eca04863c660dd99b4373b7c449cf170d84fbff9f045714",
-    "mm_agents/anthropic/tools/bash.py": "c9a785798b8389957317e287fe342c0a4e09c236cfeacc98eb9a9383bdc45a22",
-    "mm_agents/anthropic/tools/edit.py": "c735ad6e81f3606f00a1151e014d0b93904391ee96e7ecb7762bb40cccf8ec9d",
-    "mm_agents/anthropic/tools/computer.py": "1e52dc2c0e0a8d4f73d4c2e0a9d81616462d3db0e5d1705ec06f036e2cf6ca39",
-    "scripts/python/run_multienv_claude.py": "6f230557ada2f231b71d6d27cc052f85d062d75cc17f82445bbb17be18aa102d",
-}
+# Anthropic backend: the fork's own Claude agent and runner, not upstream's.
+# The fork is ahead here (the reverse of the OpenAI backend): it guards the AWS
+# provider import behind a provider check, dispatches computer-tool versions per
+# model, and carries the output_config effort fix. Upstream's copy has none of
+# those, so pinning it would run a different agent than the one this project
+# maintains.
+CLAUDE_RUNNER_PATH = Path("scripts/python/run_multienv_claude.py")
 AGENT_BACKENDS = ("muse-spark", "openai", "anthropic")
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
 DEFAULT_ANTHROPIC_THINKING = "adaptive"
@@ -1038,10 +1028,12 @@ def ensure_gpt54_overlay(paths: JobPaths) -> Path:
     )
 
 
-def ensure_claude_overlay(paths: JobPaths) -> Path:
-    return ensure_upstream_overlay(
-        paths, CLAUDE_COMMIT, CLAUDE_FILES, "scripts/python/run_multienv_claude.py", "Claude",
-    )
+def claude_runner(osworld_root: Path) -> Path:
+    """The fork's Claude runner, which its own mm_agents.anthropic backs."""
+    runner = osworld_root.expanduser().resolve() / CLAUDE_RUNNER_PATH
+    if not runner.is_file():
+        raise BridgeError(f"Claude runner not found in the OSWorld checkout: {runner}")
+    return runner
 
 
 def agent_model(args: argparse.Namespace) -> str:
@@ -1187,10 +1179,13 @@ def anthropic_osworld_command(args: argparse.Namespace, paths: JobPaths) -> list
 
 
 def anthropic_child_environment(api_key: str, runner: Path, osworld_root: Path) -> dict[str, str]:
-    """Only the Anthropic key reaches the child; the judge's key is not needed there."""
+    """Only the Anthropic key reaches the child; the judge's key is not needed there.
+
+    No overlay is prepended: mm_agents.anthropic must resolve to the checkout's
+    own agent, which is the one the runner was written against.
+    """
     environment = sanitized_environment()
-    overlay_root = runner.parents[2]
-    pythonpath = [str(overlay_root), str(osworld_root.expanduser().resolve())]
+    pythonpath = [str(osworld_root.expanduser().resolve())]
     if environment.get("PYTHONPATH"):
         pythonpath.append(environment["PYTHONPATH"])
     environment.update({
@@ -1221,7 +1216,7 @@ def run_osworld(args: argparse.Namespace, paths: JobPaths, agent_key: str) -> No
         command = openai_osworld_command(args, paths)
         environment = openai_child_environment(agent_key, runner, args.osworld_root)
     elif args.agent_backend == "anthropic":
-        runner = ensure_claude_overlay(paths)
+        runner = claude_runner(args.osworld_root)
         command = anthropic_osworld_command(args, paths)
         environment = anthropic_child_environment(agent_key, runner, args.osworld_root)
     else:

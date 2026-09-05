@@ -438,12 +438,25 @@ class AnthropicBackendTests(unittest.TestCase):
 
     def test_only_the_anthropic_key_reaches_the_agent(self):
         environment = run.anthropic_child_environment(
-            "sk-ant-test", Path("/work/upstream_osworld/abc/scripts/python/run_multienv_claude.py"),
-            Path("/osworld"),
+            "sk-ant-test", Path("/osworld/scripts/python/run_multienv_claude.py"), Path("/osworld"),
         )
         self.assertEqual(environment["ANTHROPIC_API_KEY"], "sk-ant-test")
         self.assertNotIn("OPENAI_API_KEY", environment)
         self.assertNotIn("APOLLO_REPORTING_TOKEN", environment)
+        # The checkout's own agent must win; an overlay ahead of it on the path
+        # would silently swap in a different Claude implementation.
+        self.assertEqual(environment["PYTHONPATH"].split(":")[0], "/osworld")
+
+    def test_the_claude_runner_comes_from_the_checkout(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with self.assertRaises(run.BridgeError):
+                run.claude_runner(root)   # fail loudly rather than run something else
+            target = root / "scripts" / "python"
+            target.mkdir(parents=True)
+            (target / "run_multienv_claude.py").write_text("")
+            self.assertEqual(run.claude_runner(root), target / "run_multienv_claude.py")
 
     def test_a_claude_run_is_still_judged_by_the_openai_judge(self):
         # Swapping the agent must not silently swap the judge, or the new
