@@ -87,3 +87,61 @@ class ImageBudgetTests(unittest.TestCase):
     def test_no_screenshots_leaves_the_request_alone(self):
         with tempfile.TemporaryDirectory() as temp:
             self.assertEqual(canonical_judge.image_cap_for(Path(temp), 0), 0)
+
+
+class JpegViewTests(unittest.TestCase):
+    """The judge reads a re-encoded copy; the published originals stay lossless."""
+
+    def _run(self, root, shots=3):
+        from PIL import Image
+        run = root / "pyautogui" / "screenshot" / "m" / "d" / "task"
+        run.mkdir(parents=True)
+        names = []
+        for index in range(shots):
+            name = f"{index:05d}.png"
+            Image.new("RGB", (64, 48), (index * 40 % 255, 10, 200)).save(run / name)
+            names.append(name)
+        (run / "traj.jsonl").write_text("".join(
+            json.dumps({"step_num": i, "screenshot": n, "action": "click"}) + "\n"
+            for i, n in enumerate(names)), encoding="utf-8")
+        (run / "result.txt").write_text("0.0\n", encoding="utf-8")
+        return run
+
+    def test_screenshots_are_reencoded_and_the_trajectory_follows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "runs"
+            run = self._run(root)
+            view = canonical_judge.jpeg_view(root, Path(temp) / "view")
+            mirrored = view / run.relative_to(root)
+            self.assertEqual(sorted(p.name for p in mirrored.glob("*.jpg")),
+                             ["00000.jpg", "00001.jpg", "00002.jpg"])
+            self.assertEqual(list(mirrored.glob("*.png")), [])
+            # The judge resolves the screenshot by the name in the trajectory,
+            # so a view whose trajectory still says .png would find nothing.
+            rows = [json.loads(line) for line in
+                    (mirrored / "traj.jsonl").read_text().splitlines() if line.strip()]
+            self.assertEqual([r["screenshot"] for r in rows],
+                             ["00000.jpg", "00001.jpg", "00002.jpg"])
+            for row in rows:
+                self.assertTrue((mirrored / row["screenshot"]).is_file())
+            # Non-image files the judge needs are carried over.
+            self.assertTrue((mirrored / "result.txt").is_file())
+
+    def test_the_originals_are_left_untouched(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "runs"
+            run = self._run(root)
+            before = {p.name: p.read_bytes() for p in run.glob("*.png")}
+            canonical_judge.jpeg_view(root, Path(temp) / "view")
+            after = {p.name: p.read_bytes() for p in run.glob("*.png")}
+            self.assertEqual(before, after)
+            self.assertIn("00000.png", after)
+
+    def test_a_run_with_no_screenshots_still_copies(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "runs"
+            run = root / "a" / "task"
+            run.mkdir(parents=True)
+            (run / "traj.jsonl").write_text(json.dumps({"step_num": 0, "action": "click"}) + "\n")
+            view = canonical_judge.jpeg_view(root, Path(temp) / "view")
+            self.assertTrue((view / run.relative_to(root) / "traj.jsonl").is_file())
