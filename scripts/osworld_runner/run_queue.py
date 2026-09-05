@@ -384,13 +384,22 @@ def compact_batch(batch_dir: Path) -> None:
             path.unlink()
 
 
+# Each judge words an all-failed batch differently, and matching only one of
+# them turns a batch whose VMs all died into a dead shard instead of a recorded
+# empty batch -- work the queue would otherwise have retried.
+EMPTY_BATCH_MARKERS = (
+    "no eligible trajectory runs found",   # the in-tree judge
+    "No completed runs found in",          # the canonical judge
+)
+
+
 def batch_ran_empty(command_log: Path) -> bool:
     """True when publish failed because every task in the batch failed to run."""
     try:
         tail = command_log.read_bytes()[-20_000:].decode("utf-8", "replace")
     except OSError:
         return False
-    return "no eligible trajectory runs found" in tail
+    return any(marker in tail for marker in EMPTY_BATCH_MARKERS)
 
 
 def publish_batch_with_retry(

@@ -571,3 +571,24 @@ class RunnerFlagContractTests(unittest.TestCase):
         command = run.anthropic_osworld_command(args, run.job_paths(Path("/work"), model="claude-opus-5"))
         unknown = self._emitted(command) - self._accepted(runner)
         self.assertEqual(unknown, set(), f"runner would reject: {sorted(unknown)}")
+
+
+class EmptyBatchDetectionTests(unittest.TestCase):
+    def _log(self, text):
+        import tempfile
+        handle = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+        handle.write(text); handle.close()
+        return Path(handle.name)
+
+    def test_both_judges_all_failed_wording_is_recognised(self):
+        # Matching only the in-tree judge's phrasing killed a shard whose VMs
+        # had all died, instead of recording an empty batch and carrying on.
+        self.assertTrue(run_queue.batch_ran_empty(
+            self._log("error: no eligible trajectory runs found\n")))
+        self.assertTrue(run_queue.batch_ran_empty(
+            self._log("No completed runs found in: /work/trajectory_review/jpeg_runs\n")))
+
+    def test_a_real_failure_is_not_mistaken_for_an_empty_batch(self):
+        self.assertFalse(run_queue.batch_ran_empty(
+            self._log("error: judge exited 1\nTraceback...\n")))
+        self.assertFalse(run_queue.batch_ran_empty(Path("/nonexistent/x.log")))
