@@ -90,8 +90,8 @@ exec "$python_bin" scripts/osworld_runner/run_queue.py \
   --batch-size "$concurrency" \
   --num-envs "$concurrency" \
   --judge-workers "$concurrency" \
-  --max-steps 120 \
-  --max-trajectory-length 120 \
+  --max-steps "${OSWORLD_MAX_STEPS:-100}" \
+  --max-trajectory-length "${OSWORLD_MAX_STEPS:-100}" \
   --max-retries "${OSWORLD_MAX_RETRIES:-3}" \
   --max-batches "${OSWORLD_MAX_BATCHES:-0}" \
   ${OSWORLD_DEDUPE_BY_MODEL:+--dedupe-by-model} \
