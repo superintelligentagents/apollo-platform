@@ -409,7 +409,7 @@ class AnthropicBackendTests(unittest.TestCase):
     def _args(self, **overrides):
         value = {
             "agent_backend": "anthropic", "anthropic_model": "claude-opus-5",
-            "anthropic_thinking": "adaptive", "anthropic_max_tokens": 16_000,
+            "anthropic_effort": "high", "anthropic_max_tokens": 16_000,
             "openai_model": "gpt-5.6-luna", "meta_model": "super_nova_ext",
             "judge_model": "gpt-5.6-luna", "provider_name": "apptainer",
             "max_steps": 120, "max_trajectory_length": 120, "num_envs": 2,
@@ -425,7 +425,7 @@ class AnthropicBackendTests(unittest.TestCase):
         command = run.anthropic_osworld_command(self._args(), paths)
         self.assertIn("--model", command)
         self.assertEqual(command[command.index("--model") + 1], "claude-opus-5")
-        self.assertEqual(command[command.index("--thinking") + 1], "adaptive")
+        self.assertEqual(command[command.index("--effort") + 1], "high")
         # Driven through the shim, which is what teaches upstream's pinned
         # runner about the fork's apptainer provider.
         self.assertTrue(command[1].endswith("muse_spark_launcher.py"))
@@ -537,3 +537,37 @@ class UnconditionalAwsImportTests(unittest.TestCase):
         self.assertEqual(launcher._provider_from_argv(["x", "--provider_name", "apptainer"]), "apptainer")
         self.assertEqual(launcher._provider_from_argv(["x"]), "")
         self.assertEqual(launcher._provider_from_argv(["x", "--provider_name"]), "")
+
+
+class RunnerFlagContractTests(unittest.TestCase):
+    """Every flag we send must be one the checkout's runner accepts.
+
+    The Claude runner in this project's checkout differs from upstream's -- it
+    takes --effort where upstream takes --thinking -- and argparse rejects an
+    unknown flag with exit 2, killing the shard after the VMs have booted. A
+    mismatch is cheap to catch here and expensive to catch there.
+    """
+
+    CHECKOUT = Path("/home/ljang/odysseys/osworld_runner")
+
+    def _accepted(self, runner: Path) -> set[str]:
+        import re
+        return set(re.findall(r'add_argument\(\s*"(--[^"]+)"', runner.read_text(encoding="utf-8")))
+
+    def _emitted(self, command):
+        return {part for part in command if isinstance(part, str) and part.startswith("--")}
+
+    def test_the_claude_command_uses_only_accepted_flags(self):
+        runner = self.CHECKOUT / run.CLAUDE_RUNNER_PATH
+        if not runner.is_file():
+            self.skipTest("OSWorld checkout not present")
+        args = SimpleNamespace(
+            agent_backend="anthropic", anthropic_model="claude-opus-5", anthropic_effort="high",
+            anthropic_max_tokens=16_000, provider_name="apptainer", max_steps=120,
+            max_trajectory_length=120, num_envs=5, sleep_after_execution=2.0,
+            domain="apollo_chrome", client_password="password", aws_region="us-east-1",
+            osworld_root=self.CHECKOUT, path_to_vm=Path("/vm.qcow2"),
+        )
+        command = run.anthropic_osworld_command(args, run.job_paths(Path("/work"), model="claude-opus-5"))
+        unknown = self._emitted(command) - self._accepted(runner)
+        self.assertEqual(unknown, set(), f"runner would reject: {sorted(unknown)}")

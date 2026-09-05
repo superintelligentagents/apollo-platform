@@ -99,7 +99,7 @@ exec "$python_bin" scripts/osworld_runner/run_queue.py \
   --openai-model "${OSWORLD_OPENAI_MODEL:-gpt-5.6-luna}" \
   --openai-reasoning-effort "${OSWORLD_OPENAI_REASONING_EFFORT:-medium}" \
   --anthropic-model "${OSWORLD_ANTHROPIC_MODEL:-claude-opus-5}" \
-  --anthropic-thinking "${OSWORLD_ANTHROPIC_THINKING:-adaptive}" \
+  --anthropic-effort "${OSWORLD_ANTHROPIC_EFFORT:-high}" \
   --judge-model "${OSWORLD_JUDGE_MODEL:-gpt-5.4-mini}" \
   --judge-max-images "${OSWORLD_JUDGE_MAX_IMAGES:-0}" \
   --judge-impl "${OSWORLD_JUDGE_IMPL:-canonical}" \

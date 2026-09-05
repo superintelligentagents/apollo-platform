@@ -69,7 +69,7 @@ GPT54_FILES = {
 CLAUDE_RUNNER_PATH = Path("scripts/python/run_multienv_claude.py")
 AGENT_BACKENDS = ("muse-spark", "openai", "anthropic")
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
-DEFAULT_ANTHROPIC_THINKING = "adaptive"
+DEFAULT_ANTHROPIC_EFFORT = "high"
 DEFAULT_OPENAI_MODEL = "gpt-5.6-luna"
 DEFAULT_OPENAI_REASONING_EFFORT = "medium"
 DEFAULT_OPENAI_JUDGE_MODEL = "gpt-5.4-mini"
@@ -1159,7 +1159,9 @@ def anthropic_osworld_command(args: argparse.Namespace, paths: JobPaths) -> list
         "--action_space", "pyautogui",
         "--observation_type", "screenshot",
         "--model", args.anthropic_model,
-        "--thinking", args.anthropic_thinking,
+        # The checkout's runner takes --effort (output_config) and a
+        # --no-thinking switch; upstream's --thinking does not exist here.
+        "--effort", args.anthropic_effort,
         "--max_tokens", str(args.anthropic_max_tokens),
         "--max_steps", str(args.max_steps),
         "--max_trajectory_length", str(args.max_trajectory_length),
@@ -1404,8 +1406,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--openai-model", default=DEFAULT_OPENAI_MODEL)
     value.add_argument("--anthropic-model", default=DEFAULT_ANTHROPIC_MODEL)
     value.add_argument(
-        "--anthropic-thinking", default=DEFAULT_ANTHROPIC_THINKING,
-        help="upstream's thinking mode for the Claude agent (adaptive, none, or a token budget)",
+        "--anthropic-effort", default=DEFAULT_ANTHROPIC_EFFORT,
+        choices=("max", "high", "medium", "low"),
+        help="output_config effort for the Claude agent",
     )
     value.add_argument("--anthropic-max-tokens", type=int, default=16_000)
     value.add_argument(

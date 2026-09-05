@@ -453,7 +453,7 @@ def command_base(args: argparse.Namespace, batch_dir: Path) -> list[str]:
         "--openai-model", args.openai_model,
         "--openai-reasoning-effort", args.openai_reasoning_effort,
         "--anthropic-model", args.anthropic_model,
-        "--anthropic-thinking", args.anthropic_thinking,
+        "--anthropic-effort", args.anthropic_effort,
         "--judge-model", args.judge_model,
         "--judge-max-images", str(args.judge_max_images),
         "--judge-impl", args.judge_impl,
@@ -495,7 +495,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--exclude-task-ids-file", type=Path, default=None)
     value.add_argument("--agent-backend", choices=("muse-spark", "openai", "anthropic"), default="muse-spark")
     value.add_argument("--anthropic-model", default="claude-opus-5")
-    value.add_argument("--anthropic-thinking", default="adaptive")
+    value.add_argument("--anthropic-effort", default="high")
     value.add_argument("--openai-model", default="gpt-5.6-luna")
     value.add_argument(
         "--openai-reasoning-effort",
