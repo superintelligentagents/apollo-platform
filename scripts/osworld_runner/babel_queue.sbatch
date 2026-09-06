@@ -96,6 +96,13 @@ export OSWORLD_OPENAI_ENV_FILE=${OSWORLD_OPENAI_ENV_FILE:-$DATA/apollo-osworld/o
 export OSWORLD_ANTHROPIC_ENV_FILE=${OSWORLD_ANTHROPIC_ENV_FILE:-$DATA/apollo-osworld/anthropic.env}
 export OSWORLD_ANTHROPIC_MODEL=${OSWORLD_ANTHROPIC_MODEL:-claude-opus-5}
 export OSWORLD_ANTHROPIC_EFFORT=${OSWORLD_ANTHROPIC_EFFORT:-high}
+# A Gemini rubric judge reads its own key; the agent's provider is unrelated.
+export OSWORLD_GEMINI_ENV_FILE=${OSWORLD_GEMINI_ENV_FILE:-$DATA/apollo-osworld/gemini.env}
+# Canonical-agent parity: leave upstream's own operator prompt in place for
+# every backend, so no model is measured with task-specific prompt tuning the
+# others did not get. Set to 1 to restore Apollo's override.
+export OSWORLD_OPERATOR_PROMPT_OVERRIDE=${OSWORLD_OPERATOR_PROMPT_OVERRIDE:-0}
+export OSWORLD_TEXT_REPLY_NUDGES=${OSWORLD_TEXT_REPLY_NUDGES:-0}
 export OSWORLD_OPENAI_MODEL=${OSWORLD_OPENAI_MODEL:-gpt-5.6-luna}
 export OSWORLD_OPENAI_REASONING_EFFORT=${OSWORLD_OPENAI_REASONING_EFFORT:-medium}
 export OSWORLD_JUDGE_MODEL=${OSWORLD_JUDGE_MODEL:-gpt-5.4-mini}

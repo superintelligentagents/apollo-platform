@@ -19,6 +19,8 @@ reporting_secret_id="${OSWORLD_REPORTING_SECRET_ID:-apollo/osworld/reporting}"
 agent_backend="${OSWORLD_AGENT_BACKEND:-muse-spark}"
 openai_env_file="${OSWORLD_OPENAI_ENV_FILE:-}"
 anthropic_env_file="${OSWORLD_ANTHROPIC_ENV_FILE:-}"
+gemini_env_file="${OSWORLD_GEMINI_ENV_FILE:-}"
+judge_model="${OSWORLD_JUDGE_MODEL:-gpt-5.4-mini}"
 
 read_env_key() {  # file, variable -> value on stdout; never on a command line
   sed -n "s/^\(export \)\{0,1\}$2=//p" "$1" | head -1 | tr -d '"'"'"'"'
@@ -84,6 +86,21 @@ else
   fi
   export MUSE_SPARK_API_KEY
 fi
+# The judge is chosen independently of the agent, so its key is loaded on its
+# own terms: a Gemini judge needs a Gemini key whatever the agent is.
+if [[ "$judge_model" == gemini* ]]; then
+  if [[ -z "$gemini_env_file" || ! -r "$gemini_env_file" ]]; then
+    echo "OSWORLD_GEMINI_ENV_FILE must point to a readable env file for a Gemini judge" >&2
+    exit 1
+  fi
+  GEMINI_API_KEY="$(read_env_key "$gemini_env_file" GEMINI_API_KEY)"
+  if [[ -z "$GEMINI_API_KEY" ]]; then
+    echo "GEMINI_API_KEY is missing from $gemini_env_file" >&2
+    exit 1
+  fi
+  export GEMINI_API_KEY
+fi
+
 cd "$workspace_root"
 exec "$python_bin" scripts/osworld_runner/run_queue.py \
   --queue v2 \
@@ -100,7 +117,7 @@ exec "$python_bin" scripts/osworld_runner/run_queue.py \
   --openai-reasoning-effort "${OSWORLD_OPENAI_REASONING_EFFORT:-medium}" \
   --anthropic-model "${OSWORLD_ANTHROPIC_MODEL:-claude-opus-5}" \
   --anthropic-effort "${OSWORLD_ANTHROPIC_EFFORT:-high}" \
-  --judge-model "${OSWORLD_JUDGE_MODEL:-gpt-5.4-mini}" \
+  --judge-model "$judge_model" \
   --judge-max-images "${OSWORLD_JUDGE_MAX_IMAGES:-0}" \
   --judge-impl "${OSWORLD_JUDGE_IMPL:-canonical}" \
   --start-url-mode "${OSWORLD_START_URL_MODE:-google}" \

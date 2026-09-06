@@ -478,14 +478,23 @@ class AnthropicBackendTests(unittest.TestCase):
 
 class RequiredKeyTests(unittest.TestCase):
     def test_each_backend_asks_for_the_keys_it_actually_uses(self):
-        self.assertEqual(run_queue.required_keys("openai"), ("OPENAI_API_KEY",))
+        self.assertEqual(run_queue.required_keys("openai", "gpt-5.6-luna"), ("OPENAI_API_KEY",))
         self.assertEqual(run_queue.required_keys("muse-spark"), ("MUSE_SPARK_API_KEY",))
-        # A Claude run needs both: Anthropic drives the agent, OpenAI the judge.
-        self.assertEqual(run_queue.required_keys("anthropic"), ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"))
+        # A Claude run needs both: Anthropic drives the agent, the judge its own.
+        self.assertEqual(run_queue.required_keys("anthropic", "gpt-5.6-luna"),
+                         ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"))
+
+    def test_a_gemini_judge_asks_for_a_gemini_key(self):
+        # The judge is chosen independently of the agent, so demanding the
+        # agent's provider key would fail a shard that never needed it.
+        self.assertEqual(run_queue.required_keys("openai", "gemini-3.1-flash-lite-preview"),
+                         ("OPENAI_API_KEY", "GEMINI_API_KEY"))
+        self.assertEqual(run_queue.required_keys("anthropic", "gemini-3.1-flash-lite-preview"),
+                         ("ANTHROPIC_API_KEY", "GEMINI_API_KEY"))
 
     def test_a_backend_never_demands_another_backend_s_key(self):
         for backend in ("openai", "anthropic", "muse-spark"):
-            keys = run_queue.required_keys(backend)
+            keys = run_queue.required_keys(backend, "gpt-5.6-luna")
             if backend != "muse-spark":
                 self.assertNotIn("MUSE_SPARK_API_KEY", keys)
             if backend == "openai":

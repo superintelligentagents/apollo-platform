@@ -1241,7 +1241,7 @@ def trajectory_command(args: argparse.Namespace, paths: JobPaths, *, plan: bool)
         "--runs-dir", str(paths.runs),
         "--task-source-json", str(paths.tasks),
         "--output-dir", str(paths.trajectory_output),
-        "--provider", "meta" if args.agent_backend == "muse-spark" else "openai",
+        "--provider", judge_provider(args),
         "--judge-impl", args.judge_impl,
         "--model", args.meta_model if args.agent_backend == "muse-spark" else args.judge_model,
         "--queue", args.queue,
@@ -1266,11 +1266,12 @@ def publish_trajectories(args: argparse.Namespace, paths: JobPaths, judge_key: s
     if plan:
         subprocess.run(trajectory_command(args, paths, plan=True), check=True)
         return
-    if args.agent_backend in {"openai", "anthropic"}:
-        # The judge talks to OpenAI directly; only the scoped key is forwarded.
-        # For a Claude run this is deliberately not the agent's key.
+    provider = judge_provider(args)
+    if provider != "meta":
+        # Only the judge's own scoped key is forwarded, under the name that
+        # provider's SDK reads. For a Claude run this is not the agent's key.
         environment = sanitized_environment()
-        environment["OPENAI_API_KEY"] = judge_key
+        environment[JUDGE_KEY_NAMES[provider]] = judge_key
         subprocess.run(trajectory_command(args, paths, plan=False), check=True, env=environment)
         return
     with meta_proxy(
@@ -1303,6 +1304,22 @@ def require_meta_key() -> str:
     )
 
 
+def judge_provider(args: argparse.Namespace) -> str:
+    """Which API the rubric judge talks to.
+
+    The canonical judge picks its backend from the model name, so the model is
+    the single source of truth here -- deciding it from the agent backend
+    instead would send a Gemini judge an OpenAI key.
+    """
+    if args.agent_backend == "muse-spark":
+        return "meta"
+    model = (args.judge_model or "").lower()
+    return "gemini" if model.startswith("gemini") else "openai"
+
+
+JUDGE_KEY_NAMES = {"openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
+
+
 def require_agent_key(args: argparse.Namespace) -> str:
     if args.agent_backend == "openai":
         return require_secret("OPENAI_API_KEY")
@@ -1314,13 +1331,14 @@ def require_agent_key(args: argparse.Namespace) -> str:
 def require_judge_key(args: argparse.Namespace) -> str:
     """The judge's key, which is not always the agent's.
 
-    Claude runs are still judged by the OpenAI canonical judge, so that a new
-    agent's scores stay comparable with the corpus the baseline was measured
-    on. Changing the agent must not silently change the judge.
+    The judge is chosen independently of the agent so that a new agent's scores
+    stay comparable with the corpus the baseline was measured on. Changing the
+    agent must not silently change the judge, or its key.
     """
-    if args.agent_backend in {"openai", "anthropic"}:
-        return require_secret("OPENAI_API_KEY")
-    return require_meta_key()
+    provider = judge_provider(args)
+    if provider == "meta":
+        return require_meta_key()
+    return require_secret(JUDGE_KEY_NAMES[provider])
 
 
 def parser() -> argparse.ArgumentParser:

@@ -80,18 +80,21 @@ def run_command(command: Sequence[str], output: Path) -> None:
         )
 
 
-def required_keys(agent_backend: str) -> tuple[str, ...]:
-    """Secrets a shard needs before it starts, by backend.
+def required_keys(agent_backend: str, judge_model: str = "") -> tuple[str, ...]:
+    """Secrets a shard needs before it starts.
 
-    A Claude run needs two: the agent is Anthropic but the rubric judge stays on
-    OpenAI. Defaulting an unknown backend to the Meta key -- as this check used
-    to -- fails a shard minutes in with the name of a key it never wanted.
+    The agent and the judge are chosen independently, so their keys are too: a
+    Claude run judged by Gemini needs an Anthropic key and a Gemini one, and
+    neither an OpenAI key nor the Meta key it used to demand by default.
     """
-    if agent_backend == "openai":
-        return ("OPENAI_API_KEY",)
-    if agent_backend == "anthropic":
-        return ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")
-    return ("MUSE_SPARK_API_KEY",)
+    agent = {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+    }.get(agent_backend, "MUSE_SPARK_API_KEY")
+    if agent_backend == "muse-spark":
+        return (agent,)   # the Meta judge reaches the same key through a proxy
+    judge = "GEMINI_API_KEY" if judge_model.lower().startswith("gemini") else "OPENAI_API_KEY"
+    return (agent,) if agent == judge else (agent, judge)
 
 
 def agent_model_for(args: argparse.Namespace) -> str | None:
@@ -537,7 +540,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.shard_count < 1 or args.shard_index < 0 or args.shard_index >= args.shard_count:
         raise SystemExit("shard index must be between 0 and shard-count - 1")
     token = os.environ.get("APOLLO_REPORTING_TOKEN", "").strip()
-    missing = [name for name in required_keys(args.agent_backend) if not os.environ.get(name, "").strip()]
+    missing = [name for name in required_keys(args.agent_backend, args.judge_model)
+               if not os.environ.get(name, "").strip()]
     if not token:
         missing.insert(0, "APOLLO_REPORTING_TOKEN")
     if missing:
