@@ -470,6 +470,8 @@ def command_base(args: argparse.Namespace, batch_dir: Path) -> list[str]:
         "--judge-max-images", str(args.judge_max_images),
         "--judge-impl", args.judge_impl,
         "--start-url-mode", args.start_url_mode,
+        "--screen-width", str(args.screen_width),
+        "--screen-height", str(args.screen_height),
     ]
     if args.dedupe_by_model:
         command.append("--dedupe-by-model")
@@ -522,6 +524,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--judge-max-images", type=int, default=0)
     value.add_argument("--judge-impl", choices=("repo", "canonical"), default="canonical")
     value.add_argument("--start-url-mode", choices=("google", "site_scope"), default="google")
+    value.add_argument("--screen-width", type=int, default=1920)
+    value.add_argument("--screen-height", type=int, default=1080)
     value.add_argument(
         "--block-marker",
         type=Path,

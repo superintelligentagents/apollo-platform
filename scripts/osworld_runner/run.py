@@ -1099,6 +1099,8 @@ def osworld_command(args: argparse.Namespace, paths: JobPaths) -> list[str]:
         "--max_retries", str(args.max_retries),
         "--num_envs", str(args.num_envs),
         "--sleep_after_execution", str(args.sleep_after_execution),
+        "--screen_width", str(args.screen_width),
+        "--screen_height", str(args.screen_height),
         "--result_dir", str(paths.results),
         "--test_config_base_dir", str(paths.configs),
         "--test_all_meta_path", str(paths.meta),
@@ -1130,6 +1132,8 @@ def openai_osworld_command(args: argparse.Namespace, paths: JobPaths) -> list[st
         "--max_trajectory_length", str(args.max_trajectory_length),
         "--num_envs", str(args.num_envs),
         "--sleep_after_execution", str(args.sleep_after_execution),
+        "--screen_width", str(args.screen_width),
+        "--screen_height", str(args.screen_height),
         "--result_dir", str(paths.results),
         "--test_config_base_dir", str(paths.configs),
         "--test_all_meta_path", str(paths.meta),
@@ -1167,6 +1171,8 @@ def anthropic_osworld_command(args: argparse.Namespace, paths: JobPaths) -> list
         "--max_trajectory_length", str(args.max_trajectory_length),
         "--num_envs", str(args.num_envs),
         "--sleep_after_execution", str(args.sleep_after_execution),
+        "--screen_width", str(args.screen_width),
+        "--screen_height", str(args.screen_height),
         "--result_dir", str(paths.results),
         "--test_config_base_dir", str(paths.configs),
         "--test_all_meta_path", str(paths.meta),
@@ -1412,6 +1418,10 @@ def parser() -> argparse.ArgumentParser:
         help="Maximum Meta SDK retries for a desktop-agent request",
     )
     value.add_argument("--client-password", default="password")
+    # The guest renders at this size and is screenshotted every step, so it
+    # drives the VM's memory use and the payload the judge is later sent.
+    value.add_argument("--screen-width", type=int, default=1920)
+    value.add_argument("--screen-height", type=int, default=1080)
     value.add_argument("--meta-model", default=DEFAULT_META_MODEL)
     value.add_argument("--meta-base-url", default=DEFAULT_META_BASE_URL)
     value.add_argument("--meta-session-id", default=DEFAULT_META_SESSION_ID)

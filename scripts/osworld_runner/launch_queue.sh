@@ -121,6 +121,8 @@ exec "$python_bin" scripts/osworld_runner/run_queue.py \
   --judge-max-images "${OSWORLD_JUDGE_MAX_IMAGES:-0}" \
   --judge-impl "${OSWORLD_JUDGE_IMPL:-canonical}" \
   --start-url-mode "${OSWORLD_START_URL_MODE:-google}" \
+  --screen-width "${OSWORLD_SCREEN_WIDTH:-1920}" \
+  --screen-height "${OSWORLD_SCREEN_HEIGHT:-1080}" \
   ${OSWORLD_EXCLUDE_TASKS_FILE:+--exclude-task-ids-file "$OSWORLD_EXCLUDE_TASKS_FILE"} \
   ${OSWORLD_RUBRIC_OVERLAY_JSON:+--rubric-overlay-json "$OSWORLD_RUBRIC_OVERLAY_JSON"} \
   ${OSWORLD_DEDUPE_RUN_LABEL_PREFIX:+--dedupe-by-run-label-prefix "$OSWORLD_DEDUPE_RUN_LABEL_PREFIX"} \

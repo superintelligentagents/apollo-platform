@@ -414,6 +414,7 @@ class AnthropicBackendTests(unittest.TestCase):
             "judge_model": "gpt-5.6-luna", "provider_name": "apptainer",
             "max_steps": 120, "max_trajectory_length": 120, "num_envs": 2,
             "sleep_after_execution": 2.0, "domain": "apollo_chrome",
+            "screen_width": 1920, "screen_height": 1080,
             "client_password": "password", "aws_region": "us-east-1",
             "osworld_root": Path("/osworld"), "path_to_vm": Path("/vm.qcow2"),
         }
@@ -575,6 +576,7 @@ class RunnerFlagContractTests(unittest.TestCase):
             anthropic_max_tokens=16_000, provider_name="apptainer", max_steps=120,
             max_trajectory_length=120, num_envs=5, sleep_after_execution=2.0,
             domain="apollo_chrome", client_password="password", aws_region="us-east-1",
+            screen_width=1920, screen_height=1080,
             osworld_root=self.CHECKOUT, path_to_vm=Path("/vm.qcow2"),
         )
         command = run.anthropic_osworld_command(args, run.job_paths(Path("/work"), model="claude-opus-5"))
