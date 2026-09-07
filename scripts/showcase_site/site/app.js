@@ -4,6 +4,37 @@ const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
 }[character]));
 
+// The checked-in export predates aggregate story metrics. A future dataset rebuild
+// writes this same shape from export_dataset.py, so the narrative stays reproducible.
+const FALLBACK_ANALYSIS = {
+  total_runs: 195,
+  total_rubrics: 1866,
+  failed_rubrics: 827,
+  model_stats: {
+    "claude-opus-5": {
+      runs: 100, mean_score: 0.554, mean_steps: 100.8, cap_runs: 55,
+      rubrics_passed: 494, rubrics_scored: 959, rubric_pass_rate: 0.5151,
+      zero_score_runs: 15, perfect_runs: 15,
+    },
+    "gpt-5.6-sol": {
+      runs: 95, mean_score: 0.5782, mean_steps: 32.7, cap_runs: 0,
+      rubrics_passed: 545, rubrics_scored: 907, rubric_pass_rate: 0.6009,
+      zero_score_runs: 4, perfect_runs: 16,
+    },
+  },
+  head_to_head: { shared_tasks: 95, sol_wins: 42, opus_wins: 44, ties: 9 },
+  opus_cap_comparison: {
+    capped: { failed: 394, scored: 615, rate: 0.6407 },
+    uncapped: { failed: 71, scored: 344, rate: 0.2064 },
+  },
+  failure_modes: {
+    unfinished_outcome: 303,
+    missing_details: 119,
+    weak_verification: 40,
+    access_failure: 40,
+  },
+};
+
 let tasks = [];
 let dataset;
 let visibleLimit = 24;
@@ -67,6 +98,67 @@ function renderOverview() {
     </div>`).join("");
 }
 
+function renderNarrative() {
+  const analysis = dataset.analysis || FALLBACK_ANALYSIS;
+  const opus = analysis.model_stats["claude-opus-5"];
+  const sol = analysis.model_stats["gpt-5.6-sol"];
+  const head = analysis.head_to_head;
+  const cap = analysis.opus_cap_comparison;
+  const modes = analysis.failure_modes;
+
+  document.getElementById("resultsProse").textContent =
+    `The aggregate result is close: sol averages ${fmt(sol.mean_score)} and Opus 5 averages ${fmt(opus.mean_score)}. ` +
+    `On the ${head.shared_tasks} tasks both agents attempted, Opus 5 wins ${head.opus_wins}, sol wins ${head.sol_wins}, ` +
+    `and ${head.ties} tie—evidence that success depends on the kind of work, not a single universally stronger agent.`;
+
+  document.getElementById("failureLead").textContent =
+    `Across ${analysis.total_runs} trajectories and ${analysis.total_rubrics.toLocaleString()} scored rubrics, ` +
+    `${analysis.failed_rubrics} requirements failed. The judge explanations point most often to incomplete ` +
+    `deliverables and missing synthesis, even when the browser history shows substantial research.`;
+
+  const findings = [
+    {
+      value: `${head.opus_wins}–${head.sol_wins}`,
+      label: "Opus 5 vs sol wins",
+      note: `${head.ties} ties across ${head.shared_tasks} shared tasks`,
+    },
+    {
+      value: `${Math.round((opus.cap_runs / opus.runs) * 100)}%`,
+      label: "of Opus 5 runs reached the step cap",
+      note: `${Math.round(cap.capped.rate * 100)}% failed-rubric rate when capped vs ${Math.round(cap.uncapped.rate * 100)}% when uncapped`,
+    },
+    {
+      value: modes.unfinished_outcome.toLocaleString(),
+      label: "failed rubrics signal unfinished output",
+      note: `Compared with ${modes.access_failure} that mention navigation or access trouble`,
+    },
+  ];
+  document.getElementById("findingGrid").innerHTML = findings.map((finding) => `
+    <article class="finding-card">
+      <strong>${escapeHtml(finding.value)}</strong>
+      <h3>${escapeHtml(finding.label)}</h3>
+      <p>${escapeHtml(finding.note)}</p>
+    </article>`).join("");
+
+  const failureLabels = {
+    unfinished_outcome: ["Unfinished output or synthesis", "The requested artifact, comparison, or final answer was not completed."],
+    missing_details: ["Missing required details", "A result was present, but required fields or coverage were incomplete."],
+    weak_verification: ["Weak source verification", "Claims lacked the requested authoritative source or evidence."],
+    access_failure: ["Navigation or access", "The trajectory records a load, login, paywall, or access problem."],
+  };
+  const maxMode = Math.max(...Object.values(modes));
+  document.getElementById("failureTotal").textContent = `${analysis.failed_rubrics} failed rubrics`;
+  document.getElementById("failureModes").innerHTML = Object.entries(failureLabels).map(([key, [label, note]]) => `
+    <div class="failure-mode">
+      <div class="failure-mode-head">
+        <span>${escapeHtml(label)}</span>
+        <strong>${modes[key].toLocaleString()}</strong>
+      </div>
+      <div class="failure-track"><span style="width:${(modes[key] / maxMode) * 100}%"></span></div>
+      <p>${escapeHtml(note)}</p>
+    </div>`).join("");
+}
+
 function sortValue(task, key) {
   if (key === "opus") return task.runs["claude-opus-5"]?.score ?? -1;
   if (key === "sol") return task.runs["gpt-5.6-sol"]?.score ?? -1;
@@ -126,6 +218,7 @@ async function init() {
     dataset = await response.json();
     tasks = dataset.tasks;
     renderOverview();
+    renderNarrative();
     renderTasks();
 
     ["q", "cat"].forEach((id) => document.getElementById(id).addEventListener("input", () => renderTasks({ resetLimit: true })));

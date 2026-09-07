@@ -6,7 +6,7 @@
   <meta name="description" content="Explore 100 difficult browser-agent tasks, model scores, rubric verdicts, and every recorded trajectory step.">
   <title>OdysseysMega — Turing agent evaluation</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Cpath d=%27M18 24h64v16H58v42H42V40H18z%27 fill=%27%232f6fb3%27/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/style.css?v=20260907e">
+  <link rel="stylesheet" href="/style.css?v=20260907f">
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to benchmark</a>
@@ -18,7 +18,8 @@
     </a>
     <nav class="site-nav" aria-label="Primary navigation">
       <a href="#overview">Overview</a>
-      <a href="#agents">Agents</a>
+      <a href="#method">Method</a>
+      <a href="#failures">Failures</a>
       <a href="#tasks">Tasks</a>
     </nav>
   </header>
@@ -40,6 +41,47 @@
         <div class="stat-skeleton"></div>
         <div class="stat-skeleton"></div>
         <div class="stat-skeleton"></div>
+      </section>
+
+      <section class="story-section" id="findings" aria-labelledby="findings-title">
+        <div class="story-label"><p class="eyebrow">What we tested</p><span>01</span></div>
+        <div class="story-copy">
+          <h2 id="findings-title">These are not one-click benchmark questions.</h2>
+          <p>OdysseysMega measures whether an agent can turn extended work across live websites into a usable, review-ready result. Tasks require sustained browsing, evidence gathering, comparison, and often document or spreadsheet construction; every rubric is judged against the complete screenshot history rather than the final answer alone.</p>
+          <p class="results-prose" id="resultsProse">Loading the agent comparison…</p>
+        </div>
+      </section>
+
+      <section class="construction-section" id="method" aria-labelledby="method-title">
+        <header class="narrative-heading">
+          <p class="eyebrow">Data construction and quality</p>
+          <h2 id="method-title">High-quality tasks are made, screened, and only then selected.</h2>
+          <p>The benchmark began with live, author-approved work from Turing’s reporting pipeline—not a stale task snapshot. Quality control separated whether a task was fair and verifiable from whether an agent found it difficult.</p>
+        </header>
+        <div class="construction-grid">
+          <article>
+            <span class="stage-number">01 / Construct</span>
+            <h3>Annotator-built and signed off</h3>
+            <p>Turing annotators wrote long-horizon requests and concrete rubrics, verified the intended websites and evidence, and approved the task before it entered the candidate pool.</p>
+            <strong>Approved tasks only</strong>
+          </article>
+          <article>
+            <span class="stage-number">02 / Screen</span>
+            <h3>Fairness before difficulty</h3>
+            <p>Starting candidates needed a genuine multi-step browser attempt, at least five rubrics, clean judge output, taxonomy coverage, and no content-filter exclusion. Twelve fairness-review agents then checked for stale values, access gates, underspecification, contradictions, and ungradeable evidence.</p>
+            <strong>225 candidates → 211 fair</strong>
+          </article>
+          <article>
+            <span class="stage-number">03 / Select</span>
+            <h3>Representative by design</h3>
+            <p>Rejected tasks could not return. Fair tasks were filled scarcest-category first, with category floors, an eight-task author cap, and subject spread; difficulty only broke ties within a category.</p>
+            <strong>100 tasks · 20 categories · 22 authors</strong>
+          </article>
+        </div>
+        <aside class="quality-note">
+          <span>Quality-control correction</span>
+          <p>A 1,100-character export limit was found to truncate rubric text for 43 candidates. Every affected task was re-screened using the full rubric text, and those corrected verdicts replaced the truncated reviews.</p>
+        </aside>
       </section>
 
       <section class="overview-grid" aria-label="Dataset overview">
@@ -69,6 +111,27 @@
             <a href="https://github.com/ljang0/Odysseys" target="_blank" rel="noopener">View Odysseys ↗</a>
           </div>
         </article>
+      </section>
+
+      <section class="failure-section" id="failures" aria-labelledby="failure-title">
+        <header class="narrative-heading">
+          <p class="eyebrow">Failure analysis</p>
+          <h2 id="failure-title">The hard part is finishing the work—not merely opening the web.</h2>
+          <p id="failureLead">Loading failure analysis from the published judge records…</p>
+        </header>
+        <div class="finding-grid" id="findingGrid" aria-label="Key findings"></div>
+        <div class="failure-layout">
+          <div class="failure-prose">
+            <h3>What the trajectories reveal</h3>
+            <p>Agents often gathered useful fragments but failed to convert them into the requested comparison, plan, spreadsheet, or other final artifact. Missing fields and weak source verification were visible too, but simple page-access failures account for a much smaller portion of the recorded judge explanations.</p>
+            <p>A step limit can mark a run that was already struggling, so the relationship between capped trajectories and failed rubrics is descriptive—not proof that the cap caused the failure.</p>
+          </div>
+          <aside class="failure-panel">
+            <header><div><p class="eyebrow">Judge-language review</p><h3>Recurring failure signals</h3></div><span id="failureTotal"></span></header>
+            <div id="failureModes"></div>
+            <p class="analysis-caveat">Rule-based counts from final judge explanations. Themes overlap and do not cover every failure.</p>
+          </aside>
+        </div>
       </section>
 
       <section class="task-index" id="tasks" aria-labelledby="task-index-title">
@@ -115,6 +178,6 @@
     <span>OdysseysMega · Turing frontier agent evaluation</span>
     <a href="https://github.com/ljang0/Odysseys" target="_blank" rel="noopener">Odysseys</a>
   </footer>
-  <script type="module" src="/app.js?v=20260907e"></script>
+  <script type="module" src="/app.js?v=20260907f"></script>
 </body>
 </html>

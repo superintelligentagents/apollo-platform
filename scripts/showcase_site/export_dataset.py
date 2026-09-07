@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -34,6 +35,32 @@ MODELS = {
         "state_glob": "h100v2sol-s*/queue-state.json",
         "grades": None,          # already judged by Gemini in its own run
     },
+}
+
+FAILURE_PATTERNS = {
+    "unfinished_outcome": re.compile(
+        r"failed to (produce|provide|create|compile|assemble|deliver|generate|synthesize|compare|rank|summarize)"
+        r"|never (produced|provided|created|compiled|assembled|delivered|generated|synthesized|compared|ranked|summarized)"
+        r"|did not (produce|provide|create|compile|assemble|deliver|generate|synthesize|compare|rank|summarize)"
+        r"|no (final|written|completed) (output|response|document|deliverable|report|plan|comparison)"
+        r"|trajectory ended|simply navigat|only (navigated|searched|visited)|research phase",
+        re.I,
+    ),
+    "missing_details": re.compile(
+        r"missing|omitted|did not (include|record|capture|extract|address|cover)"
+        r"|failed to (include|record|capture|extract|address|cover)|incomplete|lacks? the required",
+        re.I,
+    ),
+    "weak_verification": re.compile(
+        r"not (verify|verified)|failed to verify|did not verify|no (source|citation)"
+        r"|without (source|citation)|third.party|official source|authoritative source|unsupported",
+        re.I,
+    ),
+    "access_failure": re.compile(
+        r"site can.t be reached|failed to load|unable to access|could not access|paywall|login"
+        r"|blocked|access denied|connectivity|page did not load",
+        re.I,
+    ),
 }
 
 
@@ -104,6 +131,81 @@ def score_of(grades: list[dict[str, Any]]) -> tuple[float, int, int]:
     return (round(passed / len(scored), 4) if scored else 0.0, passed, len(scored))
 
 
+def build_analysis(details: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate reproducible story metrics from the exported judge records."""
+    model_stats: dict[str, dict[str, Any]] = {}
+    for model_id in MODELS:
+        rows = [row for row in details if row["model"] == model_id]
+        scored = sum(row["rubrics_scored"] for row in rows)
+        passed = sum(row["rubrics_passed"] for row in rows)
+        model_stats[model_id] = {
+            "runs": len(rows),
+            "mean_score": round(sum(row["score"] for row in rows) / len(rows), 4) if rows else 0,
+            "mean_steps": round(sum(row["steps"] for row in rows) / len(rows), 1) if rows else 0,
+            "cap_runs": sum(1 for row in rows if row["truncated"]),
+            "rubrics_passed": passed,
+            "rubrics_scored": scored,
+            "rubric_pass_rate": round(passed / scored, 4) if scored else 0,
+            "zero_score_runs": sum(1 for row in rows if row["score"] == 0),
+            "perfect_runs": sum(1 for row in rows if row["score"] == 1),
+        }
+
+    by_task: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in details:
+        by_task.setdefault(row["task_id"], {})[row["model"]] = row
+    shared = wins_sol = wins_opus = ties = 0
+    for task_runs in by_task.values():
+        sol = task_runs.get("gpt-5.6-sol")
+        opus = task_runs.get("claude-opus-5")
+        if not sol or not opus:
+            continue
+        shared += 1
+        if sol["score"] > opus["score"]:
+            wins_sol += 1
+        elif opus["score"] > sol["score"]:
+            wins_opus += 1
+        else:
+            ties += 1
+
+    failure_modes = {key: 0 for key in FAILURE_PATTERNS}
+    failed_rubrics = 0
+    for row in details:
+        for grade in row["grades"]:
+            if grade["status"] != "FAILURE":
+                continue
+            failed_rubrics += 1
+            reasoning = grade.get("reasoning") or ""
+            for key, pattern in FAILURE_PATTERNS.items():
+                if pattern.search(reasoning):
+                    failure_modes[key] += 1
+
+    opus_rows = [row for row in details if row["model"] == "claude-opus-5"]
+
+    def failure_rate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        scored = sum(row["rubrics_scored"] for row in rows)
+        failed = sum(row["rubrics_scored"] - row["rubrics_passed"] for row in rows)
+        return {"failed": failed, "scored": scored, "rate": round(failed / scored, 4) if scored else 0}
+
+    return {
+        "total_runs": len(details),
+        "total_rubrics": sum(row["rubrics_scored"] for row in details),
+        "failed_rubrics": failed_rubrics,
+        "model_stats": model_stats,
+        "head_to_head": {
+            "shared_tasks": shared,
+            "sol_wins": wins_sol,
+            "opus_wins": wins_opus,
+            "ties": ties,
+        },
+        "opus_cap_comparison": {
+            "capped": failure_rate([row for row in opus_rows if row["truncated"]]),
+            "uncapped": failure_rate([row for row in opus_rows if not row["truncated"]]),
+        },
+        # Categories overlap by design: one judge explanation may cite multiple modes.
+        "failure_modes": failure_modes,
+    }
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--out", type=Path, required=True)
@@ -120,6 +222,7 @@ def main(argv=None) -> int:
     tasks = {t["task_id"]: t for t in subset["tasks"]}
 
     index: dict[str, Any] = {}
+    details: list[dict[str, Any]] = []
     for model_id, spec in MODELS.items():
         runs = runs_for(spec["state_glob"])
         override = {}
@@ -154,6 +257,7 @@ def main(argv=None) -> int:
                 if not got:
                     continue
                 task_id, detail = got
+                details.append(detail)
                 (args.out / "runs").mkdir(exist_ok=True)
                 slug = f"{model_id}__{detail['run_id']}"
                 (args.out / "runs" / f"{slug}.json").write_text(
@@ -179,6 +283,7 @@ def main(argv=None) -> int:
         "max_steps": 120,
         "prompt": "canonical upstream (no Apollo operator prompt)",
         "models": {k: v["label"] for k, v in MODELS.items()},
+        "analysis": build_analysis(details),
         "tasks": sorted(index.values(), key=lambda t: t["task_id"]),
     }, ensure_ascii=False), encoding="utf-8")
     print(f"wrote {len(index)} tasks to {args.out}")
