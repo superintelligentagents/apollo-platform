@@ -163,7 +163,7 @@ async function init() {
     if (!task) throw new Error("This task is not present in the published dataset.");
 
     const title = shortTitle(task);
-    document.title = `${title} — OdysseysMega`;
+    document.title = `${title} | OdysseysMega`;
     document.getElementById("title").textContent = title;
     document.getElementById("meta").innerHTML = [
       task.category,

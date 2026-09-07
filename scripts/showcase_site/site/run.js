@@ -293,7 +293,7 @@ async function init() {
     const modelLabel = dataset.models[run.model] || run.model;
     const taskTitle = currentTask?.title || run.task_id;
 
-    document.title = `${modelLabel} trajectory — OdysseysMega`;
+    document.title = `${modelLabel} trajectory | OdysseysMega`;
     document.getElementById("back").href = `/task?id=${encodeURIComponent(run.task_id)}`;
     document.getElementById("back").innerHTML = `<span aria-hidden="true">←</span> Back to task`;
     document.getElementById("title").textContent = modelLabel;

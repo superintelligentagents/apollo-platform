@@ -1,4 +1,4 @@
-const fmt = (value) => value === null || value === undefined ? "—" : value.toFixed(3);
+const fmt = (value) => value === null || value === undefined ? "N/A" : value.toFixed(3);
 const mean = (values) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
@@ -35,10 +35,50 @@ const FALLBACK_ANALYSIS = {
   },
 };
 
+const FEATURED_TASK_IDS = [
+  "v2/riya-g5-turing-com/internal/task-dd1993d2-20260817T194718",
+  "v2/emmanuel-r1-turing-com/internal/task-b853c070-20260817T195059",
+  "v2/panwaranubhav07-gmail-com/internal/task-a254d056-20260815T153522",
+  "v2/panwaranubhav07-gmail-com/internal/task-019806cd-20260817T183415",
+];
+
 let tasks = [];
 let dataset;
 let visibleLimit = 24;
 let sort = { key: "title", direction: 1 };
+let featuredTasks = [];
+let featuredTask;
+let featuredModel = "gpt-5.6-sol";
+let featuredRun;
+let featuredStepIndex = 0;
+let featuredRunLoadId = 0;
+let featuredImageLoadId = 0;
+let featuredPlaying = false;
+let featuredTimer;
+let featuredInView = false;
+let featuredUserPaused = false;
+
+const featuredElements = {
+  section: document.getElementById("examples"),
+  list: document.getElementById("featuredTaskList"),
+  select: document.getElementById("featuredTaskSelect"),
+  category: document.getElementById("featuredCategory"),
+  title: document.getElementById("featuredTitle"),
+  modelTabs: document.getElementById("featuredModelTabs"),
+  frame: document.getElementById("featuredFrame"),
+  loading: document.getElementById("featuredLoading"),
+  image: document.getElementById("featuredImage"),
+  error: document.getElementById("featuredError"),
+  position: document.getElementById("featuredPosition"),
+  action: document.getElementById("featuredAction"),
+  score: document.getElementById("featuredScore"),
+  rubrics: document.getElementById("featuredRubrics"),
+  play: document.getElementById("featuredPlay"),
+  previous: document.getElementById("featuredPrevious"),
+  next: document.getElementById("featuredNext"),
+  scrubber: document.getElementById("featuredScrubber"),
+  open: document.getElementById("featuredOpen"),
+};
 
 function modelScores(model) {
   return tasks.filter((task) => task.runs[model]).map((task) => task.runs[model].score);
@@ -107,9 +147,9 @@ function renderNarrative() {
   const modes = analysis.failure_modes;
 
   document.getElementById("resultsProse").textContent =
-    `The aggregate result is close: sol averages ${fmt(sol.mean_score)} and Opus 5 averages ${fmt(opus.mean_score)}. ` +
+    `The average scores are close. sol averages ${fmt(sol.mean_score)} and Opus 5 averages ${fmt(opus.mean_score)}. ` +
     `On the ${head.shared_tasks} tasks both agents attempted, Opus 5 wins ${head.opus_wins}, sol wins ${head.sol_wins}, ` +
-    `and ${head.ties} tie—evidence that success depends on the kind of work, not a single universally stronger agent.`;
+    `and ${head.ties} tie. The result varies with the kind of work in the task.`;
 
   document.getElementById("failureLead").textContent =
     `Across ${analysis.total_runs} trajectories and ${analysis.total_rubrics.toLocaleString()} scored rubrics, ` +
@@ -118,7 +158,7 @@ function renderNarrative() {
 
   const findings = [
     {
-      value: `${head.opus_wins}–${head.sol_wins}`,
+      value: `${head.opus_wins} to ${head.sol_wins}`,
       label: "Opus 5 vs sol wins",
       note: `${head.ties} ties across ${head.shared_tasks} shared tasks`,
     },
@@ -159,6 +199,225 @@ function renderNarrative() {
     </div>`).join("");
 }
 
+function compactCopy(value, limit = 240) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= limit) return text;
+  const breakAt = text.lastIndexOf(" ", limit);
+  return `${text.slice(0, breakAt > limit * 0.7 ? breakAt : limit)}…`;
+}
+
+function featuredLabel(model) {
+  return model === "claude-opus-5" ? "Opus 5" : "sol";
+}
+
+function setFeaturedPlaying(value, userAction = false) {
+  featuredPlaying = value;
+  clearTimeout(featuredTimer);
+  if (userAction) featuredUserPaused = !value;
+  featuredElements.play.innerHTML = value ? "Ⅱ <span>Pause</span>" : "▶ <span>Play</span>";
+  featuredElements.play.setAttribute("aria-label", value ? "Pause trajectory" : "Play trajectory");
+}
+
+function scheduleFeaturedStep() {
+  clearTimeout(featuredTimer);
+  if (!featuredPlaying || !featuredRun?.trajectory.length) return;
+  featuredTimer = setTimeout(() => {
+    featuredStepIndex = (featuredStepIndex + 1) % featuredRun.trajectory.length;
+    drawFeaturedStep();
+  }, 2300);
+}
+
+function preloadFeaturedNext() {
+  if (!featuredRun?.trajectory.length) return;
+  const next = featuredRun.trajectory[(featuredStepIndex + 1) % featuredRun.trajectory.length];
+  if (!next?.screenshot_key) return;
+  const image = new Image();
+  image.src = `/api/shot?key=${encodeURIComponent(next.screenshot_key)}`;
+}
+
+function drawFeaturedStep() {
+  const step = featuredRun?.trajectory[featuredStepIndex];
+  if (!step) return;
+
+  featuredElements.position.textContent = `Frame ${featuredStepIndex + 1} of ${featuredRun.trajectory.length}`;
+  featuredElements.action.textContent = compactCopy(step.action || step.response || "No action was recorded for this frame.");
+  featuredElements.previous.disabled = featuredStepIndex === 0;
+  featuredElements.next.disabled = featuredStepIndex === featuredRun.trajectory.length - 1;
+  featuredElements.scrubber.value = String(featuredStepIndex + 1);
+  featuredElements.scrubber.setAttribute("aria-valuetext", `Frame ${featuredStepIndex + 1} of ${featuredRun.trajectory.length}`);
+  featuredImageLoadId += 1;
+  const thisLoad = featuredImageLoadId;
+  featuredElements.image.hidden = true;
+  featuredElements.error.hidden = true;
+  featuredElements.loading.hidden = false;
+  featuredElements.frame.setAttribute("aria-busy", "true");
+
+  if (!step.screenshot_key) {
+    featuredElements.loading.hidden = true;
+    featuredElements.error.hidden = false;
+    featuredElements.frame.setAttribute("aria-busy", "false");
+    scheduleFeaturedStep();
+    return;
+  }
+
+  featuredElements.image.onload = () => {
+    if (thisLoad !== featuredImageLoadId) return;
+    featuredElements.loading.hidden = true;
+    featuredElements.image.hidden = false;
+    featuredElements.frame.setAttribute("aria-busy", "false");
+    preloadFeaturedNext();
+    scheduleFeaturedStep();
+  };
+  featuredElements.image.onerror = () => {
+    if (thisLoad !== featuredImageLoadId) return;
+    featuredElements.loading.hidden = true;
+    featuredElements.error.hidden = false;
+    featuredElements.frame.setAttribute("aria-busy", "false");
+    scheduleFeaturedStep();
+  };
+  featuredElements.image.alt = `Recorded browser state from ${featuredLabel(featuredModel)} at step ${step.step}`;
+  featuredElements.image.src = `/api/shot?key=${encodeURIComponent(step.screenshot_key)}`;
+}
+
+function updateFeaturedTaskPicker() {
+  featuredElements.list.querySelectorAll("button").forEach((button) => {
+    const active = button.dataset.taskId === featuredTask?.task_id;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+  featuredElements.select.value = featuredTask?.task_id || "";
+}
+
+function renderFeaturedModelTabs() {
+  featuredElements.modelTabs.innerHTML = Object.keys(dataset.models)
+    .filter((model) => featuredTask.runs[model])
+    .map((model) => `<button type="button" data-featured-model="${escapeHtml(model)}" class="${model === featuredModel ? "active" : ""}" aria-pressed="${model === featuredModel}">${escapeHtml(featuredLabel(model))}</button>`)
+    .join("");
+}
+
+async function loadFeaturedRun() {
+  const reference = featuredTask.runs[featuredModel];
+  const thisLoad = ++featuredRunLoadId;
+  featuredImageLoadId += 1;
+  setFeaturedPlaying(false);
+  featuredRun = undefined;
+  featuredStepIndex = 0;
+  featuredElements.play.disabled = true;
+  featuredElements.previous.disabled = true;
+  featuredElements.next.disabled = true;
+  featuredElements.scrubber.disabled = true;
+  featuredElements.image.hidden = true;
+  featuredElements.error.hidden = true;
+  featuredElements.loading.hidden = false;
+  featuredElements.frame.setAttribute("aria-busy", "true");
+  featuredElements.position.textContent = "Loading trajectory";
+  featuredElements.action.textContent = "Loading the recorded actions";
+  featuredElements.score.textContent = reference.score.toFixed(3);
+  featuredElements.rubrics.textContent = reference.rubrics_passed.replace("/", " of ");
+  featuredElements.open.href = `/run?id=${encodeURIComponent(reference.run)}`;
+  renderFeaturedModelTabs();
+
+  try {
+    const response = await fetch(`/data/runs/${encodeURIComponent(reference.run)}.json`);
+    if (!response.ok) throw new Error(`Run request failed (${response.status})`);
+    const loadedRun = await response.json();
+    if (thisLoad !== featuredRunLoadId) return;
+    featuredRun = loadedRun;
+    featuredElements.scrubber.max = String(featuredRun.trajectory.length);
+    featuredElements.play.disabled = false;
+    featuredElements.scrubber.disabled = false;
+    drawFeaturedStep();
+    if (featuredInView && !featuredUserPaused && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setFeaturedPlaying(true);
+      scheduleFeaturedStep();
+    }
+  } catch (error) {
+    if (thisLoad !== featuredRunLoadId) return;
+    featuredElements.loading.hidden = true;
+    featuredElements.error.hidden = false;
+    featuredElements.error.textContent = "This trajectory could not be loaded";
+    featuredElements.frame.setAttribute("aria-busy", "false");
+  }
+}
+
+async function selectFeaturedTask(taskId) {
+  const nextTask = featuredTasks.find((task) => task.task_id === taskId);
+  if (!nextTask) return;
+  featuredTask = nextTask;
+  if (!featuredTask.runs[featuredModel]) featuredModel = Object.keys(featuredTask.runs)[0];
+  featuredElements.category.textContent = featuredTask.category || "Web research";
+  featuredElements.title.textContent = compactCopy(featuredTask.title || featuredTask.request, 150);
+  updateFeaturedTaskPicker();
+  await loadFeaturedRun();
+}
+
+function initTrajectoryShowcase() {
+  const preferred = FEATURED_TASK_IDS.map((taskId) => tasks.find((task) => task.task_id === taskId)).filter(Boolean);
+  const fallback = tasks.filter((task) => Object.keys(task.runs).length > 1 && !preferred.includes(task));
+  const usedCategories = new Set(preferred.map((task) => task.category));
+  for (const task of fallback) {
+    if (preferred.length >= 4) break;
+    if (usedCategories.has(task.category)) continue;
+    preferred.push(task);
+    usedCategories.add(task.category);
+  }
+  featuredTasks = preferred.slice(0, 4);
+  featuredElements.list.innerHTML = featuredTasks.map((task, index) => `
+    <button type="button" data-task-id="${escapeHtml(task.task_id)}" aria-pressed="false">
+      <span>${String(index + 1).padStart(2, "0")} · ${escapeHtml(task.category || "Web research")}</span>
+      <strong>${escapeHtml(compactCopy(task.title || task.request, 88))}</strong>
+    </button>`).join("");
+  featuredElements.select.innerHTML = featuredTasks.map((task) => `
+    <option value="${escapeHtml(task.task_id)}">${escapeHtml(task.category || "Web research")} · ${escapeHtml(compactCopy(task.title || task.request, 72))}</option>`).join("");
+
+  featuredElements.list.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-task-id]");
+    if (button) selectFeaturedTask(button.dataset.taskId);
+  });
+  featuredElements.select.addEventListener("change", (event) => selectFeaturedTask(event.target.value));
+  featuredElements.modelTabs.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-featured-model]");
+    if (!button || button.dataset.featuredModel === featuredModel) return;
+    featuredModel = button.dataset.featuredModel;
+    loadFeaturedRun();
+  });
+  featuredElements.previous.addEventListener("click", () => {
+    if (!featuredRun) return;
+    setFeaturedPlaying(false, true);
+    featuredStepIndex = Math.max(0, featuredStepIndex - 1);
+    drawFeaturedStep();
+  });
+  featuredElements.next.addEventListener("click", () => {
+    if (!featuredRun) return;
+    setFeaturedPlaying(false, true);
+    featuredStepIndex = Math.min(featuredRun.trajectory.length - 1, featuredStepIndex + 1);
+    drawFeaturedStep();
+  });
+  featuredElements.play.addEventListener("click", () => {
+    if (!featuredRun) return;
+    setFeaturedPlaying(!featuredPlaying, true);
+    if (featuredPlaying) scheduleFeaturedStep();
+  });
+  featuredElements.scrubber.addEventListener("input", (event) => {
+    setFeaturedPlaying(false, true);
+    featuredStepIndex = Number(event.target.value) - 1;
+    drawFeaturedStep();
+  });
+
+  const observer = new IntersectionObserver(([entry]) => {
+    featuredInView = entry.isIntersecting;
+    if (!featuredRun) return;
+    if (featuredInView && !featuredUserPaused && !matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      setFeaturedPlaying(true);
+      scheduleFeaturedStep();
+    } else if (!featuredInView) {
+      setFeaturedPlaying(false);
+    }
+  }, { threshold: 0.3 });
+  observer.observe(featuredElements.section);
+  selectFeaturedTask(featuredTasks[0].task_id);
+}
+
 function sortValue(task, key) {
   if (key === "opus") return task.runs["claude-opus-5"]?.score ?? -1;
   if (key === "sol") return task.runs["gpt-5.6-sol"]?.score ?? -1;
@@ -167,7 +426,7 @@ function sortValue(task, key) {
 
 function scoreItem(task, model, shortLabel) {
   const run = task.runs[model];
-  if (!run) return `<div class="task-score empty"><span>${shortLabel}</span><strong>—</strong><small>No run</small></div>`;
+  if (!run) return `<div class="task-score empty"><span>${shortLabel}</span><strong>N/A</strong><small>No run</small></div>`;
   const cap = run.truncated ? `<em title="Stopped at the ${dataset.max_steps}-step limit">cap</em>` : "";
   return `<a class="task-score" href="/run?id=${encodeURIComponent(run.run)}" aria-label="Watch ${escapeHtml(dataset.models[model])} trajectory, score ${run.score.toFixed(3)}">
     <span>${escapeHtml(shortLabel)} ${cap}</span>
@@ -219,6 +478,7 @@ async function init() {
     tasks = dataset.tasks;
     renderOverview();
     renderNarrative();
+    initTrajectoryShowcase();
     renderTasks();
 
     ["q", "cat"].forEach((id) => document.getElementById(id).addEventListener("input", () => renderTasks({ resetLimit: true })));

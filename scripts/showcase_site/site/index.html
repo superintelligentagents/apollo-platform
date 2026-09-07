@@ -4,9 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Explore 100 difficult browser-agent tasks, model scores, rubric verdicts, and every recorded trajectory step.">
-  <title>OdysseysMega — Turing agent evaluation</title>
+  <title>OdysseysMega | Turing agent evaluation</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Cpath d=%27M18 24h64v16H58v42H42V40H18z%27 fill=%27%232f6fb3%27/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/style.css?v=20260907f">
+  <link rel="stylesheet" href="/style.css?v=20260907g">
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to benchmark</a>
@@ -18,6 +18,7 @@
     </a>
     <nav class="site-nav" aria-label="Primary navigation">
       <a href="#overview">Overview</a>
+      <a href="#examples">Examples</a>
       <a href="#method">Method</a>
       <a href="#failures">Failures</a>
       <a href="#tasks">Tasks</a>
@@ -46,9 +47,64 @@
       <section class="story-section" id="findings" aria-labelledby="findings-title">
         <div class="story-label"><p class="eyebrow">What we tested</p><span>01</span></div>
         <div class="story-copy">
-          <h2 id="findings-title">These are not one-click benchmark questions.</h2>
+          <h2 id="findings-title">The tasks involve several stages of web research.</h2>
           <p>OdysseysMega measures whether an agent can turn extended work across live websites into a usable, review-ready result. Tasks require sustained browsing, evidence gathering, comparison, and often document or spreadsheet construction; every rubric is judged against the complete screenshot history rather than the final answer alone.</p>
           <p class="results-prose" id="resultsProse">Loading the agent comparison…</p>
+        </div>
+      </section>
+
+      <section class="trajectory-showcase" id="examples" aria-labelledby="examples-title">
+        <header class="narrative-heading showcase-heading">
+          <p class="eyebrow">Trajectory examples</p>
+          <h2 id="examples-title">A few trajectories from the benchmark</h2>
+          <p>Pick a task and an agent to follow the recorded browser session. Each frame comes from the same screenshot history used by the judge.</p>
+        </header>
+
+        <label class="featured-mobile-picker" for="featuredTaskSelect">
+          <span>Choose a task</span>
+          <select id="featuredTaskSelect" aria-label="Choose a trajectory example"></select>
+        </label>
+
+        <div class="featured-workbench">
+          <aside class="featured-task-list" id="featuredTaskList" aria-label="Trajectory examples"></aside>
+          <article class="featured-viewer" aria-live="polite">
+            <header class="featured-viewer-head">
+              <div class="featured-task-heading">
+                <p class="eyebrow" id="featuredCategory">Loading example</p>
+                <h3 id="featuredTitle">Loading trajectory</h3>
+              </div>
+              <div class="featured-model-tabs" id="featuredModelTabs" role="group" aria-label="Choose an agent"></div>
+            </header>
+
+            <div class="featured-frame" id="featuredFrame" aria-busy="true">
+              <div class="featured-loading" id="featuredLoading"><span></span> Loading recorded frame</div>
+              <img id="featuredImage" alt="" hidden>
+              <div class="featured-error" id="featuredError" hidden>Screenshot unavailable</div>
+              <output class="featured-position" id="featuredPosition">Frame 1</output>
+            </div>
+
+            <div class="featured-step-copy">
+              <div>
+                <span>Agent action</span>
+                <p id="featuredAction">Loading the first recorded action</p>
+              </div>
+              <dl class="featured-run-facts">
+                <div><dt>Score</dt><dd id="featuredScore">0.000</dd></div>
+                <div><dt>Rubrics</dt><dd id="featuredRubrics">0 of 0</dd></div>
+              </dl>
+            </div>
+
+            <footer class="featured-controls">
+              <button class="featured-play" id="featuredPlay" type="button" aria-label="Play trajectory" disabled>▶ <span>Play</span></button>
+              <button class="featured-step-button" id="featuredPrevious" type="button" aria-label="Previous step" disabled>←</button>
+              <label class="featured-scrubber">
+                <span class="visually-hidden">Trajectory step</span>
+                <input id="featuredScrubber" type="range" min="1" max="1" value="1" disabled>
+              </label>
+              <button class="featured-step-button" id="featuredNext" type="button" aria-label="Next step" disabled>→</button>
+              <a class="featured-open" id="featuredOpen" href="#examples">Open full trajectory <span aria-hidden="true">↗</span></a>
+            </footer>
+          </article>
         </div>
       </section>
 
@@ -56,7 +112,7 @@
         <header class="narrative-heading">
           <p class="eyebrow">Data construction and quality</p>
           <h2 id="method-title">High-quality tasks are made, screened, and only then selected.</h2>
-          <p>The benchmark began with live, author-approved work from Turing’s reporting pipeline—not a stale task snapshot. Quality control separated whether a task was fair and verifiable from whether an agent found it difficult.</p>
+          <p>The benchmark began with live, author-approved work from Turing’s reporting pipeline rather than a stale task snapshot. Quality control separated whether a task was fair and verifiable from whether an agent found it difficult.</p>
         </header>
         <div class="construction-grid">
           <article>
@@ -116,7 +172,7 @@
       <section class="failure-section" id="failures" aria-labelledby="failure-title">
         <header class="narrative-heading">
           <p class="eyebrow">Failure analysis</p>
-          <h2 id="failure-title">The hard part is finishing the work—not merely opening the web.</h2>
+          <h2 id="failure-title">Many runs gather information but do not finish the requested work.</h2>
           <p id="failureLead">Loading failure analysis from the published judge records…</p>
         </header>
         <div class="finding-grid" id="findingGrid" aria-label="Key findings"></div>
@@ -124,7 +180,7 @@
           <div class="failure-prose">
             <h3>What the trajectories reveal</h3>
             <p>Agents often gathered useful fragments but failed to convert them into the requested comparison, plan, spreadsheet, or other final artifact. Missing fields and weak source verification were visible too, but simple page-access failures account for a much smaller portion of the recorded judge explanations.</p>
-            <p>A step limit can mark a run that was already struggling, so the relationship between capped trajectories and failed rubrics is descriptive—not proof that the cap caused the failure.</p>
+            <p>A step limit can mark a run that was already struggling, so the relationship between capped trajectories and failed rubrics is descriptive. It does not show that the cap caused the failure.</p>
           </div>
           <aside class="failure-panel">
             <header><div><p class="eyebrow">Judge-language review</p><h3>Recurring failure signals</h3></div><span id="failureTotal"></span></header>
@@ -178,6 +234,6 @@
     <span>OdysseysMega · Turing frontier agent evaluation</span>
     <a href="https://github.com/ljang0/Odysseys" target="_blank" rel="noopener">Odysseys</a>
   </footer>
-  <script type="module" src="/app.js?v=20260907f"></script>
+  <script type="module" src="/app.js?v=20260907g"></script>
 </body>
 </html>
