@@ -38,10 +38,10 @@ const FALLBACK_ANALYSIS = {
 const FEATURED_TASK_IDS = {
   "gpt-5.6-sol": {
     lower: [
-      "v2/shahzan-t-turing-com/internal/task-5a286a94-20260814T092143",
-      "v2/onkar-y-turing-com/internal/task-38ea1f2e-20260813T055511",
-      "v2/naidu-s1-turing-com/internal/task-eb156bba-20260824T100415",
-      "v2/abhinav-m-turing-com/internal/task-48305bcd-20260817T214300",
+      "v2/shahzan-t-turing-com/internal/task-d46b56f0-20260813T114702",
+      "v2/olmir-n-turing-com/internal/task-cd916902-20260817T220649",
+      "v2/olmir-n-turing-com/internal/task-f4065cc6-20260817T221239",
+      "v2/lucas-b4-turing-com/internal/task-e65e9fc3-20260814T211730",
     ],
     strong: [
       "v2/panwaranubhav07-gmail-com/internal/task-a254d056-20260815T153522",
@@ -52,10 +52,10 @@ const FEATURED_TASK_IDS = {
   },
   "claude-opus-5": {
     lower: [
-      "v2/panwaranubhav07-gmail-com/internal/task-a254d056-20260815T153522",
-      "v2/panwaranubhav07-gmail-com/internal/task-bfb2e860-20260816T194044",
-      "v2/riya-g5-turing-com/internal/task-dd1993d2-20260817T194718",
-      "v2/emmanuel-r1-turing-com/internal/task-b853c070-20260817T195059",
+      "v2/onkar-y-turing-com/internal/task-3bf797b1-20260818T090144",
+      "v2/sufiyan-k-turing-com/internal/task-2ef32c40-20260818T093351",
+      "v2/felipe-p1-turing-com/internal/task-f7adbfe4-20260817T151330",
+      "v2/lucas-b4-turing-com/internal/task-0eb0453c-20260817T223339",
     ],
     strong: [
       "v2/panwaranubhav07-gmail-com/internal/task-019806cd-20260817T183415",
@@ -406,8 +406,8 @@ function pickFeaturedTasks() {
   const selected = ids.map((taskId) => tasks.find((task) => task.task_id === taskId))
     .filter((task) => task?.runs[featuredModel]);
   const isMatch = (task) => {
-    const score = task.runs[featuredModel]?.score;
-    return featuredOutcome === "lower" ? score <= 0.35 : score >= 0.85;
+    const run = task.runs[featuredModel];
+    return featuredOutcome === "lower" ? run?.score <= 0.35 && run.steps >= 20 : run?.score >= 0.85;
   };
   const fallback = tasks.filter((task) => isMatch(task) && !selected.includes(task))
     .sort((left, right) => {
@@ -434,7 +434,7 @@ function renderFeaturedTaskOptions() {
     return `<button type="button" data-task-id="${escapeHtml(task.task_id)}" aria-pressed="false">
       <span>${String(index + 1).padStart(2, "0")} · ${escapeHtml(task.category || "Web research")}</span>
       <strong>${escapeHtml(compactCopy(task.title || task.request, 88))}</strong>
-      <small><b>${run.score.toFixed(3)}</b> score · ${escapeHtml(run.rubrics_passed.replace("/", " of "))} rubrics</small>
+      <small><b>${run.score.toFixed(3)}</b> score · ${run.steps} steps · ${escapeHtml(run.rubrics_passed.replace("/", " of "))} rubrics</small>
     </button>`;
   }).join("");
   featuredElements.select.innerHTML = featuredTasks.map((task) => {
@@ -449,7 +449,7 @@ function refreshFeaturedTasks() {
   renderFeaturedOutcomeTabs();
   renderFeaturedTaskOptions();
   featuredElements.agent.textContent = featuredLabel(featuredModel);
-  featuredElements.outcome.textContent = featuredOutcome === "lower" ? "Mostly failed" : "Strong run";
+  featuredElements.outcome.textContent = featuredOutcome === "lower" ? "Task failure" : "Strong run";
   if (featuredTasks.length) selectFeaturedTask(featuredTasks[0].task_id);
 }
 

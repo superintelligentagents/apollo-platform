@@ -6,7 +6,7 @@
   <meta name="description" content="Explore 100 difficult browser-agent tasks, model scores, rubric verdicts, and every recorded trajectory step.">
   <title>OdysseysMega | Turing agent evaluation</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Cpath d=%27M18 24h64v16H58v42H42V40H18z%27 fill=%27%232f6fb3%27/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/style.css?v=20260907k">
+  <link rel="stylesheet" href="/style.css?v=20260907l">
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to benchmark</a>
@@ -57,7 +57,7 @@
         <header class="narrative-heading showcase-heading">
           <p class="eyebrow">Trajectory examples</p>
           <h2 id="examples-title">A few trajectories from the benchmark</h2>
-          <p>Lower-scoring runs are shown first because they make the benchmark difficulty easier to inspect. You can switch to stronger runs and compare the two agents.</p>
+          <p>The failure view uses sustained attempts with at least 20 recorded steps. These runs miss task requirements after doing real research. Examples dominated by login, loading, access, or environment problems are left out.</p>
         </header>
 
         <div class="featured-filterbar" aria-label="Trajectory filters">
@@ -68,7 +68,7 @@
           <div>
             <span>Result</span>
             <div class="featured-outcome-tabs" id="featuredOutcomeTabs" role="group" aria-label="Choose a run result">
-              <button class="active" type="button" data-featured-outcome="lower" aria-pressed="true">Mostly failed</button>
+              <button class="active" type="button" data-featured-outcome="lower" aria-pressed="true">Task failures</button>
               <button type="button" data-featured-outcome="strong" aria-pressed="false">Strong runs</button>
             </div>
           </div>
@@ -87,7 +87,7 @@
                 <p class="eyebrow" id="featuredCategory">Loading example</p>
                 <h3 id="featuredTitle">Loading trajectory</h3>
               </div>
-              <div class="featured-run-label"><span id="featuredAgent">sol</span><strong id="featuredOutcome">Mostly failed</strong></div>
+              <div class="featured-run-label"><span id="featuredAgent">sol</span><strong id="featuredOutcome">Task failure</strong></div>
             </header>
 
             <div class="featured-evidence-grid">
@@ -261,6 +261,6 @@
     <span>OdysseysMega · Turing frontier agent evaluation</span>
     <a href="https://github.com/ljang0/Odysseys" target="_blank" rel="noopener">Odysseys</a>
   </footer>
-  <script type="module" src="/app.js?v=20260907k"></script>
+  <script type="module" src="/app.js?v=20260907l"></script>
 </body>
 </html>
