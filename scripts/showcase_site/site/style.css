@@ -1,0 +1,44 @@
+:root{--bg:#fff;--fg:#111;--mut:#666;--line:#e5e5e5;--ok:#0a7d3f;--no:#b00020}
+@media(prefers-color-scheme:dark){:root{--bg:#111;--fg:#eee;--mut:#999;--line:#2a2a2a;--ok:#4caf7d;--no:#e57373}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:15px/1.6 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+a{color:inherit}
+.wrap{max-width:900px;margin:0 auto;padding:40px 20px 100px}
+h1{font-size:20px;font-weight:600;margin:0 0 4px}
+h2{font-size:15px;font-weight:600;margin:32px 0 10px}
+p.sub{color:var(--mut);font-size:14px;margin:0 0 24px;max-width:70ch}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{text-align:left;font-weight:500;color:var(--mut);font-size:13px;
+padding:6px 8px;border-bottom:1px solid var(--line);cursor:pointer}
+th.n,td.n{text-align:right;font-variant-numeric:tabular-nums}
+td{padding:8px;border-bottom:1px solid var(--line)}
+tr:hover td{background:rgba(128,128,128,.06)}
+input,select{background:var(--bg);color:var(--fg);border:1px solid var(--line);
+border-radius:4px;padding:6px 9px;font:inherit;font-size:14px}
+input{width:280px}
+.row{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.stats{display:flex;gap:28px;flex-wrap:wrap;margin:0 0 28px;font-size:14px}
+.stats div{color:var(--mut)}
+.stats b{display:block;color:var(--fg);font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
+.req{white-space:pre-wrap;font-size:14px;margin:0 0 8px}
+.g{border-bottom:1px solid var(--line);padding:12px 0}
+.g:last-child{border-bottom:0}
+.g .s{font-size:12px;font-weight:600}
+.s.SUCCESS{color:var(--ok)}.s.FAILURE{color:var(--no)}.s.ERROR{color:var(--mut)}
+.g .r{margin:4px 0}
+.g .w{color:var(--mut);font-size:13px;white-space:pre-wrap}
+.step{border-bottom:1px solid var(--line);padding:16px 0}
+.step .h{font-size:12px;color:var(--mut);margin-bottom:6px}
+.step pre{margin:0 0 8px;white-space:pre-wrap;word-break:break-word;
+font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
+.step img{width:100%;border:1px solid var(--line);display:block}
+.mut{color:var(--mut)}
+.back{font-size:14px;color:var(--mut);text-decoration:none;display:inline-block;margin-bottom:20px}
+nav{font-size:13px;color:var(--mut);margin-bottom:20px}
+td a{text-decoration:none;border-bottom:1px solid var(--line)}
+td a:hover{border-bottom-color:currentColor}
+.capslot{display:inline-block;width:30px;text-align:left;font-style:normal}
+.cap{font-size:10px;color:var(--mut);border:1px solid var(--line);border-radius:3px;
+padding:0 3px;margin-left:6px;vertical-align:1px}
+td.n{white-space:nowrap}

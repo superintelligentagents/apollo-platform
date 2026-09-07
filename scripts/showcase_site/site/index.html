@@ -1,0 +1,24 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Apollo hard-100</title><link rel="stylesheet" href="/style.css"></head><body>
+<div class="wrap">
+  <h1>Apollo hard-100</h1>
+  <p class="sub" id="sub"></p>
+  <div class="stats" id="stats"></div>
+  <div class="row">
+    <input id="q" placeholder="Search tasks">
+    <select id="cat"><option value="">All categories</option></select>
+    <select id="filt">
+      <option value="">All tasks</option>
+      <option value="cap">Opus hit the step cap</option>
+      <option value="nocap">Opus finished in budget</option>
+    </select>
+  </div>
+  <table><thead><tr>
+    <th data-k="title">Task</th>
+    <th class="n" data-k="baseline_luna">luna</th>
+    <th class="n" data-k="opus">Opus 5</th>
+    <th class="n" data-k="sol">sol</th>
+  </tr></thead><tbody id="rows"></tbody></table>
+</div>
+<script type="module" src="/app.js"></script></body></html>
