@@ -26,6 +26,17 @@ and writes `index.json` plus one file per run. Screenshots are referenced by S3
 key and never copied — the runs hold ~13,000 frames and about a gigabyte, which
 no deployment should carry.
 
+## Run it locally
+
+```bash
+scripts/showcase_site/serve_local.py          # http://127.0.0.1:8791
+```
+
+Stands in for the two things Vercel does that a plain static server does not:
+resolves `/task` and `/run` to their HTML, and signs screenshots via `/api/shot`
+using the AWS CLI. Without it a local preview shows every trajectory with blank
+frames. Needs AWS credentials that can read `v2-review/trajectory-runs/*`.
+
 ## Deploy
 
 The site is plain HTML/JS with one serverless function; there is no build step.
