@@ -15,6 +15,7 @@ import argparse
 import http.server
 import os
 import re
+import shutil
 import socketserver
 import subprocess
 import urllib.parse
@@ -22,7 +23,11 @@ from pathlib import Path
 
 SITE = Path(__file__).resolve().parent / "site"
 BUCKET = os.environ.get("SHOWCASE_BUCKET", "journeys-prolific")
-AWS = os.environ.get("AWS_CLI", "/data/user_data/ljang/apollo-osworld/bin/aws")
+AWS = (
+    os.environ.get("AWS_CLI")
+    or shutil.which("aws")
+    or "/data/user_data/ljang/apollo-osworld/bin/aws"
+)
 # Mirrors the deployed function: only trajectory screenshots may be signed.
 ALLOWED = re.compile(
     r"^v2-review/trajectory-runs/[A-Za-z0-9_-]+/[a-f0-9]{16,40}/screens/\d{1,6}\.(png|jpg|jpeg|webp)$"

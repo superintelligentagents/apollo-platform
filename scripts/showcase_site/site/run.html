@@ -1,10 +1,127 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Trajectory — Apollo hard-100</title><link rel="stylesheet" href="/style.css"></head><body>
-<div class="wrap">
-  <a class="back" id="back" href="/">← Back</a>
-  <h1 id="title">…</h1>
-  <nav id="meta"></nav>
-  <div id="steps"></div>
-</div>
-<script type="module" src="/run.js"></script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Step through a recorded OdysseysMega browser-agent trajectory frame by frame.">
+  <title>Trajectory — OdysseysMega</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Cpath d=%27M18 24h64v16H58v42H42V40H18z%27 fill=%27%232f6fb3%27/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css?v=20260907e">
+</head>
+<body class="run-body">
+  <a class="skip-link" href="#main">Skip to trajectory</a>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="OdysseysMega home">
+      <span class="turing-wordmark">TURING</span>
+      <span class="brand-divider" aria-hidden="true"></span>
+      <span class="brand-name">OdysseysMega</span>
+    </a>
+    <span class="site-context">trajectory viewer</span>
+  </header>
+
+  <main class="run-page" id="main" tabindex="-1">
+    <header class="run-heading">
+      <div class="run-heading-copy">
+        <a class="back-link" id="back" href="/"><span aria-hidden="true">←</span> Back</a>
+        <p class="eyebrow">Recorded browser path</p>
+        <h1 id="title">Loading trajectory…</h1>
+        <p class="run-task-title" id="taskTitle"></p>
+      </div>
+      <div class="run-summary" id="meta" aria-label="Run summary"></div>
+    </header>
+
+    <section class="run-picker" id="runPicker" aria-label="Choose a trajectory">
+      <label>
+        <span>Task</span>
+        <select id="taskPicker" aria-label="Choose another task"></select>
+      </label>
+      <label>
+        <span>Agent</span>
+        <select id="modelPicker" aria-label="Choose another agent"></select>
+      </label>
+    </section>
+
+    <details class="task-reference" id="taskReference">
+      <summary>
+        <span class="task-reference-title">Task prompt</span>
+        <span class="task-reference-preview" id="promptPreview"></span>
+        <span class="summary-toggle" aria-hidden="true">⌄</span>
+      </summary>
+      <p id="prompt"></p>
+    </details>
+
+    <section class="trajectory-workbench" id="workbench" aria-label="Trajectory slideshow">
+      <section class="trajectory-evidence-pane" aria-label="Recorded browser frames">
+        <header class="pane-title">
+          <div><span class="status-dot" aria-hidden="true"></span>Recorded browser frame</div>
+          <div class="step-controls">
+            <button class="icon-button" id="previousStep" type="button" aria-label="Previous step" title="Previous step (Left arrow)">←</button>
+            <output class="step-position" id="stepPosition" aria-live="polite">— / —</output>
+            <button class="icon-button" id="nextStep" type="button" aria-label="Next step" title="Next step (Right arrow)">→</button>
+          </div>
+        </header>
+
+        <div class="playback-bar" aria-label="Slideshow playback">
+          <button class="play-button" id="playPause" type="button" aria-label="Play trajectory">▶ <span>Play</span></button>
+          <label class="scrubber-label" for="stepScrubber"><span class="visually-hidden">Trajectory step</span>
+            <input id="stepScrubber" type="range" min="1" max="1" value="1">
+          </label>
+          <label class="speed-control" for="playbackSpeed"><span>Speed</span>
+            <select id="playbackSpeed">
+              <option value="1800">1×</option>
+              <option value="950">2×</option>
+              <option value="500">4×</option>
+            </select>
+          </label>
+        </div>
+        <div class="trajectory-progress" aria-hidden="true"><span id="trajectoryProgress"></span></div>
+
+        <div class="trajectory-shot-stage" id="shotStage">
+          <div class="shot-loading" id="shotLoading" role="status"><span></span>Signing screenshot…</div>
+          <img class="trajectory-screenshot" id="screenshot" alt="" hidden>
+          <div class="trajectory-no-image" id="noScreenshot" hidden>Screenshot unavailable for this step.</div>
+          <a class="full-size-link" id="fullSize" href="#" target="_blank" rel="noopener" hidden>Open full size ↗</a>
+        </div>
+      </section>
+
+      <aside class="trajectory-inspector" aria-label="Trajectory details">
+        <div class="inspector-tabs" role="tablist" aria-label="Inspector view">
+          <button class="inspector-tab active" id="stepTab" type="button" role="tab" aria-selected="true" aria-controls="stepPanel">Current step</button>
+          <button class="inspector-tab" id="rubricTab" type="button" role="tab" aria-selected="false" aria-controls="rubricPanel">Rubrics</button>
+        </div>
+
+        <section class="inspector-panel step-panel" id="stepPanel" role="tabpanel" aria-labelledby="stepTab">
+          <header class="inspector-heading"><p class="eyebrow">Current frame</p><h2 id="stepTitle">Step —</h2></header>
+          <section class="rubric-progress-card" aria-labelledby="rubric-progress-title">
+            <div class="rubric-progress-head">
+              <h3 id="rubric-progress-title">Rubric evidence score</h3>
+              <output id="scoreAtStep">0.000</output>
+            </div>
+            <svg class="score-timeline" id="scoreTimeline" viewBox="0 0 300 58" role="img" aria-label="Rubric evidence score over trajectory steps"></svg>
+            <div class="rubric-progress-meta"><span id="progressRubrics">0 supported</span><span id="finalRubricScore">final —</span></div>
+            <p>Derived from the earliest step cited by the final judge; uncited passes resolve at the last step.</p>
+          </section>
+          <section class="detail-block response-block"><h3>Agent response</h3><div class="agent-response" id="stepResponse"></div></section>
+          <section class="detail-block action-block"><h3>Action</h3><pre class="step-action" id="stepAction"></pre></section>
+          <div class="shortcut-note" aria-label="Keyboard shortcuts">
+            <span><kbd>←</kbd><kbd>→</kbd> move</span>
+            <span><kbd>Home</kbd><kbd>End</kbd> jump</span>
+          </div>
+        </section>
+
+        <section class="inspector-panel rubric-panel" id="rubricPanel" role="tabpanel" aria-labelledby="rubricTab" hidden>
+          <header class="inspector-heading"><p class="eyebrow">Judge results</p><h2 id="rubricTitle">Rubric verdicts</h2></header>
+          <div class="rubric-list" id="rubrics"></div>
+        </section>
+      </aside>
+    </section>
+
+    <div class="error-state" id="runError" hidden>
+      <strong>Trajectory unavailable</strong>
+      <p id="runErrorMessage">The requested run could not be loaded.</p>
+      <a class="button secondary" href="/">Return to all tasks</a>
+    </div>
+  </main>
+  <script type="module" src="/run.js?v=20260907e"></script>
+</body>
+</html>

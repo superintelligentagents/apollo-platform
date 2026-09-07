@@ -1,65 +1,147 @@
-const fmt = (v) => (v === null || v === undefined ? "—" : v.toFixed(3));
-const data = await (await fetch("/data/index.json")).json();
-const tasks = data.tasks;
+const fmt = (value) => value === null || value === undefined ? "—" : value.toFixed(3);
+const mean = (values) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+}[character]));
 
-document.getElementById("sub").textContent =
-  `100 tasks where a weak agent scored below 0.35, screened for fairness and spread across the ` +
-  `SimilarWeb taxonomy. Both models run on their own upstream prompt with a ${data.max_steps}-step ` +
-  `budget, judged by ${data.judge} on every screenshot.`;
+let tasks = [];
+let dataset;
+let visibleLimit = 24;
+let sort = { key: "title", direction: 1 };
 
-const mean = (xs) => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
-const scores = (m) => tasks.filter((t) => t.runs[m]).map((t) => t.runs[m].score);
-const both = tasks.filter((t) => t.runs["claude-opus-5"] && t.runs["gpt-5.6-sol"]);
-document.getElementById("stats").innerHTML = `
-  <div><b>${fmt(mean(scores("claude-opus-5")))}</b>Opus 5 · ${scores("claude-opus-5").length} runs</div>
-  <div><b>${fmt(mean(scores("gpt-5.6-sol")))}</b>sol · ${scores("gpt-5.6-sol").length} runs</div>
-  <div><b>${fmt(mean(tasks.map((t) => t.baseline_luna ?? 0)))}</b>luna baseline</div>
-  <div><b>${both.filter((t) => t.runs["claude-opus-5"].truncated).length}</b>of ${both.length} truncated at the cap</div>`;
-
-const cats = [...new Set(tasks.map((t) => t.category).filter(Boolean))].sort();
-document.getElementById("cat").insertAdjacentHTML("beforeend",
-  cats.map((c) => `<option>${c}</option>`).join(""));
-
-let sort = { k: "title", dir: 1 };
-const val = (t, k) => k === "opus" ? (t.runs["claude-opus-5"]?.score ?? -1)
-  : k === "sol" ? (t.runs["gpt-5.6-sol"]?.score ?? -1)
-  : k === "baseline_luna" ? (t.baseline_luna ?? -1) : (t.title || "").toLowerCase();
-
-function cell(t, m) {
-  const r = t.runs[m];
-  if (!r) return `<td class="n mut">—</td>`;
-  // The cap is why a low score may not be a low capability, so it is shown
-  // beside the number rather than buried in the run page.
-  // The badge sits in a fixed slot so the numbers stay in one column whether
-  // or not a run was truncated.
-  const cap = r.truncated ? `<span class="cap" title="stopped at the step cap">cap</span>` : "";
-  return `<td class="n"><a href="/run?id=${r.run}">${r.score.toFixed(3)}</a><i class="capslot">${cap}</i></td>`;
+function modelScores(model) {
+  return tasks.filter((task) => task.runs[model]).map((task) => task.runs[model].score);
 }
 
-function render() {
-  const q = document.getElementById("q").value.toLowerCase();
-  const c = document.getElementById("cat").value;
-  const f = document.getElementById("filt").value;
-  const rows = tasks.filter((t) =>
-    (!q || (t.title + t.task_id).toLowerCase().includes(q)) &&
-    (!c || t.category === c) &&
-    (!f || (f === "cap" ? t.runs["claude-opus-5"]?.truncated : t.runs["claude-opus-5"] && !t.runs["claude-opus-5"].truncated))
+function renderOverview() {
+  const opusScores = modelScores("claude-opus-5");
+  const solScores = modelScores("gpt-5.6-sol");
+  const totalRuns = opusScores.length + solScores.length;
+  const bestMean = Math.max(mean(opusScores), mean(solScores));
+
+  document.getElementById("sub").textContent =
+    `${tasks.length} screened, long-horizon tasks test whether agents can research, compare, and act across real websites. ` +
+    `Each agent receives the same ${dataset.max_steps}-step budget. A separate judge scores every requirement against the complete visual record.`;
+  document.getElementById("heroMetric").innerHTML = `
+    <strong>${fmt(bestMean)}</strong>
+    <span>best mean rubric score</span>`;
+  document.getElementById("stats").innerHTML = `
+    <div><strong>${tasks.length}</strong><span>hard tasks</span></div>
+    <div><strong>${Object.keys(dataset.models).length}</strong><span>frontier agents</span></div>
+    <div><strong>${totalRuns}</strong><span>recorded runs</span></div>
+    <div><strong>${dataset.max_steps}</strong><span>steps / run</span></div>`;
+
+  const categories = [...new Set(tasks.map((task) => task.category).filter(Boolean))].sort();
+  document.getElementById("categoryCount").textContent = `${categories.length} categories`;
+  document.getElementById("cat").insertAdjacentHTML("beforeend",
+    categories.map((category) => `<option>${escapeHtml(category)}</option>`).join(""));
+
+  const distribution = categories.map((category) => ({
+    category,
+    count: tasks.filter((task) => task.category === category).length,
+  })).sort((a, b) => b.count - a.count || a.category.localeCompare(b.category));
+  const largestCategory = Math.max(...distribution.map((item) => item.count));
+  document.getElementById("distribution").innerHTML = distribution.map((item) => `
+    <div class="distribution-row">
+      <div class="distribution-label"><span>${escapeHtml(item.category)}</span><strong>${item.count}</strong></div>
+      <div class="distribution-track"><span style="width:${(item.count / largestCategory) * 100}%"></span></div>
+    </div>`).join("");
+
+  const agents = [
+    {
+      label: dataset.models["gpt-5.6-sol"],
+      note: `${solScores.length} runs · ${tasks.filter((task) => task.runs["gpt-5.6-sol"]?.truncated).length} reached the cap`,
+      score: mean(solScores),
+    },
+    {
+      label: dataset.models["claude-opus-5"],
+      note: `${opusScores.length} runs · ${tasks.filter((task) => task.runs["claude-opus-5"]?.truncated).length} reached the cap`,
+      score: mean(opusScores),
+    },
+  ];
+  document.getElementById("agentList").innerHTML = agents.map((agent) => `
+    <div class="agent-row">
+      <div><strong>${escapeHtml(agent.label)}</strong><span>${escapeHtml(agent.note)}</span></div>
+      <b>${fmt(agent.score)}</b>
+      <div class="agent-track"><span style="width:${agent.score * 100}%"></span></div>
+    </div>`).join("");
+}
+
+function sortValue(task, key) {
+  if (key === "opus") return task.runs["claude-opus-5"]?.score ?? -1;
+  if (key === "sol") return task.runs["gpt-5.6-sol"]?.score ?? -1;
+  return (task.title || task.task_id).toLowerCase();
+}
+
+function scoreItem(task, model, shortLabel) {
+  const run = task.runs[model];
+  if (!run) return `<div class="task-score empty"><span>${shortLabel}</span><strong>—</strong><small>No run</small></div>`;
+  const cap = run.truncated ? `<em title="Stopped at the ${dataset.max_steps}-step limit">cap</em>` : "";
+  return `<a class="task-score" href="/run?id=${encodeURIComponent(run.run)}" aria-label="Watch ${escapeHtml(dataset.models[model])} trajectory, score ${run.score.toFixed(3)}">
+    <span>${escapeHtml(shortLabel)} ${cap}</span>
+    <strong>${run.score.toFixed(3)}</strong>
+    <small>Watch trajectory →</small>
+  </a>`;
+}
+
+function renderTasks({ resetLimit = false } = {}) {
+  if (resetLimit) visibleLimit = 24;
+  const query = document.getElementById("q").value.trim().toLowerCase();
+  const category = document.getElementById("cat").value;
+  const visibleTasks = tasks.filter((task) =>
+    (!query || `${task.title} ${task.task_id} ${task.category}`.toLowerCase().includes(query)) &&
+    (!category || task.category === category)
   ).sort((a, b) => {
-    const x = val(a, sort.k), y = val(b, sort.k);
-    return (x < y ? -1 : x > y ? 1 : 0) * sort.dir;
+    const left = sortValue(a, sort.key);
+    const right = sortValue(b, sort.key);
+    return (left < right ? -1 : left > right ? 1 : 0) * sort.direction;
   });
-  document.getElementById("rows").innerHTML = rows.map((t) => `
-    <tr>
-      <td><a href="/task?id=${encodeURIComponent(t.task_id)}">${t.title || t.task_id}</a>
-        <div class="mut" style="font-size:12px">${t.category || ""}</div></td>
-      <td class="n mut">${fmt(t.baseline_luna)}</td>
-      ${cell(t, "claude-opus-5")}${cell(t, "gpt-5.6-sol")}
-    </tr>`).join("") || `<tr><td colspan="4" class="mut">No tasks match.</td></tr>`;
+  const shownTasks = visibleTasks.slice(0, visibleLimit);
+
+  document.getElementById("resultCount").textContent = visibleTasks.length > shownTasks.length
+    ? `${shownTasks.length} shown · ${visibleTasks.length} matches`
+    : `${visibleTasks.length} task${visibleTasks.length === 1 ? "" : "s"}`;
+  document.getElementById("rows").innerHTML = shownTasks.map((task) => `
+    <article class="task-card">
+      <div class="task-card-meta"><span>${escapeHtml(task.category || "Uncategorized")}</span><span>${task.rubric_count} rubrics</span></div>
+      <h3><a class="task-link" href="/task?id=${encodeURIComponent(task.task_id)}">${escapeHtml(task.title || task.task_id)}</a></h3>
+      <div class="task-scores">
+        ${scoreItem(task, "claude-opus-5", "Opus 5")}
+        ${scoreItem(task, "gpt-5.6-sol", "sol")}
+      </div>
+      <a class="task-detail-link" href="/task?id=${encodeURIComponent(task.task_id)}">Task prompt and rubrics <span aria-hidden="true">→</span></a>
+    </article>`).join("") || `<div class="table-state">No tasks match these filters.</div>`;
+
+  const hasMore = shownTasks.length < visibleTasks.length;
+  document.getElementById("loadMoreWrap").hidden = !hasMore;
+  document.getElementById("showMore").textContent = hasMore
+    ? `Show ${Math.min(24, visibleTasks.length - shownTasks.length)} more tasks`
+    : "Show more tasks";
 }
-document.querySelectorAll("th[data-k]").forEach((th) => th.onclick = () => {
-  const k = th.dataset.k;
-  sort = { k, dir: sort.k === k ? -sort.dir : (k === "title" ? 1 : -1) };
-  render();
-});
-["q", "cat", "filt"].forEach((id) => document.getElementById(id).oninput = render);
-render();
+
+async function init() {
+  try {
+    const response = await fetch("/data/index.json");
+    if (!response.ok) throw new Error(`Dataset request failed (${response.status})`);
+    dataset = await response.json();
+    tasks = dataset.tasks;
+    renderOverview();
+    renderTasks();
+
+    ["q", "cat"].forEach((id) => document.getElementById(id).addEventListener("input", () => renderTasks({ resetLimit: true })));
+    document.getElementById("sortBy").addEventListener("change", (event) => {
+      sort = { key: event.target.value, direction: event.target.value === "title" ? 1 : -1 };
+      renderTasks({ resetLimit: true });
+    });
+    document.getElementById("showMore").addEventListener("click", () => {
+      visibleLimit += 24;
+      renderTasks();
+    });
+  } catch (error) {
+    document.getElementById("sub").textContent = "The dataset could not be loaded. Refresh the page to try again.";
+    document.getElementById("stats").innerHTML = "";
+    document.getElementById("rows").innerHTML = `<div class="table-state error">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+init();

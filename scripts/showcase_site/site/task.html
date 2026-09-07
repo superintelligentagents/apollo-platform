@@ -1,12 +1,56 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Task — Apollo hard-100</title><link rel="stylesheet" href="/style.css"></head><body>
-<div class="wrap">
-  <a class="back" href="/">← All tasks</a>
-  <h1 id="title">…</h1>
-  <nav id="meta"></nav>
-  <h2>Request</h2>
-  <div class="req" id="req"></div>
-  <div id="runs"></div>
-</div>
-<script type="module" src="/task.js"></script></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Task prompt, model runs, and rubric judgments from the OdysseysMega benchmark.">
+  <title>Task — OdysseysMega</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Cpath d=%27M18 24h64v16H58v42H42V40H18z%27 fill=%27%232f6fb3%27/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css?v=20260907e">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to task</a>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="OdysseysMega home">
+      <span class="turing-wordmark">TURING</span>
+      <span class="brand-divider" aria-hidden="true"></span>
+      <span class="brand-name">OdysseysMega</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary navigation"><a href="/">All tasks</a></nav>
+  </header>
+
+  <main class="content-width detail-page" id="main">
+    <a class="back-link" href="/"><span aria-hidden="true">←</span> All tasks</a>
+    <header class="detail-heading">
+      <p class="eyebrow">Benchmark task</p>
+      <h1 id="title">Loading task…</h1>
+      <div class="meta-row" id="meta" aria-label="Task metadata"></div>
+    </header>
+
+    <details class="prompt-panel">
+      <summary>
+        <span>Task prompt</span>
+        <span class="summary-hint">The exact request given to the agents</span>
+      </summary>
+      <div class="request-copy" id="req"></div>
+    </details>
+
+    <section class="comparison-section" aria-labelledby="comparison-title">
+      <header class="section-head">
+        <div>
+          <p class="eyebrow">Side-by-side evidence</p>
+          <h2 id="comparison-title">Agent trajectories</h2>
+          <p>Both recorded runs load below. Play or scrub them independently, then open the focused viewer for step details.</p>
+        </div>
+      </header>
+      <div class="run-grid" id="runs"><div class="loading-card">Loading model runs…</div></div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <span>OdysseysMega · Turing frontier agent evaluation</span>
+    <a href="https://github.com/ljang0/Odysseys" target="_blank" rel="noopener">Odysseys</a>
+  </footer>
+  <script type="module" src="/task.js?v=20260907e"></script>
+</body>
+</html>
