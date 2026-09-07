@@ -35,12 +35,36 @@ const FALLBACK_ANALYSIS = {
   },
 };
 
-const FEATURED_TASK_IDS = [
-  "v2/riya-g5-turing-com/internal/task-dd1993d2-20260817T194718",
-  "v2/emmanuel-r1-turing-com/internal/task-b853c070-20260817T195059",
-  "v2/panwaranubhav07-gmail-com/internal/task-a254d056-20260815T153522",
-  "v2/panwaranubhav07-gmail-com/internal/task-019806cd-20260817T183415",
-];
+const FEATURED_TASK_IDS = {
+  "gpt-5.6-sol": {
+    lower: [
+      "v2/shahzan-t-turing-com/internal/task-5a286a94-20260814T092143",
+      "v2/onkar-y-turing-com/internal/task-38ea1f2e-20260813T055511",
+      "v2/naidu-s1-turing-com/internal/task-eb156bba-20260824T100415",
+      "v2/abhinav-m-turing-com/internal/task-48305bcd-20260817T214300",
+    ],
+    strong: [
+      "v2/panwaranubhav07-gmail-com/internal/task-a254d056-20260815T153522",
+      "v2/panwaranubhav07-gmail-com/internal/task-611aacfe-20260818T184711",
+      "v2/emmanuel-r1-turing-com/internal/task-b853c070-20260817T195059",
+      "v2/lucas-b4-turing-com/internal/task-f2557462-20260814T225918",
+    ],
+  },
+  "claude-opus-5": {
+    lower: [
+      "v2/panwaranubhav07-gmail-com/internal/task-a254d056-20260815T153522",
+      "v2/panwaranubhav07-gmail-com/internal/task-bfb2e860-20260816T194044",
+      "v2/riya-g5-turing-com/internal/task-dd1993d2-20260817T194718",
+      "v2/emmanuel-r1-turing-com/internal/task-b853c070-20260817T195059",
+    ],
+    strong: [
+      "v2/panwaranubhav07-gmail-com/internal/task-019806cd-20260817T183415",
+      "v2/mukund-m1-turing-com/internal/task-b31f013b-20260817T090858",
+      "v2/olmir-n-turing-com/internal/task-94f94f83-20260828T203954",
+      "v2/onkar-y-turing-com/internal/task-38ea1f2e-20260813T055511",
+    ],
+  },
+};
 
 let tasks = [];
 let dataset;
@@ -49,7 +73,10 @@ let sort = { key: "title", direction: 1 };
 let featuredTasks = [];
 let featuredTask;
 let featuredModel = "gpt-5.6-sol";
+let featuredOutcome = "lower";
 let featuredRun;
+let featuredRubricProgress = [];
+let featuredRubricMilestones = [];
 let featuredStepIndex = 0;
 let featuredRunLoadId = 0;
 let featuredImageLoadId = 0;
@@ -65,6 +92,9 @@ const featuredElements = {
   category: document.getElementById("featuredCategory"),
   title: document.getElementById("featuredTitle"),
   modelTabs: document.getElementById("featuredModelTabs"),
+  outcomeTabs: document.getElementById("featuredOutcomeTabs"),
+  agent: document.getElementById("featuredAgent"),
+  outcome: document.getElementById("featuredOutcome"),
   frame: document.getElementById("featuredFrame"),
   loading: document.getElementById("featuredLoading"),
   image: document.getElementById("featuredImage"),
@@ -73,6 +103,11 @@ const featuredElements = {
   action: document.getElementById("featuredAction"),
   score: document.getElementById("featuredScore"),
   rubrics: document.getElementById("featuredRubrics"),
+  evidenceScore: document.getElementById("featuredEvidenceScore"),
+  finalScore: document.getElementById("featuredFinalScore"),
+  scoreTimeline: document.getElementById("featuredScoreTimeline"),
+  rubricMeta: document.getElementById("featuredRubricMeta"),
+  rubricList: document.getElementById("featuredRubricList"),
   play: document.getElementById("featuredPlay"),
   previous: document.getElementById("featuredPrevious"),
   next: document.getElementById("featuredNext"),
@@ -235,6 +270,69 @@ function preloadFeaturedNext() {
   image.src = `/api/shot?key=${encodeURIComponent(next.screenshot_key)}`;
 }
 
+function buildFeaturedRubricProgress() {
+  const scoredGrades = featuredRun.grades.filter((grade) => ["SUCCESS", "FAILURE"].includes(grade.status));
+  const finalStep = Number(featuredRun.trajectory.at(-1)?.step || featuredRun.steps || 1);
+  featuredRubricMilestones = scoredGrades.map((grade) => {
+    if (grade.status !== "SUCCESS") return { grade, milestone: null };
+    const citedSteps = [...String(grade.reasoning || "").matchAll(/\b(?:steps?|screenshots?)\s*#?\s*(\d+)/gi)]
+      .map((match) => Number(match[1]))
+      .filter((step) => step >= 1 && step <= finalStep);
+    return { grade, milestone: citedSteps.length ? Math.min(...citedSteps) : finalStep };
+  });
+  featuredRubricProgress = featuredRun.trajectory.map((step) => {
+    const supported = featuredRubricMilestones.filter((item) =>
+      item.grade.status === "SUCCESS" && item.milestone <= Number(step.step)).length;
+    return { supported, score: scoredGrades.length ? supported / scoredGrades.length : 0 };
+  });
+
+  const width = 300;
+  const height = 58;
+  const pad = 5;
+  const points = featuredRubricProgress.map((item, index) => ({
+    x: pad + (index / Math.max(1, featuredRubricProgress.length - 1)) * (width - pad * 2),
+    y: height - pad - item.score * (height - pad * 2),
+  }));
+  const line = points.map((point, index) => `${index ? "L" : "M"}${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(" ");
+  const area = points.length
+    ? `${line} L${points.at(-1).x.toFixed(2)},${height - pad} L${pad},${height - pad} Z`
+    : "";
+  featuredElements.scoreTimeline.innerHTML = `
+    <line x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}" class="featured-timeline-axis"></line>
+    <line x1="${pad}" y1="${pad}" x2="${width - pad}" y2="${pad}" class="featured-timeline-guide"></line>
+    <path d="${area}" class="featured-timeline-area"></path>
+    <path d="${line}" class="featured-timeline-line"></path>
+    <circle id="featuredScoreTimelineMarker" r="4" class="featured-timeline-marker"></circle>`;
+  featuredElements.finalScore.textContent = `Final ${featuredRun.score.toFixed(3)}`;
+}
+
+function updateFeaturedRubricProgress() {
+  const item = featuredRubricProgress[featuredStepIndex];
+  const step = featuredRun.trajectory[featuredStepIndex];
+  if (!item || !step) return;
+  const width = 300;
+  const height = 58;
+  const pad = 5;
+  const x = pad + (featuredStepIndex / Math.max(1, featuredRubricProgress.length - 1)) * (width - pad * 2);
+  const y = height - pad - item.score * (height - pad * 2);
+  const marker = document.getElementById("featuredScoreTimelineMarker");
+  marker?.setAttribute("cx", x.toFixed(2));
+  marker?.setAttribute("cy", y.toFixed(2));
+  featuredElements.evidenceScore.textContent = item.score.toFixed(3);
+  featuredElements.rubricMeta.textContent = `${item.supported} of ${featuredRun.rubrics_scored} supported by this frame`;
+  featuredElements.rubricList.innerHTML = featuredRubricMilestones.map(({ grade, milestone }) => {
+    const supported = grade.status === "SUCCESS" && milestone <= Number(step.step);
+    const failed = grade.status === "FAILURE";
+    const state = supported ? "supported" : failed ? "failure" : "pending";
+    const icon = supported ? "✓" : failed ? "×" : "·";
+    const label = supported ? "Cited by this frame" : failed ? "Final fail" : "Not yet cited";
+    return `<div class="featured-rubric-row ${state}">
+      <span class="featured-rubric-icon" aria-hidden="true">${icon}</span>
+      <div><p>${escapeHtml(compactCopy(grade.requirement, 115))}</p><small>${label}</small></div>
+    </div>`;
+  }).join("");
+}
+
 function drawFeaturedStep() {
   const step = featuredRun?.trajectory[featuredStepIndex];
   if (!step) return;
@@ -245,6 +343,7 @@ function drawFeaturedStep() {
   featuredElements.next.disabled = featuredStepIndex === featuredRun.trajectory.length - 1;
   featuredElements.scrubber.value = String(featuredStepIndex + 1);
   featuredElements.scrubber.setAttribute("aria-valuetext", `Frame ${featuredStepIndex + 1} of ${featuredRun.trajectory.length}`);
+  updateFeaturedRubricProgress();
   featuredImageLoadId += 1;
   const thisLoad = featuredImageLoadId;
   featuredElements.image.hidden = true;
@@ -290,9 +389,68 @@ function updateFeaturedTaskPicker() {
 
 function renderFeaturedModelTabs() {
   featuredElements.modelTabs.innerHTML = Object.keys(dataset.models)
-    .filter((model) => featuredTask.runs[model])
     .map((model) => `<button type="button" data-featured-model="${escapeHtml(model)}" class="${model === featuredModel ? "active" : ""}" aria-pressed="${model === featuredModel}">${escapeHtml(featuredLabel(model))}</button>`)
     .join("");
+}
+
+function renderFeaturedOutcomeTabs() {
+  featuredElements.outcomeTabs.querySelectorAll("button").forEach((button) => {
+    const active = button.dataset.featuredOutcome === featuredOutcome;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
+}
+
+function pickFeaturedTasks() {
+  const ids = FEATURED_TASK_IDS[featuredModel]?.[featuredOutcome] || [];
+  const selected = ids.map((taskId) => tasks.find((task) => task.task_id === taskId))
+    .filter((task) => task?.runs[featuredModel]);
+  const isMatch = (task) => {
+    const score = task.runs[featuredModel]?.score;
+    return featuredOutcome === "lower" ? score <= 0.35 : score >= 0.85;
+  };
+  const fallback = tasks.filter((task) => isMatch(task) && !selected.includes(task))
+    .sort((left, right) => {
+      const delta = left.runs[featuredModel].score - right.runs[featuredModel].score;
+      return featuredOutcome === "lower" ? delta : -delta;
+    });
+  const usedCategories = new Set(selected.map((task) => task.category));
+  for (const task of fallback) {
+    if (selected.length >= 4) break;
+    if (usedCategories.has(task.category)) continue;
+    selected.push(task);
+    usedCategories.add(task.category);
+  }
+  for (const task of fallback) {
+    if (selected.length >= 4) break;
+    if (!selected.includes(task)) selected.push(task);
+  }
+  return selected.slice(0, 4);
+}
+
+function renderFeaturedTaskOptions() {
+  featuredElements.list.innerHTML = featuredTasks.map((task, index) => {
+    const run = task.runs[featuredModel];
+    return `<button type="button" data-task-id="${escapeHtml(task.task_id)}" aria-pressed="false">
+      <span>${String(index + 1).padStart(2, "0")} · ${escapeHtml(task.category || "Web research")}</span>
+      <strong>${escapeHtml(compactCopy(task.title || task.request, 88))}</strong>
+      <small><b>${run.score.toFixed(3)}</b> score · ${escapeHtml(run.rubrics_passed.replace("/", " of "))} rubrics</small>
+    </button>`;
+  }).join("");
+  featuredElements.select.innerHTML = featuredTasks.map((task) => {
+    const run = task.runs[featuredModel];
+    return `<option value="${escapeHtml(task.task_id)}">${run.score.toFixed(3)} · ${escapeHtml(task.category || "Web research")} · ${escapeHtml(compactCopy(task.title || task.request, 64))}</option>`;
+  }).join("");
+}
+
+function refreshFeaturedTasks() {
+  featuredTasks = pickFeaturedTasks();
+  renderFeaturedModelTabs();
+  renderFeaturedOutcomeTabs();
+  renderFeaturedTaskOptions();
+  featuredElements.agent.textContent = featuredLabel(featuredModel);
+  featuredElements.outcome.textContent = featuredOutcome === "lower" ? "Mostly failed" : "Strong run";
+  if (featuredTasks.length) selectFeaturedTask(featuredTasks[0].task_id);
 }
 
 async function loadFeaturedRun() {
@@ -314,8 +472,12 @@ async function loadFeaturedRun() {
   featuredElements.action.textContent = "Loading the recorded actions";
   featuredElements.score.textContent = reference.score.toFixed(3);
   featuredElements.rubrics.textContent = reference.rubrics_passed.replace("/", " of ");
+  featuredElements.evidenceScore.textContent = "0.000";
+  featuredElements.finalScore.textContent = `Final ${reference.score.toFixed(3)}`;
+  featuredElements.rubricMeta.textContent = "Loading rubric evidence";
+  featuredElements.rubricList.innerHTML = '<div class="featured-rubric-loading">Loading final rubric verdicts</div>';
+  featuredElements.scoreTimeline.innerHTML = "";
   featuredElements.open.href = `/run?id=${encodeURIComponent(reference.run)}`;
-  renderFeaturedModelTabs();
 
   try {
     const response = await fetch(`/data/runs/${encodeURIComponent(reference.run)}.json`);
@@ -323,6 +485,7 @@ async function loadFeaturedRun() {
     const loadedRun = await response.json();
     if (thisLoad !== featuredRunLoadId) return;
     featuredRun = loadedRun;
+    buildFeaturedRubricProgress();
     featuredElements.scrubber.max = String(featuredRun.trajectory.length);
     featuredElements.play.disabled = false;
     featuredElements.scrubber.disabled = false;
@@ -344,7 +507,6 @@ async function selectFeaturedTask(taskId) {
   const nextTask = featuredTasks.find((task) => task.task_id === taskId);
   if (!nextTask) return;
   featuredTask = nextTask;
-  if (!featuredTask.runs[featuredModel]) featuredModel = Object.keys(featuredTask.runs)[0];
   featuredElements.category.textContent = featuredTask.category || "Web research";
   featuredElements.title.textContent = compactCopy(featuredTask.title || featuredTask.request, 150);
   updateFeaturedTaskPicker();
@@ -352,24 +514,6 @@ async function selectFeaturedTask(taskId) {
 }
 
 function initTrajectoryShowcase() {
-  const preferred = FEATURED_TASK_IDS.map((taskId) => tasks.find((task) => task.task_id === taskId)).filter(Boolean);
-  const fallback = tasks.filter((task) => Object.keys(task.runs).length > 1 && !preferred.includes(task));
-  const usedCategories = new Set(preferred.map((task) => task.category));
-  for (const task of fallback) {
-    if (preferred.length >= 4) break;
-    if (usedCategories.has(task.category)) continue;
-    preferred.push(task);
-    usedCategories.add(task.category);
-  }
-  featuredTasks = preferred.slice(0, 4);
-  featuredElements.list.innerHTML = featuredTasks.map((task, index) => `
-    <button type="button" data-task-id="${escapeHtml(task.task_id)}" aria-pressed="false">
-      <span>${String(index + 1).padStart(2, "0")} · ${escapeHtml(task.category || "Web research")}</span>
-      <strong>${escapeHtml(compactCopy(task.title || task.request, 88))}</strong>
-    </button>`).join("");
-  featuredElements.select.innerHTML = featuredTasks.map((task) => `
-    <option value="${escapeHtml(task.task_id)}">${escapeHtml(task.category || "Web research")} · ${escapeHtml(compactCopy(task.title || task.request, 72))}</option>`).join("");
-
   featuredElements.list.addEventListener("click", (event) => {
     const button = event.target.closest("button[data-task-id]");
     if (button) selectFeaturedTask(button.dataset.taskId);
@@ -379,7 +523,15 @@ function initTrajectoryShowcase() {
     const button = event.target.closest("button[data-featured-model]");
     if (!button || button.dataset.featuredModel === featuredModel) return;
     featuredModel = button.dataset.featuredModel;
-    loadFeaturedRun();
+    featuredUserPaused = false;
+    refreshFeaturedTasks();
+  });
+  featuredElements.outcomeTabs.addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-featured-outcome]");
+    if (!button || button.dataset.featuredOutcome === featuredOutcome) return;
+    featuredOutcome = button.dataset.featuredOutcome;
+    featuredUserPaused = false;
+    refreshFeaturedTasks();
   });
   featuredElements.previous.addEventListener("click", () => {
     if (!featuredRun) return;
@@ -415,7 +567,7 @@ function initTrajectoryShowcase() {
     }
   }, { threshold: 0.3 });
   observer.observe(featuredElements.section);
-  selectFeaturedTask(featuredTasks[0].task_id);
+  refreshFeaturedTasks();
 }
 
 function sortValue(task, key) {

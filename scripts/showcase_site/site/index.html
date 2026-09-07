@@ -6,7 +6,7 @@
   <meta name="description" content="Explore 100 difficult browser-agent tasks, model scores, rubric verdicts, and every recorded trajectory step.">
   <title>OdysseysMega | Turing agent evaluation</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Cpath d=%27M18 24h64v16H58v42H42V40H18z%27 fill=%27%232f6fb3%27/%3E%3C/svg%3E">
-  <link rel="stylesheet" href="/style.css?v=20260907g">
+  <link rel="stylesheet" href="/style.css?v=20260907k">
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to benchmark</a>
@@ -57,8 +57,22 @@
         <header class="narrative-heading showcase-heading">
           <p class="eyebrow">Trajectory examples</p>
           <h2 id="examples-title">A few trajectories from the benchmark</h2>
-          <p>Pick a task and an agent to follow the recorded browser session. Each frame comes from the same screenshot history used by the judge.</p>
+          <p>Lower-scoring runs are shown first because they make the benchmark difficulty easier to inspect. You can switch to stronger runs and compare the two agents.</p>
         </header>
+
+        <div class="featured-filterbar" aria-label="Trajectory filters">
+          <div>
+            <span>Agent</span>
+            <div class="featured-model-tabs" id="featuredModelTabs" role="group" aria-label="Choose an agent"></div>
+          </div>
+          <div>
+            <span>Result</span>
+            <div class="featured-outcome-tabs" id="featuredOutcomeTabs" role="group" aria-label="Choose a run result">
+              <button class="active" type="button" data-featured-outcome="lower" aria-pressed="true">Mostly failed</button>
+              <button type="button" data-featured-outcome="strong" aria-pressed="false">Strong runs</button>
+            </div>
+          </div>
+        </div>
 
         <label class="featured-mobile-picker" for="featuredTaskSelect">
           <span>Choose a task</span>
@@ -73,14 +87,27 @@
                 <p class="eyebrow" id="featuredCategory">Loading example</p>
                 <h3 id="featuredTitle">Loading trajectory</h3>
               </div>
-              <div class="featured-model-tabs" id="featuredModelTabs" role="group" aria-label="Choose an agent"></div>
+              <div class="featured-run-label"><span id="featuredAgent">sol</span><strong id="featuredOutcome">Mostly failed</strong></div>
             </header>
 
-            <div class="featured-frame" id="featuredFrame" aria-busy="true">
-              <div class="featured-loading" id="featuredLoading"><span></span> Loading recorded frame</div>
-              <img id="featuredImage" alt="" hidden>
-              <div class="featured-error" id="featuredError" hidden>Screenshot unavailable</div>
-              <output class="featured-position" id="featuredPosition">Frame 1</output>
+            <div class="featured-evidence-grid">
+              <div class="featured-frame" id="featuredFrame" aria-busy="true">
+                <div class="featured-loading" id="featuredLoading"><span></span> Loading recorded frame</div>
+                <img id="featuredImage" alt="" hidden>
+                <div class="featured-error" id="featuredError" hidden>Screenshot unavailable</div>
+                <output class="featured-position" id="featuredPosition">Frame 1</output>
+              </div>
+
+              <aside class="featured-rubric-panel" aria-label="Rubric progress">
+                <header>
+                  <div><span>Derived evidence score</span><strong id="featuredEvidenceScore">0.000</strong></div>
+                  <span id="featuredFinalScore">Final 0.000</span>
+                </header>
+                <svg id="featuredScoreTimeline" viewBox="0 0 300 58" preserveAspectRatio="none" aria-hidden="true"></svg>
+                <p class="featured-rubric-meta" id="featuredRubricMeta">0 of 0 supported by this frame</p>
+                <div class="featured-rubric-list" id="featuredRubricList"></div>
+                <p class="featured-evidence-note">Checks appear at the first frame cited by the final judge. Crosses show final failed rubrics. This is an evidence view rather than a new judge call at every frame.</p>
+              </aside>
             </div>
 
             <div class="featured-step-copy">
@@ -234,6 +261,6 @@
     <span>OdysseysMega · Turing frontier agent evaluation</span>
     <a href="https://github.com/ljang0/Odysseys" target="_blank" rel="noopener">Odysseys</a>
   </footer>
-  <script type="module" src="/app.js?v=20260907g"></script>
+  <script type="module" src="/app.js?v=20260907k"></script>
 </body>
 </html>
