@@ -24,14 +24,17 @@ BUCKET = "journeys-prolific"
 MODELS = {
     "claude-opus-5": {
         "label": "Claude Opus 5",
-        "state_glob": "h100opus-s*/queue-state.json",
+        "state_glob": ["h100opus-s*/queue-state.json"],
         # Opus was judged by luna at run time; the Gemini verdicts live in the
         # re-judge output, so both models are shown on the same judge.
         "grades": D / "rejudge-opus-gemini" / "results.json",
     },
     "gpt-5.6-sol": {
         "label": "GPT-5.6 sol",
-        "state_glob": "h100v2sol-s*/queue-state.json",
+        # The tail of the campaign ran under its own work root, so both are
+        # listed; a wildcard covering them by accident would be one rename away
+        # from silently dropping published runs.
+        "state_glob": ["h100v2sol-s*/queue-state.json", "h100v2fill-s*/queue-state.json"],
         "grades": None,          # already judged by Gemini in its own run
     },
 }
@@ -45,11 +48,12 @@ def summarise(request: str, limit: int = 130) -> str:
     return text[:text.rfind(" ", 0, limit)].rstrip(",;:") + "…"
 
 
-def runs_for(glob_pattern: str) -> dict[str, dict[str, Any]]:
+def runs_for(patterns: list[str]) -> dict[str, dict[str, Any]]:
     found: dict[str, dict[str, Any]] = {}
-    for path in sorted(D.glob(glob_pattern)):
-        for run in json.loads(path.read_text()).get("runs") or []:
-            found[run["task_id"]] = run
+    for pattern in patterns:
+        for path in sorted(D.glob(pattern)):
+            for run in json.loads(path.read_text()).get("runs") or []:
+                found[run["task_id"]] = run
     return found
 
 
