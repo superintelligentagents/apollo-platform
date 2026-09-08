@@ -578,7 +578,7 @@ function sortValue(task, key) {
 
 function scoreItem(task, model, shortLabel) {
   const run = task.runs[model];
-  if (!run) return `<div class="task-score empty"><span>${shortLabel}</span><strong>N/A</strong><small>No run</small></div>`;
+  if (!run) return `<div class="task-score empty" title="The guest VM failed repeatedly on this task; no scored run was produced."><span>${shortLabel}</span><strong>N/A</strong><small>Environment failure</small></div>`;
   const cap = run.truncated ? `<em title="Stopped at the ${dataset.max_steps}-step limit">cap</em>` : "";
   return `<a class="task-score" href="/run?id=${encodeURIComponent(run.run)}" aria-label="Watch ${escapeHtml(dataset.models[model])} trajectory, score ${run.score.toFixed(3)}">
     <span>${escapeHtml(shortLabel)} ${cap}</span>
