@@ -175,7 +175,13 @@ async function init() {
     const results = await Promise.all(entries.map(async ([model, label], playerId) => {
       const reference = task.runs[model];
       if (!reference) return {
-        markup: `<article class="run-card empty"><p class="eyebrow">Evaluated agent</p><h3>${escapeHtml(label)}</h3><p>No run was published for this task.</p></article>`,
+        markup: `<article class="run-card empty">
+          <header class="run-card-head">
+            <div><p class="eyebrow">Evaluated agent</p><h3>${escapeHtml(label)}</h3></div>
+            <div class="score-block"><strong>0.000</strong><span>benchmark score</span></div>
+          </header>
+          <p>No run was published for this task. It counts as zero in the benchmark results, and there is no trajectory to show.</p>
+        </article>`,
       };
       try {
         const response = await fetch(`/data/runs/${encodeURIComponent(reference.run)}.json`);

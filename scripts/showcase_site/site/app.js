@@ -115,15 +115,54 @@ const featuredElements = {
   open: document.getElementById("featuredOpen"),
 };
 
-function modelScores(model) {
-  return tasks.filter((task) => task.runs[model]).map((task) => task.runs[model].score);
+function analysisForDisplay() {
+  const source = dataset.analysis || FALLBACK_ANALYSIS;
+  const modelStats = Object.fromEntries(Object.keys(dataset.models).map((model) => {
+    const recorded = tasks.filter((task) => task.runs[model]);
+    const missingRuns = tasks.length - recorded.length;
+    const scores = tasks.map((task) => task.runs[model]?.score ?? 0);
+    return [model, {
+      ...(source.model_stats?.[model] || {}),
+      runs: recorded.length,
+      missing_runs: missingRuns,
+      counted_tasks: tasks.length,
+      mean_score: mean(scores),
+      zero_score_runs: recorded.filter((task) => task.runs[model].score === 0).length + missingRuns,
+    }];
+  }));
+
+  let solWins = 0;
+  let opusWins = 0;
+  let ties = 0;
+  let recordedPairs = 0;
+  tasks.forEach((task) => {
+    const solRun = task.runs["gpt-5.6-sol"];
+    const opusRun = task.runs["claude-opus-5"];
+    if (solRun && opusRun) recordedPairs += 1;
+    const solScore = solRun?.score ?? 0;
+    const opusScore = opusRun?.score ?? 0;
+    if (solScore > opusScore) solWins += 1;
+    else if (opusScore > solScore) opusWins += 1;
+    else ties += 1;
+  });
+
+  return {
+    ...source,
+    model_stats: modelStats,
+    head_to_head: {
+      counted_tasks: tasks.length,
+      recorded_pairs: recordedPairs,
+      shared_tasks: recordedPairs,
+      sol_wins: solWins,
+      opus_wins: opusWins,
+      ties,
+    },
+  };
 }
 
 function renderOverview() {
-  const opusScores = modelScores("claude-opus-5");
-  const solScores = modelScores("gpt-5.6-sol");
-  const totalRuns = opusScores.length + solScores.length;
-  const bestMean = Math.max(mean(opusScores), mean(solScores));
+  const analysis = analysisForDisplay();
+  const bestMean = Math.max(...Object.values(analysis.model_stats).map((stats) => stats.mean_score));
 
   document.getElementById("sub").textContent =
     `${tasks.length} screened, long-horizon tasks test whether agents can research, compare, and act across real websites. ` +
@@ -132,9 +171,9 @@ function renderOverview() {
     <strong>${fmt(bestMean)}</strong>
     <span>best mean rubric score</span>`;
   document.getElementById("stats").innerHTML = `
-    <div><strong>${tasks.length}</strong><span>hard tasks</span></div>
+    <div><strong>${tasks.length}</strong><span>tasks in sample set</span></div>
     <div><strong>${Object.keys(dataset.models).length}</strong><span>frontier agents</span></div>
-    <div><strong>${totalRuns}</strong><span>recorded runs</span></div>
+    <div><strong>${analysis.total_rubrics.toLocaleString()}</strong><span>scored rubrics</span></div>
     <div><strong>${dataset.max_steps}</strong><span>steps / run</span></div>`;
 
   const categories = [...new Set(tasks.map((task) => task.category).filter(Boolean))].sort();
@@ -156,13 +195,13 @@ function renderOverview() {
   const agents = [
     {
       label: dataset.models["gpt-5.6-sol"],
-      note: `${solScores.length} runs · ${tasks.filter((task) => task.runs["gpt-5.6-sol"]?.truncated).length} reached the cap`,
-      score: mean(solScores),
+      note: `${tasks.length} tasks · ${analysis.model_stats["gpt-5.6-sol"].missing_runs} missing run counted as zero`,
+      score: analysis.model_stats["gpt-5.6-sol"].mean_score,
     },
     {
       label: dataset.models["claude-opus-5"],
-      note: `${opusScores.length} runs · ${tasks.filter((task) => task.runs["claude-opus-5"]?.truncated).length} reached the cap`,
-      score: mean(opusScores),
+      note: `${tasks.length} tasks · ${tasks.filter((task) => task.runs["claude-opus-5"]?.truncated).length} reached the cap`,
+      score: analysis.model_stats["claude-opus-5"].mean_score,
     },
   ];
   document.getElementById("agentList").innerHTML = agents.map((agent) => `
@@ -174,7 +213,7 @@ function renderOverview() {
 }
 
 function renderNarrative() {
-  const analysis = dataset.analysis || FALLBACK_ANALYSIS;
+  const analysis = analysisForDisplay();
   const opus = analysis.model_stats["claude-opus-5"];
   const sol = analysis.model_stats["gpt-5.6-sol"];
   const head = analysis.head_to_head;
@@ -183,11 +222,12 @@ function renderNarrative() {
 
   document.getElementById("resultsProse").textContent =
     `The average scores are close. sol averages ${fmt(sol.mean_score)} and Opus 5 averages ${fmt(opus.mean_score)}. ` +
-    `On the ${head.shared_tasks} tasks both agents attempted, Opus 5 wins ${head.opus_wins}, sol wins ${head.sol_wins}, ` +
-    `and ${head.ties} tie. The result varies with the kind of work in the task.`;
+    `The missing sol run counts as zero rather than being dropped. Across all ${head.counted_tasks} tasks, ` +
+    `Opus 5 wins ${head.opus_wins}, sol wins ${head.sol_wins}, and ${head.ties} tie. ` +
+    `The result varies with the kind of work in the task.`;
 
   document.getElementById("failureLead").textContent =
-    `Across ${analysis.total_runs} trajectories and ${analysis.total_rubrics.toLocaleString()} scored rubrics, ` +
+    `Across the ${tasks.length} tasks, the judge scored ${analysis.total_rubrics.toLocaleString()} rubrics and found that ` +
     `${analysis.failed_rubrics} requirements failed. The judge explanations point most often to incomplete ` +
     `deliverables and missing synthesis, even when the browser history shows substantial research.`;
 
@@ -195,7 +235,7 @@ function renderNarrative() {
     {
       value: `${head.opus_wins} to ${head.sol_wins}`,
       label: "Opus 5 vs sol wins",
-      note: `${head.ties} ties across ${head.shared_tasks} shared tasks`,
+      note: `${head.ties} ties across ${head.counted_tasks} tasks`,
     },
     {
       value: `${Math.round((opus.cap_runs / opus.runs) * 100)}%`,
@@ -578,7 +618,7 @@ function sortValue(task, key) {
 
 function scoreItem(task, model, shortLabel) {
   const run = task.runs[model];
-  if (!run) return `<div class="task-score empty" title="The guest VM failed repeatedly on this task; no scored run was produced."><span>${shortLabel}</span><strong>N/A</strong><small>Environment failure</small></div>`;
+  if (!run) return `<div class="task-score empty" title="No run was published. This outcome counts as zero in benchmark results."><span>${shortLabel}</span><strong>0.000</strong><small>Missing run · counted as failure</small></div>`;
   const cap = run.truncated ? `<em title="Stopped at the ${dataset.max_steps}-step limit">cap</em>` : "";
   return `<a class="task-score" href="/run?id=${encodeURIComponent(run.run)}" aria-label="Watch ${escapeHtml(dataset.models[model])} trajectory, score ${run.score.toFixed(3)}">
     <span>${escapeHtml(shortLabel)} ${cap}</span>

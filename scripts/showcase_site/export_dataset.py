@@ -135,38 +135,44 @@ def score_of(grades: list[dict[str, Any]]) -> tuple[float, int, int]:
     return (round(passed / len(scored), 4) if scored else 0.0, passed, len(scored))
 
 
-def build_analysis(details: list[dict[str, Any]]) -> dict[str, Any]:
+def build_analysis(details: list[dict[str, Any]], tasks: Mapping[str, Any]) -> dict[str, Any]:
     """Aggregate reproducible story metrics from the exported judge records."""
+    task_count = len(tasks)
     model_stats: dict[str, dict[str, Any]] = {}
     for model_id in MODELS:
         rows = [row for row in details if row["model"] == model_id]
         scored = sum(row["rubrics_scored"] for row in rows)
         passed = sum(row["rubrics_passed"] for row in rows)
+        missing_runs = max(task_count - len(rows), 0)
         model_stats[model_id] = {
             "runs": len(rows),
-            "mean_score": round(sum(row["score"] for row in rows) / len(rows), 4) if rows else 0,
+            "missing_runs": missing_runs,
+            "counted_tasks": task_count,
+            "mean_score": round(sum(row["score"] for row in rows) / task_count, 4) if task_count else 0,
             "mean_steps": round(sum(row["steps"] for row in rows) / len(rows), 1) if rows else 0,
             "cap_runs": sum(1 for row in rows if row["truncated"]),
             "rubrics_passed": passed,
             "rubrics_scored": scored,
             "rubric_pass_rate": round(passed / scored, 4) if scored else 0,
-            "zero_score_runs": sum(1 for row in rows if row["score"] == 0),
+            "zero_score_runs": sum(1 for row in rows if row["score"] == 0) + missing_runs,
             "perfect_runs": sum(1 for row in rows if row["score"] == 1),
         }
 
     by_task: dict[str, dict[str, dict[str, Any]]] = {}
     for row in details:
         by_task.setdefault(row["task_id"], {})[row["model"]] = row
-    shared = wins_sol = wins_opus = ties = 0
-    for task_runs in by_task.values():
+    recorded_pairs = wins_sol = wins_opus = ties = 0
+    for task_id in tasks:
+        task_runs = by_task.get(task_id, {})
         sol = task_runs.get("gpt-5.6-sol")
         opus = task_runs.get("claude-opus-5")
-        if not sol or not opus:
-            continue
-        shared += 1
-        if sol["score"] > opus["score"]:
+        if sol and opus:
+            recorded_pairs += 1
+        sol_score = sol["score"] if sol else 0
+        opus_score = opus["score"] if opus else 0
+        if sol_score > opus_score:
             wins_sol += 1
-        elif opus["score"] > sol["score"]:
+        elif opus_score > sol_score:
             wins_opus += 1
         else:
             ties += 1
@@ -196,7 +202,9 @@ def build_analysis(details: list[dict[str, Any]]) -> dict[str, Any]:
         "failed_rubrics": failed_rubrics,
         "model_stats": model_stats,
         "head_to_head": {
-            "shared_tasks": shared,
+            "counted_tasks": task_count,
+            "recorded_pairs": recorded_pairs,
+            "shared_tasks": recorded_pairs,
             "sol_wins": wins_sol,
             "opus_wins": wins_opus,
             "ties": ties,
@@ -287,7 +295,7 @@ def main(argv=None) -> int:
         "max_steps": 120,
         "prompt": "canonical upstream (no Apollo operator prompt)",
         "models": {k: v["label"] for k, v in MODELS.items()},
-        "analysis": build_analysis(details),
+        "analysis": build_analysis(details, tasks),
         "tasks": sorted(index.values(), key=lambda t: t["task_id"]),
     }, ensure_ascii=False), encoding="utf-8")
     print(f"wrote {len(index)} tasks to {args.out}")
