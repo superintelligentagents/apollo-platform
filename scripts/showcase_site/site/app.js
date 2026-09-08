@@ -163,6 +163,7 @@ function analysisForDisplay() {
 function renderOverview() {
   const analysis = analysisForDisplay();
   const bestMean = Math.max(...Object.values(analysis.model_stats).map((stats) => stats.mean_score));
+  const categories = [...new Set(tasks.map((task) => task.category).filter(Boolean))].sort();
 
   document.getElementById("sub").textContent =
     `${tasks.length} screened, long-horizon tasks test whether agents can research, compare, and act across real websites. ` +
@@ -174,9 +175,8 @@ function renderOverview() {
     <div><strong>${tasks.length}</strong><span>tasks in sample set</span></div>
     <div><strong>${Object.keys(dataset.models).length}</strong><span>frontier agents</span></div>
     <div><strong>${analysis.total_rubrics.toLocaleString()}</strong><span>scored rubrics</span></div>
-    <div><strong>${dataset.max_steps}</strong><span>steps / run</span></div>`;
+    <div><strong>${categories.length}</strong><span>task categories</span></div>`;
 
-  const categories = [...new Set(tasks.map((task) => task.category).filter(Boolean))].sort();
   document.getElementById("categoryCount").textContent = `${categories.length} categories`;
   document.getElementById("cat").insertAdjacentHTML("beforeend",
     categories.map((category) => `<option>${escapeHtml(category)}</option>`).join(""));
