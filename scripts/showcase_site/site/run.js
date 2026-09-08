@@ -2,6 +2,17 @@ const runSlug = new URLSearchParams(location.search).get("id");
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
 }[character]));
+const formatDuration = (value) => {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return "Not recorded";
+  const rounded = Math.round(seconds);
+  const hours = Math.floor(rounded / 3600);
+  const minutes = Math.floor((rounded % 3600) / 60);
+  const remainder = rounded % 60;
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m ${remainder}s`;
+  return `${remainder}s`;
+};
 
 let run;
 let dataset;
@@ -141,7 +152,7 @@ function loadScreenshot(step) {
     elements.shotStage.setAttribute("aria-busy", "false");
     scheduleNext();
   };
-  elements.screenshot.alt = `Recorded browser state at frame ${stepIndex + 1}`;
+  elements.screenshot.alt = `Recorded browser state at frame ${stepIndex + 1} of ${run.trajectory.length}`;
   elements.screenshot.src = url;
   elements.fullSize.href = url;
 }
@@ -150,14 +161,14 @@ function drawStep() {
   const step = run.trajectory[stepIndex];
   if (!step) return;
 
-  elements.position.textContent = `Frame ${stepIndex + 1}`;
+  elements.position.textContent = `Frame ${stepIndex + 1} of ${run.trajectory.length}`;
   elements.stepTitle.textContent = `Frame ${stepIndex + 1}`;
   elements.action.textContent = step.action || "No action recorded.";
   elements.response.textContent = step.response || "No agent response recorded.";
   elements.previous.disabled = stepIndex === 0;
   elements.next.disabled = stepIndex === run.trajectory.length - 1;
   elements.scrubber.value = String(stepIndex + 1);
-  elements.scrubber.setAttribute("aria-valuetext", `Frame ${stepIndex + 1}`);
+  elements.scrubber.setAttribute("aria-valuetext", `Frame ${stepIndex + 1} of ${run.trajectory.length}`);
   elements.progress.style.width = `${((stepIndex + 1) / run.trajectory.length) * 100}%`;
   history.replaceState(null, "", `${location.pathname}${location.search}#step-${step.step}`);
   updateRubricProgress();
@@ -300,8 +311,9 @@ async function init() {
     document.getElementById("taskTitle").textContent = taskTitle;
     document.getElementById("meta").innerHTML = `
       <div class="summary-score"><strong>${run.score.toFixed(3)}</strong><span>rubric score</span></div>
-      <div><strong>${run.rubrics_passed}/${run.rubrics_scored}</strong><span>rubrics passed</span></div>
-      <div><strong>${run.truncated ? "Reached" : "Within"}</strong><span>interaction budget</span></div>`;
+      <div><strong>${formatDuration(run.duration_seconds)}</strong><span>recorded time</span></div>
+      <div><strong>${run.steps}</strong><span>steps${run.truncated ? " · hit max" : ""}</span></div>
+      <div><strong>${run.rubrics_passed}/${run.rubrics_scored}</strong><span>rubrics passed</span></div>`;
     document.getElementById("prompt").textContent = currentTask?.request || "Task prompt unavailable.";
     document.getElementById("promptPreview").textContent = currentTask?.request
       ? `${currentTask.request.replace(/\s+/g, " ").slice(0, 150)}${currentTask.request.length > 150 ? "…" : ""}`

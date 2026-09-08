@@ -1,5 +1,16 @@
 const fmt = (value) => value === null || value === undefined ? "N/A" : value.toFixed(3);
 const mean = (values) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+const formatDuration = (value) => {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return "Not recorded";
+  const rounded = Math.round(seconds);
+  const hours = Math.floor(rounded / 3600);
+  const minutes = Math.floor((rounded % 3600) / 60);
+  const remainder = rounded % 60;
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m ${remainder}s`;
+  return `${remainder}s`;
+};
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
 }[character]));
@@ -103,6 +114,8 @@ const featuredElements = {
   action: document.getElementById("featuredAction"),
   score: document.getElementById("featuredScore"),
   rubrics: document.getElementById("featuredRubrics"),
+  duration: document.getElementById("featuredDuration"),
+  steps: document.getElementById("featuredSteps"),
   evidenceScore: document.getElementById("featuredEvidenceScore"),
   finalScore: document.getElementById("featuredFinalScore"),
   scoreTimeline: document.getElementById("featuredScoreTimeline"),
@@ -164,6 +177,9 @@ function renderOverview() {
   const analysis = analysisForDisplay();
   const bestMean = Math.max(...Object.values(analysis.model_stats).map((stats) => stats.mean_score));
   const categories = [...new Set(tasks.map((task) => task.category).filter(Boolean))].sort();
+  const recordedDurations = tasks.flatMap((task) => Object.values(task.runs))
+    .map((run) => run.duration_seconds)
+    .filter((duration) => Number.isFinite(duration));
 
   document.getElementById("sub").textContent =
     `${tasks.length} screened, long-horizon tasks test whether agents can research, compare, and act across real websites. ` +
@@ -175,7 +191,7 @@ function renderOverview() {
     <div><strong>${tasks.length}</strong><span>tasks in sample set</span></div>
     <div><strong>${Object.keys(dataset.models).length}</strong><span>frontier agents</span></div>
     <div><strong>${analysis.total_rubrics.toLocaleString()}</strong><span>scored rubrics</span></div>
-    <div><strong>${categories.length}</strong><span>task categories</span></div>`;
+    <div><strong>${formatDuration(mean(recordedDurations))}</strong><span>average recorded time</span></div>`;
 
   document.getElementById("categoryCount").textContent = `${categories.length} categories`;
   document.getElementById("cat").insertAdjacentHTML("beforeend",
@@ -197,11 +213,13 @@ function renderOverview() {
       label: dataset.models["gpt-5.6-sol"],
       note: `${tasks.length} tasks · ${analysis.model_stats["gpt-5.6-sol"].missing_runs} missing run counted as zero`,
       score: analysis.model_stats["gpt-5.6-sol"].mean_score,
+      stats: analysis.model_stats["gpt-5.6-sol"],
     },
     {
       label: dataset.models["claude-opus-5"],
       note: `${tasks.length} tasks · ${tasks.filter((task) => task.runs["claude-opus-5"]?.truncated).length} reached the cap`,
       score: analysis.model_stats["claude-opus-5"].mean_score,
+      stats: analysis.model_stats["claude-opus-5"],
     },
   ];
   document.getElementById("agentList").innerHTML = agents.map((agent) => `
@@ -209,6 +227,11 @@ function renderOverview() {
       <div><strong>${escapeHtml(agent.label)}</strong><span>${escapeHtml(agent.note)}</span></div>
       <b>${fmt(agent.score)}</b>
       <div class="agent-track"><span style="width:${agent.score * 100}%"></span></div>
+      <dl class="agent-metrics">
+        <div><dt>Average time</dt><dd>${formatDuration(agent.stats.mean_duration_seconds)}</dd></div>
+        <div><dt>Average steps</dt><dd>${agent.stats.mean_steps.toFixed(1)}</dd></div>
+        <div><dt>Hit max steps</dt><dd>${agent.stats.cap_runs}</dd></div>
+      </dl>
     </div>`).join("");
 }
 
@@ -377,12 +400,12 @@ function drawFeaturedStep() {
   const step = featuredRun?.trajectory[featuredStepIndex];
   if (!step) return;
 
-  featuredElements.position.textContent = `Frame ${featuredStepIndex + 1}`;
+  featuredElements.position.textContent = `Frame ${featuredStepIndex + 1} of ${featuredRun.trajectory.length}`;
   featuredElements.action.textContent = compactCopy(step.action || step.response || "No action was recorded for this frame.");
   featuredElements.previous.disabled = featuredStepIndex === 0;
   featuredElements.next.disabled = featuredStepIndex === featuredRun.trajectory.length - 1;
   featuredElements.scrubber.value = String(featuredStepIndex + 1);
-  featuredElements.scrubber.setAttribute("aria-valuetext", `Frame ${featuredStepIndex + 1}`);
+  featuredElements.scrubber.setAttribute("aria-valuetext", `Frame ${featuredStepIndex + 1} of ${featuredRun.trajectory.length}`);
   updateFeaturedRubricProgress();
   featuredImageLoadId += 1;
   const thisLoad = featuredImageLoadId;
@@ -414,7 +437,7 @@ function drawFeaturedStep() {
     featuredElements.frame.setAttribute("aria-busy", "false");
     scheduleFeaturedStep();
   };
-  featuredElements.image.alt = `Recorded browser state from ${featuredLabel(featuredModel)} at frame ${featuredStepIndex + 1}`;
+  featuredElements.image.alt = `Recorded browser state from ${featuredLabel(featuredModel)} at frame ${featuredStepIndex + 1} of ${featuredRun.trajectory.length}`;
   featuredElements.image.src = `/api/shot?key=${encodeURIComponent(step.screenshot_key)}`;
 }
 
@@ -474,7 +497,7 @@ function renderFeaturedTaskOptions() {
     return `<button type="button" data-task-id="${escapeHtml(task.task_id)}" aria-pressed="false">
       <span>${String(index + 1).padStart(2, "0")} · ${escapeHtml(task.category || "Web research")}</span>
       <strong>${escapeHtml(compactCopy(task.title || task.request, 88))}</strong>
-      <small><b>${run.score.toFixed(3)}</b> score · ${escapeHtml(run.rubrics_passed.replace("/", " of "))} rubrics</small>
+      <small><b>${run.score.toFixed(3)}</b> score · ${run.steps} steps · ${formatDuration(run.duration_seconds)}</small>
     </button>`;
   }).join("");
   featuredElements.select.innerHTML = featuredTasks.map((task) => {
@@ -512,6 +535,8 @@ async function loadFeaturedRun() {
   featuredElements.action.textContent = "Loading the recorded actions";
   featuredElements.score.textContent = reference.score.toFixed(3);
   featuredElements.rubrics.textContent = reference.rubrics_passed.replace("/", " of ");
+  featuredElements.duration.textContent = formatDuration(reference.duration_seconds);
+  featuredElements.steps.textContent = `${reference.steps}${reference.truncated ? " · hit max" : ""}`;
   featuredElements.evidenceScore.textContent = "0.000";
   featuredElements.finalScore.textContent = `Final ${reference.score.toFixed(3)}`;
   featuredElements.rubricMeta.textContent = "Loading rubric evidence";
@@ -623,7 +648,7 @@ function scoreItem(task, model, shortLabel) {
   return `<a class="task-score" href="/run?id=${encodeURIComponent(run.run)}" aria-label="Watch ${escapeHtml(dataset.models[model])} trajectory, score ${run.score.toFixed(3)}">
     <span>${escapeHtml(shortLabel)} ${cap}</span>
     <strong>${run.score.toFixed(3)}</strong>
-    <small>Watch trajectory →</small>
+    <small>${run.steps} steps · ${formatDuration(run.duration_seconds)} →</small>
   </a>`;
 }
 

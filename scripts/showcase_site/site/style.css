@@ -891,8 +891,9 @@ img {
 }
 
 .featured-run-facts {
-  display: flex;
-  gap: 30px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(72px, 1fr));
+  gap: 14px 24px;
   margin: 0;
 }
 
@@ -1257,6 +1258,34 @@ img {
 .agent-row .agent-track {
   grid-column: 1 / -1;
   margin-top: 8px;
+}
+
+.agent-metrics {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin: 11px 0 0;
+}
+
+.agent-metrics div {
+  min-width: 0;
+}
+
+.agent-metrics dt {
+  color: var(--faint);
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.agent-metrics dd {
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
 }
 
 .agent-row.baseline .agent-track span {
@@ -2311,7 +2340,7 @@ th.number .sort-button {
 
 .run-summary {
   display: grid;
-  grid-template-columns: repeat(3, minmax(105px, 1fr));
+  grid-template-columns: repeat(4, minmax(105px, 1fr));
   flex: 0 0 auto;
   border: 1px solid var(--line);
   background: var(--paper);
@@ -3351,7 +3380,7 @@ kbd {
   }
 
   .run-summary {
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
     margin-top: 20px;
   }
 

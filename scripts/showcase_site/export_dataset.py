@@ -11,11 +11,13 @@ unshippable, and the site signs them on demand instead.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import re
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -66,6 +68,8 @@ FAILURE_PATTERNS = {
     ),
 }
 
+CAPTURE_TIMESTAMP = re.compile(r"^step_\d+_(\d{8}@\d{6}(?:\d{6})?)\.jpg$")
+
 
 def summarise(request: str, limit: int = 130) -> str:
     """A one-line title that ends on a word, not mid-syllable."""
@@ -75,12 +79,36 @@ def summarise(request: str, limit: int = 130) -> str:
     return text[:text.rfind(" ", 0, limit)].rstrip(",;:") + "…"
 
 
+def recorded_duration_seconds(state_path: Path, task_id: str, run_id: str) -> int | None:
+    """Measure the span from the first retained browser frame to the last."""
+    encoded_task = base64.urlsafe_b64encode(task_id.encode()).decode().rstrip("=")
+    manifests = sorted(state_path.parent.glob(
+        f"batch-*/trajectory_review/{encoded_task}/{run_id}/manifest.json"
+    ))
+    for manifest_path in reversed(manifests):
+        frames_dir = manifest_path.parents[2] / "jpeg_runs" / f"apollo_b64_{encoded_task}"
+        captures = []
+        for frame in frames_dir.glob("step_*.jpg"):
+            match = CAPTURE_TIMESTAMP.match(frame.name)
+            if match:
+                stamp = match.group(1)
+                pattern = "%Y%m%d@%H%M%S%f" if len(stamp) == 21 else "%Y%m%d@%H%M%S"
+                captures.append(datetime.strptime(stamp, pattern))
+        if captures:
+            return max(0, round((max(captures) - min(captures)).total_seconds()))
+    return None
+
+
 def runs_for(patterns: list[str]) -> dict[str, dict[str, Any]]:
     found: dict[str, dict[str, Any]] = {}
     for pattern in patterns:
         for path in sorted(D.glob(pattern)):
             for run in json.loads(path.read_text()).get("runs") or []:
-                found[run["task_id"]] = run
+                enriched = dict(run)
+                enriched["duration_seconds"] = recorded_duration_seconds(
+                    path, run["task_id"], run["run_id"]
+                )
+                found[run["task_id"]] = enriched
     return found
 
 
@@ -141,6 +169,10 @@ def build_analysis(details: list[dict[str, Any]], tasks: Mapping[str, Any]) -> d
     model_stats: dict[str, dict[str, Any]] = {}
     for model_id in MODELS:
         rows = [row for row in details if row["model"] == model_id]
+        durations = [
+            row["duration_seconds"] for row in rows
+            if isinstance(row.get("duration_seconds"), (int, float))
+        ]
         scored = sum(row["rubrics_scored"] for row in rows)
         passed = sum(row["rubrics_passed"] for row in rows)
         missing_runs = max(task_count - len(rows), 0)
@@ -150,6 +182,8 @@ def build_analysis(details: list[dict[str, Any]], tasks: Mapping[str, Any]) -> d
             "counted_tasks": task_count,
             "mean_score": round(sum(row["score"] for row in rows) / task_count, 4) if task_count else 0,
             "mean_steps": round(sum(row["steps"] for row in rows) / len(rows), 1) if rows else 0,
+            "mean_duration_seconds": round(sum(durations) / len(durations)) if durations else None,
+            "duration_runs": len(durations),
             "cap_runs": sum(1 for row in rows if row["truncated"]),
             "rubrics_passed": passed,
             "rubrics_scored": scored,
@@ -259,6 +293,7 @@ def main(argv=None) -> int:
                 "rubrics_scored": scored,
                 "steps": run["num_steps"],
                 "truncated": run["num_steps"] >= 120,
+                "duration_seconds": run.get("duration_seconds"),
                 "grades": grades,
                 "trajectory": trajectory_from(manifest, prefix),
             }
@@ -287,6 +322,7 @@ def main(argv=None) -> int:
                 entry["runs"][model_id] = {
                     "run": slug, "score": detail["score"], "steps": detail["steps"],
                     "truncated": detail["truncated"],
+                    "duration_seconds": detail["duration_seconds"],
                     "rubrics_passed": passed_scored(detail),
                 }
     (args.out / "index.json").write_text(json.dumps({

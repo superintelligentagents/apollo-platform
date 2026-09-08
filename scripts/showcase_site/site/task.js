@@ -2,6 +2,17 @@ const taskId = new URLSearchParams(location.search).get("id");
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (character) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
 }[character]));
+const formatDuration = (value) => {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds < 0) return "Not recorded";
+  const rounded = Math.round(seconds);
+  const hours = Math.floor(rounded / 3600);
+  const minutes = Math.floor((rounded % 3600) / 60);
+  const remainder = rounded % 60;
+  if (hours) return `${hours}h ${minutes}m`;
+  if (minutes) return `${minutes}m ${remainder}s`;
+  return `${remainder}s`;
+};
 
 function shortTitle(task) {
   const firstSentence = (task.request || "").split(/(?<=\.)\s/)[0] || task.title || task.task_id;
@@ -31,13 +42,15 @@ function runMarkup(run, label, runSlug, playerId) {
     </header>
     <div class="run-facts">
       <span><strong>${run.rubrics_passed}/${run.rubrics_scored}</strong> rubrics passed</span>
+      <span><strong>${run.steps}</strong> steps</span>
+      <span><strong>${formatDuration(run.duration_seconds)}</strong> recorded time</span>
       ${capped}
     </div>
     ${run.truncated ? `<p class="cap-note">This run reached the shared interaction budget. Read low scores with that limit in mind.</p>` : ""}
     <section class="inline-player" data-player="${playerId}" aria-label="${escapeHtml(label)} trajectory slideshow">
       <header class="inline-player-head">
         <button type="button" data-prev aria-label="Previous ${escapeHtml(label)} step">←</button>
-        <output data-position aria-live="polite">Frame 1</output>
+        <output data-position aria-live="polite">Frame 1 of ${run.trajectory.length}</output>
         <button type="button" data-next aria-label="Next ${escapeHtml(label)} step">→</button>
       </header>
       <div class="inline-shot-stage" data-stage aria-busy="true">
@@ -98,10 +111,11 @@ function createRunPreview(root, run) {
     loadId += 1;
     const thisLoad = loadId;
     clearTimeout(timer);
-    position.textContent = `Frame ${index + 1}`;
+    position.textContent = `Frame ${index + 1} of ${run.trajectory.length}`;
     previous.disabled = index === 0;
     next.disabled = index === run.trajectory.length - 1;
     scrubber.value = String(index + 1);
+    scrubber.setAttribute("aria-valuetext", `Frame ${index + 1} of ${run.trajectory.length}`);
     image.hidden = true;
     error.hidden = true;
     loading.hidden = false;
@@ -129,7 +143,7 @@ function createRunPreview(root, run) {
       stage.setAttribute("aria-busy", "false");
       schedule();
     };
-    image.alt = `Recorded browser state from ${run.model} at frame ${index + 1}`;
+    image.alt = `Recorded browser state from ${run.model} at frame ${index + 1} of ${run.trajectory.length}`;
     image.src = url;
   };
 
