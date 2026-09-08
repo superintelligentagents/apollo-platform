@@ -1,0 +1,346 @@
+#!/usr/bin/env python3
+"""Build the showcase dataset: tasks, per-model runs, grades, trajectories.
+
+Screenshots are referenced by S3 key, never copied. The runs hold ~13,000
+frames and roughly a gigabyte; a deployment that bundled them would be
+unshippable, and the site signs them on demand instead.
+
+    export_dataset.py --out showcase/data
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import re
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Mapping
+
+D = Path("/data/user_data/ljang/apollo-osworld")
+BUCKET = "journeys-prolific"
+
+MODELS = {
+    "claude-opus-5": {
+        "label": "Claude Opus 5",
+        "state_glob": ["h100opus-s*/queue-state.json"],
+        # Opus was judged by luna at run time; the Gemini verdicts live in the
+        # re-judge output, so both models are shown on the same judge.
+        "grades": D / "rejudge-opus-gemini" / "results.json",
+    },
+    "gpt-5.6-sol": {
+        "label": "GPT-5.6 sol",
+        # The tail of the campaign ran under its own work root, so both are
+        # listed; a wildcard covering them by accident would be one rename away
+        # from silently dropping published runs.
+        "state_glob": ["h100v2sol-s*/queue-state.json", "h100v2fill-s*/queue-state.json"],
+        "grades": None,          # already judged by Gemini in its own run
+    },
+}
+
+FAILURE_PATTERNS = {
+    "unfinished_outcome": re.compile(
+        r"failed to (produce|provide|create|compile|assemble|deliver|generate|synthesize|compare|rank|summarize)"
+        r"|never (produced|provided|created|compiled|assembled|delivered|generated|synthesized|compared|ranked|summarized)"
+        r"|did not (produce|provide|create|compile|assemble|deliver|generate|synthesize|compare|rank|summarize)"
+        r"|no (final|written|completed) (output|response|document|deliverable|report|plan|comparison)"
+        r"|trajectory ended|simply navigat|only (navigated|searched|visited)|research phase",
+        re.I,
+    ),
+    "missing_details": re.compile(
+        r"missing|omitted|did not (include|record|capture|extract|address|cover)"
+        r"|failed to (include|record|capture|extract|address|cover)|incomplete|lacks? the required",
+        re.I,
+    ),
+    "weak_verification": re.compile(
+        r"not (verify|verified)|failed to verify|did not verify|no (source|citation)"
+        r"|without (source|citation)|third.party|official source|authoritative source|unsupported",
+        re.I,
+    ),
+    "access_failure": re.compile(
+        r"site can.t be reached|failed to load|unable to access|could not access|paywall|login"
+        r"|blocked|access denied|connectivity|page did not load",
+        re.I,
+    ),
+}
+
+CAPTURE_TIMESTAMP = re.compile(r"^step_\d+_(\d{8}@\d{6}(?:\d{6})?)\.jpg$")
+
+
+def summarise(request: str, limit: int = 130) -> str:
+    """A one-line title that ends on a word, not mid-syllable."""
+    text = " ".join(request.split())
+    if len(text) <= limit:
+        return text
+    return text[:text.rfind(" ", 0, limit)].rstrip(",;:") + "…"
+
+
+def recorded_duration_seconds(state_path: Path, task_id: str, run_id: str) -> int | None:
+    """Measure the span from the first retained browser frame to the last."""
+    encoded_task = base64.urlsafe_b64encode(task_id.encode()).decode().rstrip("=")
+    manifests = sorted(state_path.parent.glob(
+        f"batch-*/trajectory_review/{encoded_task}/{run_id}/manifest.json"
+    ))
+    for manifest_path in reversed(manifests):
+        frames_dir = manifest_path.parents[2] / "jpeg_runs" / f"apollo_b64_{encoded_task}"
+        captures = []
+        for frame in frames_dir.glob("step_*.jpg"):
+            match = CAPTURE_TIMESTAMP.match(frame.name)
+            if match:
+                stamp = match.group(1)
+                pattern = "%Y%m%d@%H%M%S%f" if len(stamp) == 21 else "%Y%m%d@%H%M%S"
+                captures.append(datetime.strptime(stamp, pattern))
+        if captures:
+            return max(0, round((max(captures) - min(captures)).total_seconds()))
+    return None
+
+
+def runs_for(patterns: list[str]) -> dict[str, dict[str, Any]]:
+    found: dict[str, dict[str, Any]] = {}
+    for pattern in patterns:
+        for path in sorted(D.glob(pattern)):
+            for run in json.loads(path.read_text()).get("runs") or []:
+                enriched = dict(run)
+                enriched["duration_seconds"] = recorded_duration_seconds(
+                    path, run["task_id"], run["run_id"]
+                )
+                found[run["task_id"]] = enriched
+    return found
+
+
+def fetch_manifest(key: str, aws_cli: str = "aws") -> dict[str, Any] | None:
+    result = subprocess.run(
+        [aws_cli, "s3", "cp", f"s3://{BUCKET}/{key}", "-"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except ValueError:
+        return None
+
+
+def trajectory_from(manifest: Mapping[str, Any], prefix: str) -> list[dict[str, Any]]:
+    steps = []
+    for step in manifest.get("steps") or []:
+        path = step.get("screenshot_path")
+        steps.append({
+            "index": step.get("index"),
+            "step": step.get("step_number"),
+            "action": (step.get("action") or "")[:4000],
+            "response": (step.get("response") or "")[:8000],
+            # A key, not a URL: signing happens per request, at view time.
+            "screenshot_key": f"{prefix}/{path}" if path else None,
+        })
+    return steps
+
+
+def grades_from(manifest: Mapping[str, Any], override: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    if override is not None:
+        rows = override.get("rubric_results") or []
+        return [{
+            "rubric_id": r.get("rubric_id"),
+            "requirement": (r.get("requirement") or "")[:6000],
+            "status": str(r.get("judge_status") or "").upper() or ("SUCCESS" if r.get("success") else "FAILURE"),
+            "reasoning": (r.get("final_reasoning") or "")[:6000],
+        } for r in rows]
+    return [{
+        "rubric_id": r.get("rubric_id"),
+        "requirement": (r.get("requirement") or "")[:6000],
+        "status": str(r.get("llm_status") or "").upper(),
+        "reasoning": (r.get("llm_reasoning") or "")[:6000],
+    } for r in manifest.get("rubrics") or []]
+
+
+def score_of(grades: list[dict[str, Any]]) -> tuple[float, int, int]:
+    scored = [g for g in grades if g["status"] in {"SUCCESS", "FAILURE"}]
+    passed = sum(1 for g in scored if g["status"] == "SUCCESS")
+    return (round(passed / len(scored), 4) if scored else 0.0, passed, len(scored))
+
+
+def build_analysis(details: list[dict[str, Any]], tasks: Mapping[str, Any]) -> dict[str, Any]:
+    """Aggregate reproducible story metrics from the exported judge records."""
+    task_count = len(tasks)
+    model_stats: dict[str, dict[str, Any]] = {}
+    for model_id in MODELS:
+        rows = [row for row in details if row["model"] == model_id]
+        durations = [
+            row["duration_seconds"] for row in rows
+            if isinstance(row.get("duration_seconds"), (int, float))
+        ]
+        scored = sum(row["rubrics_scored"] for row in rows)
+        passed = sum(row["rubrics_passed"] for row in rows)
+        missing_runs = max(task_count - len(rows), 0)
+        model_stats[model_id] = {
+            "runs": len(rows),
+            "missing_runs": missing_runs,
+            "counted_tasks": task_count,
+            "mean_score": round(sum(row["score"] for row in rows) / task_count, 4) if task_count else 0,
+            "mean_steps": round(sum(row["steps"] for row in rows) / len(rows), 1) if rows else 0,
+            "mean_duration_seconds": round(sum(durations) / len(durations)) if durations else None,
+            "duration_runs": len(durations),
+            "cap_runs": sum(1 for row in rows if row["truncated"]),
+            "rubrics_passed": passed,
+            "rubrics_scored": scored,
+            "rubric_pass_rate": round(passed / scored, 4) if scored else 0,
+            "zero_score_runs": sum(1 for row in rows if row["score"] == 0) + missing_runs,
+            "perfect_runs": sum(1 for row in rows if row["score"] == 1),
+        }
+
+    by_task: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in details:
+        by_task.setdefault(row["task_id"], {})[row["model"]] = row
+    recorded_pairs = wins_sol = wins_opus = ties = 0
+    for task_id in tasks:
+        task_runs = by_task.get(task_id, {})
+        sol = task_runs.get("gpt-5.6-sol")
+        opus = task_runs.get("claude-opus-5")
+        if sol and opus:
+            recorded_pairs += 1
+        sol_score = sol["score"] if sol else 0
+        opus_score = opus["score"] if opus else 0
+        if sol_score > opus_score:
+            wins_sol += 1
+        elif opus_score > sol_score:
+            wins_opus += 1
+        else:
+            ties += 1
+
+    failure_modes = {key: 0 for key in FAILURE_PATTERNS}
+    failed_rubrics = 0
+    for row in details:
+        for grade in row["grades"]:
+            if grade["status"] != "FAILURE":
+                continue
+            failed_rubrics += 1
+            reasoning = grade.get("reasoning") or ""
+            for key, pattern in FAILURE_PATTERNS.items():
+                if pattern.search(reasoning):
+                    failure_modes[key] += 1
+
+    opus_rows = [row for row in details if row["model"] == "claude-opus-5"]
+
+    def failure_rate(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        scored = sum(row["rubrics_scored"] for row in rows)
+        failed = sum(row["rubrics_scored"] - row["rubrics_passed"] for row in rows)
+        return {"failed": failed, "scored": scored, "rate": round(failed / scored, 4) if scored else 0}
+
+    return {
+        "total_runs": len(details),
+        "total_rubrics": sum(row["rubrics_scored"] for row in details),
+        "failed_rubrics": failed_rubrics,
+        "model_stats": model_stats,
+        "head_to_head": {
+            "counted_tasks": task_count,
+            "recorded_pairs": recorded_pairs,
+            "shared_tasks": recorded_pairs,
+            "sol_wins": wins_sol,
+            "opus_wins": wins_opus,
+            "ties": ties,
+        },
+        "opus_cap_comparison": {
+            "capped": failure_rate([row for row in opus_rows if row["truncated"]]),
+            "uncapped": failure_rate([row for row in opus_rows if not row["truncated"]]),
+        },
+        # Categories overlap by design: one judge explanation may cite multiple modes.
+        "failure_modes": failure_modes,
+    }
+
+
+def parser() -> argparse.ArgumentParser:
+    value = argparse.ArgumentParser(description=__doc__)
+    value.add_argument("--out", type=Path, required=True)
+    value.add_argument("--subset", type=Path, default=D / "showcase-subset-100.json")
+    value.add_argument("--aws-cli", default=str(D / "bin" / "aws"))
+    value.add_argument("--workers", type=int, default=16)
+    return value
+
+
+def main(argv=None) -> int:
+    args = parser().parse_args(argv)
+    args.out.mkdir(parents=True, exist_ok=True)
+    subset = json.loads(args.subset.read_text())
+    tasks = {t["task_id"]: t for t in subset["tasks"]}
+
+    index: dict[str, Any] = {}
+    details: list[dict[str, Any]] = []
+    for model_id, spec in MODELS.items():
+        runs = runs_for(spec["state_glob"])
+        override = {}
+        if spec["grades"] and Path(spec["grades"]).is_file():
+            override = {t["task_id"]: t for t in json.loads(Path(spec["grades"]).read_text())["tasks"]}
+        print(f"{model_id}: {len(runs)} runs, {len(override)} re-judged", flush=True)
+
+        def one(item: tuple[str, dict[str, Any]]) -> tuple[str, dict[str, Any]] | None:
+            task_id, run = item
+            manifest = fetch_manifest(run["manifest_key"], args.aws_cli)
+            if not manifest:
+                return None
+            prefix = run["manifest_key"].rsplit("/", 1)[0]
+            grades = grades_from(manifest, override.get(task_id))
+            score, passed, scored = score_of(grades)
+            detail = {
+                "task_id": task_id,
+                "model": model_id,
+                "run_id": run["run_id"],
+                "score": score,
+                "rubrics_passed": passed,
+                "rubrics_scored": scored,
+                "steps": run["num_steps"],
+                "truncated": run["num_steps"] >= 120,
+                "duration_seconds": run.get("duration_seconds"),
+                "grades": grades,
+                "trajectory": trajectory_from(manifest, prefix),
+            }
+            return task_id, detail
+
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            for got in pool.map(one, runs.items()):
+                if not got:
+                    continue
+                task_id, detail = got
+                details.append(detail)
+                (args.out / "runs").mkdir(exist_ok=True)
+                slug = f"{model_id}__{detail['run_id']}"
+                (args.out / "runs" / f"{slug}.json").write_text(
+                    json.dumps(detail, ensure_ascii=False), encoding="utf-8")
+                entry = index.setdefault(task_id, {
+                    "task_id": task_id,
+                    "title": summarise(tasks.get(task_id, {}).get("confirmed_task") or ""),
+                    "request": tasks.get(task_id, {}).get("confirmed_task") or "",
+                    "category": tasks.get(task_id, {}).get("category"),
+                    "subjects": tasks.get(task_id, {}).get("subjects"),
+                    "rubric_count": len(tasks.get(task_id, {}).get("rubrics") or []),
+                    "baseline_luna": (tasks.get(task_id, {}).get("baseline_gpt_5_6_luna") or {}).get("average_rubric_score"),
+                    "runs": {},
+                })
+                entry["runs"][model_id] = {
+                    "run": slug, "score": detail["score"], "steps": detail["steps"],
+                    "truncated": detail["truncated"],
+                    "duration_seconds": detail["duration_seconds"],
+                    "rubrics_passed": passed_scored(detail),
+                }
+    (args.out / "index.json").write_text(json.dumps({
+        "generated_from": str(args.subset),
+        "judge": "gemini-3.1-flash-lite-preview",
+        "max_steps": 120,
+        "prompt": "canonical upstream (no Apollo operator prompt)",
+        "models": {k: v["label"] for k, v in MODELS.items()},
+        "analysis": build_analysis(details, tasks),
+        "tasks": sorted(index.values(), key=lambda t: t["task_id"]),
+    }, ensure_ascii=False), encoding="utf-8")
+    print(f"wrote {len(index)} tasks to {args.out}")
+    return 0
+
+
+def passed_scored(detail: Mapping[str, Any]) -> str:
+    return f"{detail['rubrics_passed']}/{detail['rubrics_scored']}"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

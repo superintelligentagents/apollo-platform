@@ -126,6 +126,13 @@ import {
   llmReviewForHuman,
   buildTrajectoryReportingReport,
   safeTrajectoryAssetPath,
+  cleanTrajectoryRejudgment,
+  selectReportingPage,
+  cleanSubsetName,
+  cleanSubsetDocument,
+  subsetKeyFor,
+  trajectoryJudgmentView,
+  trajectoryRejudgmentKeyFor,
   buildOsworldExportReport,
   osworldTaskForItem,
   osworldTaskIdFor,
@@ -700,6 +707,129 @@ test("trajectory reporting separates metadata from opt-in full content", () => {
   const full = buildTrajectoryReportingReport(items, "2026-08-11T00:01:00Z", { includeContent: true });
   assert.equal(full.trajectories[0].manifest.task_prompt, "private prompt");
   assert.equal(full.schema_version, "apollo-trajectory-reporting-v2");
+});
+
+test("a named subset filters both reporting endpoints", () => {
+  const items = [
+    { task_id: "t1", status: "pending", manifest_key: "k1", run_id: "r1", llm_average_rubric_score: 1 },
+    { task_id: "t2", status: "pending", manifest_key: "k2", run_id: "r2", llm_average_rubric_score: 0 },
+  ];
+  const subsetIds = new Set(["t2"]);
+  const report = buildTrajectoryReportingReport(items, undefined, { subsetIds });
+  assert.equal(report.trajectories.length, 1);
+  assert.equal(report.trajectories[0].task_id, "t2");
+  assert.equal(report.totals.submitted, 1);
+
+  // The tasks endpoint narrows the same way.
+  const dashboard = { items: [{ task_id: "t1", status: "approved" }, { task_id: "t2", status: "approved" }] };
+  assert.deepEqual(
+    selectReportingPage(dashboard, { subsetIds }).filteredItems.map((i) => i.task_id),
+    ["t2"],
+  );
+  // No subset means no narrowing.
+  assert.equal(buildTrajectoryReportingReport(items).trajectories.length, 2);
+});
+
+test("a subset name cannot address anything outside its own prefix", () => {
+  assert.equal(cleanSubsetName("hard-100-v1"), "hard-100-v1");
+  assert.equal(cleanSubsetName("Hard-100-V1"), "hard-100-v1");
+  // A traversal or absolute path must not become a key.
+  assert.equal(cleanSubsetName("../../secrets"), "");
+  assert.equal(cleanSubsetName("a/b"), "");
+  assert.equal(cleanSubsetName(""), "");
+  assert.equal(subsetKeyFor("hard-100-v1"), "v2-review/subsets/hard-100-v1.json");
+});
+
+test("a subset document must actually carry task ids", () => {
+  const clean = cleanSubsetDocument({
+    name: "hard-100-v1", description: "showcase", task_ids: ["v2/a/internal/task-1", "", "v2/b/internal/task-2"],
+  });
+  assert.deepEqual(clean.task_ids, ["v2/a/internal/task-1", "v2/b/internal/task-2"]);
+  assert.equal(cleanSubsetDocument({ task_ids: [] }), null);
+  assert.equal(cleanSubsetDocument({ task_ids: [""] }), null);
+  assert.equal(cleanSubsetDocument(null), null);
+  assert.equal(cleanSubsetDocument({ task_ids: new Array(20_001).fill("v2/a/internal/task-1") }), null);
+});
+
+test("a re-judgment replaces the packaged verdicts it supersedes", () => {
+  const manifest = {
+    metrics: { average_rubric_score: 1, perfect: true, judge_errors: 0 },
+    rubrics: [
+      { rubric_id: "R1", requirement: "a", llm_status: "SUCCESS", llm_score: 1, llm_reasoning: "old" },
+      { rubric_id: "R2", requirement: "b", llm_status: "SUCCESS", llm_score: 1, llm_reasoning: "old" },
+    ],
+  };
+  const rejudgment = cleanTrajectoryRejudgment({
+    schema_version: "apollo-trajectory-rejudgment-v1",
+    judge: { repo: "ljang0/Odysseys", commit: "abc", sha256: "def", model: "gpt-5.6-luna", screenshots: "all" },
+    metrics: { average_rubric_score: 0.5, perfect: false, judge_errors: 0 },
+    rubrics: [
+      { rubric_id: "R1", requirement: "a", llm_status: "SUCCESS", llm_score: 1, llm_reasoning: "new" },
+      { rubric_id: "R2", requirement: "b", llm_status: "FAILURE", llm_score: 0, llm_reasoning: "never navigated" },
+    ],
+  });
+  assert.equal(rejudgment.judge.model, "gpt-5.6-luna");
+  const view = trajectoryJudgmentView(manifest, rejudgment);
+  assert.equal(view.metrics.average_rubric_score, 0.5);
+  assert.equal(view.metrics.perfect, false);
+  assert.equal(view.manifest.rubrics[1].llm_status, "FAILURE");
+  assert.equal(view.manifest.rubrics[1].llm_reasoning, "never navigated");
+  assert.equal(view.manifest.rejudgment.judge.commit, "abc");
+});
+
+test("the reporting row keeps the re-judgment's provenance", () => {
+  // The row builder whitelists fields, so a corrected score can reach the API
+  // with nothing saying it was corrected. Assert the provenance survives.
+  const row = buildTrajectoryReportingReport([{
+    manifest_key: "v2-review/trajectory-runs/a/b/manifest.json",
+    task_id: "t1", run_id: "r1", status: "pending",
+    llm_average_rubric_score: 0.5, llm_perfect: false,
+    llm_judge_source: "canonical_full_trajectory",
+    llm_judge: { model: "gpt-5.6-luna", commit: "abc", screenshots: "all" },
+    llm_original_average_rubric_score: 1, llm_original_perfect: true,
+  }]).trajectories[0];
+  assert.equal(row.llm_average_rubric_score, 0.5);
+  assert.equal(row.llm_judge_source, "canonical_full_trajectory");
+  assert.equal(row.llm_judge.screenshots, "all");
+  assert.equal(row.llm_original_average_rubric_score, 1);
+  assert.equal(row.llm_original_perfect, true);
+
+  // A row with no re-judgment reports itself as packaged, and its "original"
+  // is its own score rather than null, so clients can compare unconditionally.
+  const packaged = buildTrajectoryReportingReport([{
+    manifest_key: "v2-review/trajectory-runs/a/b/manifest.json",
+    task_id: "t2", run_id: "r2", status: "pending",
+    llm_average_rubric_score: 0.8, llm_perfect: false,
+  }]).trajectories[0];
+  assert.equal(packaged.llm_judge_source, "packaged");
+  assert.equal(packaged.llm_judge, null);
+  assert.equal(packaged.llm_original_average_rubric_score, 0.8);
+});
+
+test("a re-judgment for a different rubric set is ignored", () => {
+  const manifest = {
+    metrics: { average_rubric_score: 1, perfect: true, judge_errors: 0 },
+    rubrics: [{ rubric_id: "R1", requirement: "a", llm_status: "SUCCESS", llm_score: 1, llm_reasoning: "old" }],
+  };
+  const stale = cleanTrajectoryRejudgment({
+    schema_version: "apollo-trajectory-rejudgment-v1",
+    judge: { model: "m" },
+    metrics: { average_rubric_score: 0, perfect: false, judge_errors: 0 },
+    rubrics: [{ rubric_id: "OTHER", requirement: "z", llm_status: "FAILURE", llm_score: 0, llm_reasoning: "x" }],
+  });
+  const view = trajectoryJudgmentView(manifest, stale);
+  assert.equal(view.metrics.average_rubric_score, 1);   // packaged judgment stands
+  assert.equal(view.manifest.rubrics[0].llm_reasoning, "old");
+  // No re-judgment at all also falls back cleanly.
+  assert.equal(trajectoryJudgmentView(manifest, null).metrics.perfect, true);
+  assert.equal(cleanTrajectoryRejudgment({ schema_version: "wrong" }), null);
+});
+
+test("the re-judgment key sits beside its manifest", () => {
+  assert.equal(
+    trajectoryRejudgmentKeyFor("v2-review/trajectory-runs/abc/run1/manifest.json"),
+    "v2-review/trajectory-runs/abc/run1/rejudgment.json",
+  );
 });
 
 test("only relative in-run screenshot paths are signed", () => {

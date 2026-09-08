@@ -30,6 +30,88 @@ def task(task_id="v2/alice/internal/task-1", **overrides):
     return value
 
 
+class RubricOverlayTests(unittest.TestCase):
+    """Clean rubric proposals replace what the judge scores, and nothing else."""
+
+    def _overlay(self, **overrides):
+        entry = {
+            "task_id": "v2/alice/internal/task-1",
+            "confirmed_task": "Research the topic and summarize it.",
+            "rubrics": [{
+                "rubric_id": "rubric-1",
+                "requirement": "The summary reports the cited source's current figure.",
+                "verification": "Open the source and compare.",
+            }],
+        }
+        entry.update(overrides)
+        return {"tasks": [entry]}
+
+    def _apply(self, overlay_value, tasks=None):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "overlay.json"
+            path.write_text(json.dumps(overlay_value), encoding="utf-8")
+            overlay = run.load_rubric_overlay(path)
+        return run.apply_rubric_overlay(tasks if tasks is not None else [task()], overlay)
+
+    def test_the_clean_rubric_replaces_the_packaged_one(self):
+        updated, rejected = self._apply(self._overlay())
+        self.assertEqual(rejected, [])
+        rubric = updated[0]["content"]["rubrics"][0]
+        # The judge reads `requirement` first and `final` as a fallback, so both
+        # must carry the clean text or the two paths would score different text.
+        self.assertEqual(rubric["final"], "The summary reports the cited source's current figure.")
+        self.assertEqual(rubric["requirement"], rubric["final"])
+        self.assertEqual(rubric["verification"], "Open the source and compare.")
+        # Approval provenance is untouched: the overlay never grants runnability.
+        self.assertEqual(updated[0]["status"], "approved")
+        self.assertEqual(updated[0]["content"]["task_content_hash"], "a" * 64)
+
+    def test_the_overlay_restricts_the_run_to_the_tasks_it_names(self):
+        other = task("v2/alice/internal/task-2")
+        updated, _ = self._apply(self._overlay(), [task(), other])
+        self.assertEqual([item["task_id"] for item in updated], ["v2/alice/internal/task-1"])
+
+    def test_a_stale_overlay_is_dropped_rather_than_run(self):
+        # Written against a request that has since been amended.
+        updated, rejected = self._apply(self._overlay(confirmed_task="A different request."))
+        self.assertEqual(updated, [])
+        self.assertIn("prompt differs", rejected[0]["reason"])
+
+        # Written against a rubric set the approved task no longer has.
+        updated, rejected = self._apply(self._overlay(rubrics=[
+            {"rubric_id": "rubric-9", "requirement": "Something nobody approved."},
+        ]))
+        self.assertEqual(updated, [])
+        self.assertIn("rubric IDs differ", rejected[0]["reason"])
+
+    def test_an_overlay_without_rubrics_is_refused_at_load(self):
+        with self.assertRaises(run.BridgeError):
+            self._apply(self._overlay(rubrics=[]))
+
+
+class CampaignDedupTests(unittest.TestCase):
+    def test_only_this_campaign_s_trajectories_count_as_done(self):
+        page = {"trajectories": [
+            {"task_id": "v2/alice/internal/task-1", "model": "gpt-5.6-luna",
+             "run_label": "Apollo author-approved OpenAI production shard 1/14 batch 000001"},
+            {"task_id": "v2/alice/internal/task-2", "model": "gpt-5.6-luna",
+             "run_label": "Apollo cleaned-rubric OpenAI production shard 1/5 batch 000001"},
+        ], "page": {"next_offset": None}}
+        with patch.object(run, "get_json", return_value=page):
+            # Without the prefix a re-run campaign would see every task as done.
+            self.assertEqual(
+                run.fetch_trajectory_task_ids("https://api.test/reporting/tasks", "secret",
+                                              model="gpt-5.6-luna"),
+                {"v2/alice/internal/task-1", "v2/alice/internal/task-2"},
+            )
+            self.assertEqual(
+                run.fetch_trajectory_task_ids("https://api.test/reporting/tasks", "secret",
+                                              model="gpt-5.6-luna",
+                                              run_label_prefix="Apollo cleaned-rubric"),
+                {"v2/alice/internal/task-2"},
+            )
+
+
 class OSWorldBridgeTests(unittest.TestCase):
     def test_run_id_round_trip_is_path_safe(self):
         task_id = "v2/alice/internal/task-1"
@@ -321,3 +403,203 @@ class OSWorldBridgeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnthropicBackendTests(unittest.TestCase):
+    def _args(self, **overrides):
+        value = {
+            "agent_backend": "anthropic", "anthropic_model": "claude-opus-5",
+            "anthropic_effort": "high", "anthropic_max_tokens": 16_000,
+            "openai_model": "gpt-5.6-luna", "meta_model": "super_nova_ext",
+            "judge_model": "gpt-5.6-luna", "provider_name": "apptainer",
+            "max_steps": 120, "max_trajectory_length": 120, "num_envs": 2,
+            "sleep_after_execution": 2.0, "domain": "apollo_chrome",
+            "screen_width": 1920, "screen_height": 1080,
+            "client_password": "password", "aws_region": "us-east-1",
+            "osworld_root": Path("/osworld"), "path_to_vm": Path("/vm.qcow2"),
+        }
+        value.update(overrides)
+        return SimpleNamespace(**value)
+
+    def test_the_claude_agent_is_launched_with_its_own_model(self):
+        paths = run.job_paths(Path("/work"), model="claude-opus-5")
+        command = run.anthropic_osworld_command(self._args(), paths)
+        self.assertIn("--model", command)
+        self.assertEqual(command[command.index("--model") + 1], "claude-opus-5")
+        self.assertEqual(command[command.index("--effort") + 1], "high")
+        # Driven through the shim, which is what teaches upstream's pinned
+        # runner about the fork's apptainer provider.
+        self.assertTrue(command[1].endswith("muse_spark_launcher.py"))
+        self.assertEqual(command[command.index("--provider_name") + 1], "apptainer")
+
+    def test_trajectories_are_published_under_the_claude_model(self):
+        args = self._args()
+        self.assertEqual(run.agent_model(args), "claude-opus-5")
+        self.assertEqual(run.agent_label(args), "OSWorld AnthropicAgent")
+
+    def test_only_the_anthropic_key_reaches_the_agent(self):
+        environment = run.anthropic_child_environment(
+            "sk-ant-test", Path("/osworld/scripts/python/run_multienv_claude.py"), Path("/osworld"),
+        )
+        self.assertEqual(environment["ANTHROPIC_API_KEY"], "sk-ant-test")
+        self.assertNotIn("OPENAI_API_KEY", environment)
+        self.assertNotIn("APOLLO_REPORTING_TOKEN", environment)
+        # The checkout's own agent must win; an overlay ahead of it on the path
+        # would silently swap in a different Claude implementation.
+        self.assertEqual(environment["PYTHONPATH"].split(":")[0], "/osworld")
+
+    def test_the_claude_runner_comes_from_the_checkout(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            with self.assertRaises(run.BridgeError):
+                run.claude_runner(root)   # fail loudly rather than run something else
+            target = root / "scripts" / "python"
+            target.mkdir(parents=True)
+            (target / "run_multienv_claude.py").write_text("")
+            self.assertEqual(run.claude_runner(root), target / "run_multienv_claude.py")
+
+    def test_a_claude_run_is_still_judged_by_the_openai_judge(self):
+        # Swapping the agent must not silently swap the judge, or the new
+        # model's scores stop being comparable with the baseline corpus.
+        args = self._args(judge_impl="canonical", judge_workers=1, judge_max_images=0,
+                          queue="v2", run_label="x", s3_bucket="b", aws_profile=None)
+        paths = run.job_paths(Path("/work"), model="claude-opus-5")
+        command = run.trajectory_command(args, paths, plan=False)
+        self.assertEqual(command[command.index("--provider") + 1], "openai")
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6-luna")
+        self.assertEqual(command[command.index("--run-model") + 1], "claude-opus-5")
+
+    def test_the_judge_key_and_the_agent_key_are_different_secrets(self):
+        args = self._args()
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant", "OPENAI_API_KEY": "sk-oai"}):
+            self.assertEqual(run.require_agent_key(args), "sk-ant")
+            self.assertEqual(run.require_judge_key(args), "sk-oai")
+
+
+class RequiredKeyTests(unittest.TestCase):
+    def test_each_backend_asks_for_the_keys_it_actually_uses(self):
+        self.assertEqual(run_queue.required_keys("openai", "gpt-5.6-luna"), ("OPENAI_API_KEY",))
+        self.assertEqual(run_queue.required_keys("muse-spark"), ("MUSE_SPARK_API_KEY",))
+        # A Claude run needs both: Anthropic drives the agent, the judge its own.
+        self.assertEqual(run_queue.required_keys("anthropic", "gpt-5.6-luna"),
+                         ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"))
+
+    def test_a_gemini_judge_asks_for_a_gemini_key(self):
+        # The judge is chosen independently of the agent, so demanding the
+        # agent's provider key would fail a shard that never needed it.
+        self.assertEqual(run_queue.required_keys("openai", "gemini-3.1-flash-lite-preview"),
+                         ("OPENAI_API_KEY", "GEMINI_API_KEY"))
+        self.assertEqual(run_queue.required_keys("anthropic", "gemini-3.1-flash-lite-preview"),
+                         ("ANTHROPIC_API_KEY", "GEMINI_API_KEY"))
+
+    def test_a_backend_never_demands_another_backend_s_key(self):
+        for backend in ("openai", "anthropic", "muse-spark"):
+            keys = run_queue.required_keys(backend, "gpt-5.6-luna")
+            if backend != "muse-spark":
+                self.assertNotIn("MUSE_SPARK_API_KEY", keys)
+            if backend == "openai":
+                self.assertNotIn("ANTHROPIC_API_KEY", keys)
+
+
+def _launcher():
+    """Import the launcher without the OSWorld venv's third-party deps.
+
+    It runs inside the OSWorld child, so it imports docker/httpx/openai at
+    module level; the orchestration venv has none of them. Stub them rather
+    than skip -- the helpers under test are pure, and a skipped test here
+    would protect nothing.
+    """
+    import sys as _sys
+    import types as _types
+    for name in ("docker", "docker.models", "docker.models.containers", "httpx", "openai"):
+        if name not in _sys.modules:
+            _sys.modules[name] = _types.ModuleType(name)
+    _sys.modules["docker.models.containers"].Container = type("Container", (), {"remove": lambda self: None})
+    _sys.modules["openai"].OpenAI = object
+    _sys.modules["httpx"].post = lambda *a, **k: None
+    from scripts.osworld_runner import muse_spark_launcher as launcher
+    return launcher
+
+
+class UnconditionalAwsImportTests(unittest.TestCase):
+    def test_the_stub_stands_in_only_off_aws(self):
+        import sys as _sys
+        launcher = _launcher()
+        name = "desktop_env.providers.aws.manager"
+        _sys.modules.pop(name, None)
+        try:
+            # On AWS the real module must be the one that loads.
+            launcher._satisfy_unconditional_aws_import("aws")
+            self.assertNotIn(name, _sys.modules)
+            # Anywhere else, the import upstream makes before it checks the
+            # provider has to succeed or every env process dies at startup.
+            launcher._satisfy_unconditional_aws_import("apptainer")
+            self.assertIn(name, _sys.modules)
+            image_map = _sys.modules[name].IMAGE_ID_MAP
+            self.assertEqual(image_map["us-east-1"][(1920, 1080)], "unused-off-aws")
+            self.assertEqual(image_map["any-region"].get((1280, 720), "fallback"), "fallback")
+        finally:
+            _sys.modules.pop(name, None)
+
+    def test_the_provider_is_read_from_the_child_argv(self):
+        launcher = _launcher()
+        self.assertEqual(launcher._provider_from_argv(["x", "--provider_name", "apptainer"]), "apptainer")
+        self.assertEqual(launcher._provider_from_argv(["x"]), "")
+        self.assertEqual(launcher._provider_from_argv(["x", "--provider_name"]), "")
+
+
+class RunnerFlagContractTests(unittest.TestCase):
+    """Every flag we send must be one the checkout's runner accepts.
+
+    The Claude runner in this project's checkout differs from upstream's -- it
+    takes --effort where upstream takes --thinking -- and argparse rejects an
+    unknown flag with exit 2, killing the shard after the VMs have booted. A
+    mismatch is cheap to catch here and expensive to catch there.
+    """
+
+    CHECKOUT = Path("/home/ljang/odysseys/osworld_runner")
+
+    def _accepted(self, runner: Path) -> set[str]:
+        import re
+        return set(re.findall(r'add_argument\(\s*"(--[^"]+)"', runner.read_text(encoding="utf-8")))
+
+    def _emitted(self, command):
+        return {part for part in command if isinstance(part, str) and part.startswith("--")}
+
+    def test_the_claude_command_uses_only_accepted_flags(self):
+        runner = self.CHECKOUT / run.CLAUDE_RUNNER_PATH
+        if not runner.is_file():
+            self.skipTest("OSWorld checkout not present")
+        args = SimpleNamespace(
+            agent_backend="anthropic", anthropic_model="claude-opus-5", anthropic_effort="high",
+            anthropic_max_tokens=16_000, provider_name="apptainer", max_steps=120,
+            max_trajectory_length=120, num_envs=5, sleep_after_execution=2.0,
+            domain="apollo_chrome", client_password="password", aws_region="us-east-1",
+            screen_width=1920, screen_height=1080,
+            osworld_root=self.CHECKOUT, path_to_vm=Path("/vm.qcow2"),
+        )
+        command = run.anthropic_osworld_command(args, run.job_paths(Path("/work"), model="claude-opus-5"))
+        unknown = self._emitted(command) - self._accepted(runner)
+        self.assertEqual(unknown, set(), f"runner would reject: {sorted(unknown)}")
+
+
+class EmptyBatchDetectionTests(unittest.TestCase):
+    def _log(self, text):
+        import tempfile
+        handle = tempfile.NamedTemporaryFile("w", suffix=".log", delete=False)
+        handle.write(text); handle.close()
+        return Path(handle.name)
+
+    def test_both_judges_all_failed_wording_is_recognised(self):
+        # Matching only the in-tree judge's phrasing killed a shard whose VMs
+        # had all died, instead of recording an empty batch and carrying on.
+        self.assertTrue(run_queue.batch_ran_empty(
+            self._log("error: no eligible trajectory runs found\n")))
+        self.assertTrue(run_queue.batch_ran_empty(
+            self._log("No completed runs found in: /work/trajectory_review/jpeg_runs\n")))
+
+    def test_a_real_failure_is_not_mistaken_for_an_empty_batch(self):
+        self.assertFalse(run_queue.batch_ran_empty(
+            self._log("error: judge exited 1\nTraceback...\n")))
+        self.assertFalse(run_queue.batch_ran_empty(Path("/nonexistent/x.log")))

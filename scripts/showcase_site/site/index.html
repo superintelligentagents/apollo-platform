@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Explore 100 difficult browser-agent tasks, model scores, rubric verdicts, and every recorded trajectory step.">
+  <title>OdysseysMega | Turing agent evaluation</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%27http://www.w3.org/2000/svg%27 viewBox=%270 0 100 100%27%3E%3Cpath d=%27M18 24h64v16H58v42H42V40H18z%27 fill=%27%232f6fb3%27/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/style.css?v=20260908a">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to benchmark</a>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="OdysseysMega home">
+      <span class="turing-wordmark">TURING</span>
+      <span class="brand-divider" aria-hidden="true"></span>
+      <span class="brand-name">OdysseysMega</span>
+    </a>
+    <nav class="site-nav" aria-label="Primary navigation">
+      <a href="#overview">Overview</a>
+      <a href="#examples">Examples</a>
+      <a href="#method">Method</a>
+      <a href="#failures">Failures</a>
+      <a href="#tasks">Tasks</a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <header class="hero" id="overview">
+      <div class="content-width">
+        <p class="eyebrow">Turing × OdysseysMega</p>
+        <h1>Evaluating frontier AI agents on hard, real-world web tasks.</h1>
+        <p class="hero-copy" id="sub">Loading the dataset…</p>
+        <div class="hero-metric" id="heroMetric" aria-live="polite"></div>
+        <a class="hero-cta" href="#tasks">Browse task trajectories <span aria-hidden="true">↓</span></a>
+      </div>
+    </header>
+
+    <div class="content-width">
+      <section class="stats" id="stats" aria-label="Dataset summary">
+        <div class="stat-skeleton"></div>
+        <div class="stat-skeleton"></div>
+        <div class="stat-skeleton"></div>
+        <div class="stat-skeleton"></div>
+      </section>
+
+      <section class="story-section" id="findings" aria-labelledby="findings-title">
+        <div class="story-label"><p class="eyebrow">What we tested</p><span>01</span></div>
+        <div class="story-copy">
+          <h2 id="findings-title">The tasks involve several stages of web research.</h2>
+          <p>OdysseysMega measures whether an agent can turn extended work across live websites into a usable, review-ready result. Tasks require sustained browsing, evidence gathering, comparison, and often document or spreadsheet construction; every rubric is judged against the complete screenshot history rather than the final answer alone.</p>
+          <p class="results-prose" id="resultsProse">Loading the agent comparison…</p>
+        </div>
+      </section>
+
+      <section class="trajectory-showcase" id="examples" aria-labelledby="examples-title">
+        <header class="narrative-heading showcase-heading">
+          <p class="eyebrow">Trajectory examples</p>
+          <h2 id="examples-title">A few trajectories from the benchmark</h2>
+          <p>The failure view uses sustained attempts with at least 20 recorded steps. These runs miss task requirements after doing real research. Examples dominated by login, loading, access, or environment problems are left out.</p>
+        </header>
+
+        <div class="featured-filterbar" aria-label="Trajectory filters">
+          <div>
+            <span>Agent</span>
+            <div class="featured-model-tabs" id="featuredModelTabs" role="group" aria-label="Choose an agent"></div>
+          </div>
+          <div>
+            <span>Result</span>
+            <div class="featured-outcome-tabs" id="featuredOutcomeTabs" role="group" aria-label="Choose a run result">
+              <button class="active" type="button" data-featured-outcome="lower" aria-pressed="true">Task failures</button>
+              <button type="button" data-featured-outcome="strong" aria-pressed="false">Strong runs</button>
+            </div>
+          </div>
+        </div>
+
+        <label class="featured-mobile-picker" for="featuredTaskSelect">
+          <span>Choose a task</span>
+          <select id="featuredTaskSelect" aria-label="Choose a trajectory example"></select>
+        </label>
+
+        <div class="featured-workbench">
+          <aside class="featured-task-list" id="featuredTaskList" aria-label="Trajectory examples"></aside>
+          <article class="featured-viewer" aria-live="polite">
+            <header class="featured-viewer-head">
+              <div class="featured-task-heading">
+                <p class="eyebrow" id="featuredCategory">Loading example</p>
+                <h3 id="featuredTitle">Loading trajectory</h3>
+              </div>
+              <div class="featured-run-label"><span id="featuredAgent">sol</span><strong id="featuredOutcome">Task failure</strong></div>
+            </header>
+
+            <div class="featured-evidence-grid">
+              <div class="featured-frame" id="featuredFrame" aria-busy="true">
+                <div class="featured-loading" id="featuredLoading"><span></span> Loading recorded frame</div>
+                <img id="featuredImage" alt="" hidden>
+                <div class="featured-error" id="featuredError" hidden>Screenshot unavailable</div>
+                <output class="featured-position" id="featuredPosition">Frame 1</output>
+              </div>
+
+              <aside class="featured-rubric-panel" aria-label="Rubric progress">
+                <header>
+                  <div><span>Derived evidence score</span><strong id="featuredEvidenceScore">0.000</strong></div>
+                  <span id="featuredFinalScore">Final 0.000</span>
+                </header>
+                <svg id="featuredScoreTimeline" viewBox="0 0 300 58" preserveAspectRatio="none" aria-hidden="true"></svg>
+                <p class="featured-rubric-meta" id="featuredRubricMeta">0 of 0 supported by this frame</p>
+                <div class="featured-rubric-list" id="featuredRubricList"></div>
+                <p class="featured-evidence-note">Checks appear at the first frame cited by the final judge. Crosses show final failed rubrics. This is an evidence view rather than a new judge call at every frame.</p>
+              </aside>
+            </div>
+
+            <div class="featured-step-copy">
+              <div>
+                <span>Agent action</span>
+                <p id="featuredAction">Loading the first recorded action</p>
+              </div>
+              <dl class="featured-run-facts">
+                <div><dt>Score</dt><dd id="featuredScore">0.000</dd></div>
+                <div><dt>Rubrics</dt><dd id="featuredRubrics">0 of 0</dd></div>
+                <div><dt>Time</dt><dd id="featuredDuration">Loading</dd></div>
+                <div><dt>Steps</dt><dd id="featuredSteps">0</dd></div>
+              </dl>
+            </div>
+
+            <footer class="featured-controls">
+              <button class="featured-play" id="featuredPlay" type="button" aria-label="Play trajectory" disabled>▶ <span>Play</span></button>
+              <button class="featured-step-button" id="featuredPrevious" type="button" aria-label="Previous step" disabled>←</button>
+              <label class="featured-scrubber">
+                <span class="visually-hidden">Trajectory step</span>
+                <input id="featuredScrubber" type="range" min="1" max="1" value="1" disabled>
+              </label>
+              <button class="featured-step-button" id="featuredNext" type="button" aria-label="Next step" disabled>→</button>
+              <a class="featured-open" id="featuredOpen" href="#examples">Open full trajectory <span aria-hidden="true">↗</span></a>
+            </footer>
+          </article>
+        </div>
+      </section>
+
+      <section class="construction-section" id="method" aria-labelledby="method-title">
+        <header class="narrative-heading">
+          <p class="eyebrow">Data construction and quality</p>
+          <h2 id="method-title">High-quality tasks are made, screened, and only then selected.</h2>
+          <p>The benchmark began with live, author-approved work from Turing’s reporting pipeline rather than a stale task snapshot. Quality control separated whether a task was fair and verifiable from whether an agent found it difficult.</p>
+        </header>
+        <div class="construction-grid">
+          <article>
+            <span class="stage-number">01 / Construct</span>
+            <h3>Annotator-built and signed off</h3>
+            <p>Turing annotators wrote long-horizon requests and concrete rubrics, verified the intended websites and evidence, and approved the task before it entered the candidate pool.</p>
+            <strong>Approved tasks only</strong>
+          </article>
+          <article>
+            <span class="stage-number">02 / Screen</span>
+            <h3>Fairness before difficulty</h3>
+            <p>Starting candidates needed a genuine multi-step browser attempt, at least five rubrics, clean judge output, taxonomy coverage, and no content-filter exclusion. Twelve fairness-review agents then checked for stale values, access gates, underspecification, contradictions, and ungradeable evidence.</p>
+            <strong>225 candidates → 211 fair</strong>
+          </article>
+          <article>
+            <span class="stage-number">03 / Select</span>
+            <h3>Representative by design</h3>
+            <p>Rejected tasks could not return. Fair tasks were filled scarcest-category first, with category floors, an eight-task author cap, and subject spread; difficulty only broke ties within a category.</p>
+            <strong>100 tasks · 20 categories · 22 authors</strong>
+          </article>
+        </div>
+        <aside class="quality-note">
+          <span>Quality-control correction</span>
+          <p>A 1,100-character export limit was found to truncate rubric text for 43 candidates. Every affected task was re-screened using the full rubric text, and those corrected verdicts replaced the truncated reviews.</p>
+        </aside>
+      </section>
+
+      <section class="overview-grid" aria-label="Dataset overview">
+        <article class="distribution-panel">
+          <header class="section-head compact">
+            <div>
+              <p class="eyebrow">Task distribution</p>
+              <h2>Work across the open web</h2>
+            </div>
+            <span class="section-count" id="categoryCount"></span>
+          </header>
+          <div class="distribution" id="distribution"></div>
+        </article>
+
+        <article class="agents-panel" id="agents">
+          <header class="section-head compact">
+            <div>
+              <p class="eyebrow">Evaluated agents</p>
+              <h2>Two frontier agents</h2>
+            </div>
+          </header>
+          <div class="agent-list" id="agentList"></div>
+          <div class="method-note">
+            <p class="eyebrow">Evaluation lineage</p>
+            <h3>Built on Odysseys</h3>
+            <p>Turing annotators constructed long-horizon tasks that require agents to research and act across live websites, then reviewed and signed off on each task, rubric, and expected evidence. From the approved pool, we selected 100 tasks with genuine multi-step browser histories, no judge errors, and strong fairness, gradeability, category coverage, and author diversity; every model run is judged from its complete screenshot history.</p>
+            <a href="https://github.com/ljang0/Odysseys" target="_blank" rel="noopener">View Odysseys ↗</a>
+          </div>
+        </article>
+      </section>
+
+      <section class="failure-section" id="failures" aria-labelledby="failure-title">
+        <header class="narrative-heading">
+          <p class="eyebrow">Failure analysis</p>
+          <h2 id="failure-title">Many runs gather information but do not finish the requested work.</h2>
+          <p id="failureLead">Loading failure analysis from the published judge records…</p>
+        </header>
+        <div class="finding-grid" id="findingGrid" aria-label="Key findings"></div>
+        <div class="failure-layout">
+          <div class="failure-prose">
+            <h3>What the trajectories reveal</h3>
+            <p>Agents often gathered useful fragments but failed to convert them into the requested comparison, plan, spreadsheet, or other final artifact. Missing fields and weak source verification were visible too, but simple page-access failures account for a much smaller portion of the recorded judge explanations.</p>
+            <p>A step limit can mark a run that was already struggling, so the relationship between capped trajectories and failed rubrics is descriptive. It does not show that the cap caused the failure.</p>
+          </div>
+          <aside class="failure-panel">
+            <header><div><p class="eyebrow">Judge-language review</p><h3>Recurring failure signals</h3></div><span id="failureTotal"></span></header>
+            <div id="failureModes"></div>
+            <p class="analysis-caveat">Rule-based counts from final judge explanations. Themes overlap and do not cover every failure.</p>
+          </aside>
+        </div>
+      </section>
+
+      <section class="task-index" id="tasks" aria-labelledby="task-index-title">
+        <header class="section-head">
+          <div>
+            <p class="eyebrow">The evidence</p>
+            <h2 id="task-index-title">Explore all 100 tasks</h2>
+            <p>Open any score to watch the complete browser trajectory, frame by frame.</p>
+          </div>
+          <output class="result-count" id="resultCount" aria-live="polite"></output>
+        </header>
+
+        <div class="filters">
+          <label class="search-field" for="q">
+            <span class="visually-hidden">Search tasks</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg>
+            <input id="q" type="search" placeholder="Search tasks" autocomplete="off">
+          </label>
+          <label>
+            <span class="visually-hidden">Category</span>
+            <select id="cat"><option value="">All categories</option></select>
+          </label>
+          <label>
+            <span class="visually-hidden">Sort tasks</span>
+            <select id="sortBy">
+              <option value="title">Sort by task name</option>
+              <option value="opus">Sort by Opus 5 score</option>
+              <option value="sol">Sort by sol score</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="task-cards" id="rows">
+          <div class="task-card loading-card">Loading tasks…</div>
+        </div>
+        <div class="load-more-wrap" id="loadMoreWrap" hidden>
+          <button class="button secondary" id="showMore" type="button">Show more tasks</button>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <span>OdysseysMega · Turing frontier agent evaluation</span>
+    <a href="https://github.com/ljang0/Odysseys" target="_blank" rel="noopener">Odysseys</a>
+  </footer>
+  <script type="module" src="/app.js?v=20260908a"></script>
+</body>
+</html>

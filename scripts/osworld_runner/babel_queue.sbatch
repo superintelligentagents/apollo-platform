@@ -91,11 +91,29 @@ export OSWORLD_EXCLUDE_TASKS_FILE=$DATA/apollo-osworld/excluded-tasks.txt
 # Agent backend: muse-spark (Meta) or openai (upstream GPT-5.4-style agent).
 export OSWORLD_AGENT_BACKEND=${OSWORLD_AGENT_BACKEND:-muse-spark}
 export OSWORLD_OPENAI_ENV_FILE=${OSWORLD_OPENAI_ENV_FILE:-$DATA/apollo-osworld/openai.env}
+# The anthropic backend needs its own key AND the OpenAI one: the agent is
+# Claude, the rubric judge stays on OpenAI so scores stay comparable.
+export OSWORLD_ANTHROPIC_ENV_FILE=${OSWORLD_ANTHROPIC_ENV_FILE:-$DATA/apollo-osworld/anthropic.env}
+export OSWORLD_ANTHROPIC_MODEL=${OSWORLD_ANTHROPIC_MODEL:-claude-opus-5}
+export OSWORLD_ANTHROPIC_EFFORT=${OSWORLD_ANTHROPIC_EFFORT:-high}
+# A Gemini rubric judge reads its own key; the agent's provider is unrelated.
+export OSWORLD_GEMINI_ENV_FILE=${OSWORLD_GEMINI_ENV_FILE:-$DATA/apollo-osworld/gemini.env}
+# Canonical-agent parity: leave upstream's own operator prompt in place for
+# every backend, so no model is measured with task-specific prompt tuning the
+# others did not get. Set to 1 to restore Apollo's override.
+export OSWORLD_OPERATOR_PROMPT_OVERRIDE=${OSWORLD_OPERATOR_PROMPT_OVERRIDE:-0}
+export OSWORLD_TEXT_REPLY_NUDGES=${OSWORLD_TEXT_REPLY_NUDGES:-0}
 export OSWORLD_OPENAI_MODEL=${OSWORLD_OPENAI_MODEL:-gpt-5.6-luna}
 export OSWORLD_OPENAI_REASONING_EFFORT=${OSWORLD_OPENAI_REASONING_EFFORT:-medium}
 export OSWORLD_JUDGE_MODEL=${OSWORLD_JUDGE_MODEL:-gpt-5.4-mini}
 # Multi-model coverage: skip a task only when THIS model already ran it.
 export OSWORLD_DEDUPE_BY_MODEL=${OSWORLD_DEDUPE_BY_MODEL:-}
+# Re-run campaigns: judge against a clean rubric proposal, restrict the run to
+# the tasks it names, and count a task done only once THIS campaign has run it
+# (dedup by model alone would call every already-covered task done).
+export OSWORLD_RUBRIC_OVERLAY_JSON=${OSWORLD_RUBRIC_OVERLAY_JSON:-}
+export OSWORLD_RUN_LABEL_PREFIX=${OSWORLD_RUN_LABEL_PREFIX:-}
+export OSWORLD_DEDUPE_RUN_LABEL_PREFIX=${OSWORLD_DEDUPE_RUN_LABEL_PREFIX:-}
 if [[ "$OSWORLD_AGENT_BACKEND" != "openai" && -e "$OSWORLD_META_BLOCK_MARKER" ]]; then
   echo "Meta block marker present ($OSWORLD_META_BLOCK_MARKER); not starting"
   exit 0

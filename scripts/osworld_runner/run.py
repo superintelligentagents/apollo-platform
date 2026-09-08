@@ -60,7 +60,16 @@ GPT54_FILES = {
     "mm_agents/gpt54_agent.py": "cf27dd0b2244e34a40586d21fd892d77cacb558427c8852e5ce03900eb5c467c",
     "scripts/python/run_multienv_gpt54.py": "3710dbd75892e188512395ca62db2ddea9edaa9f0f3b93e889d5bb2741c3f15e",
 }
-AGENT_BACKENDS = ("muse-spark", "openai")
+# Anthropic backend: the fork's own Claude agent and runner, not upstream's.
+# The fork is ahead here (the reverse of the OpenAI backend): it guards the AWS
+# provider import behind a provider check, dispatches computer-tool versions per
+# model, and carries the output_config effort fix. Upstream's copy has none of
+# those, so pinning it would run a different agent than the one this project
+# maintains.
+CLAUDE_RUNNER_PATH = Path("scripts/python/run_multienv_claude.py")
+AGENT_BACKENDS = ("muse-spark", "openai", "anthropic")
+DEFAULT_ANTHROPIC_MODEL = "claude-opus-5"
+DEFAULT_ANTHROPIC_EFFORT = "high"
 DEFAULT_OPENAI_MODEL = "gpt-5.6-luna"
 DEFAULT_OPENAI_REASONING_EFFORT = "medium"
 DEFAULT_OPENAI_JUDGE_MODEL = "gpt-5.4-mini"
@@ -274,13 +283,18 @@ def fetch_reporting_tasks(api_url: str, token: str) -> list[dict[str, Any]]:
 
 
 def fetch_trajectory_task_ids(
-    api_url: str, token: str, *, model: str | None = None
+    api_url: str, token: str, *, model: str | None = None, run_label_prefix: str | None = None
 ) -> set[str]:
     """Task IDs that already have a trajectory.
 
     With `model`, only trajectories produced by that model count, so a
     multi-model campaign can run a second agent over tasks another agent
     already covered while still terminating once this model has done them all.
+
+    With `run_label_prefix`, only trajectories from that campaign count. A
+    re-run of tasks the same model already covered needs this: dedup by model
+    alone would report every task as done, and no dedup at all never marks
+    anything done, so the shards would re-select the same tasks every batch.
     """
     task_ids: set[str] = set()
     offset = 0
@@ -298,6 +312,8 @@ def fetch_trajectory_task_ids(
             for item in items
             if isinstance(item, Mapping)
             if model is None or _text(item.get("model"), 200) == model
+            if run_label_prefix is None
+            or _text(item.get("run_label"), 240).startswith(run_label_prefix)
             for task_id in [_text(item.get("task_id"), 300)]
             if task_id
         )
@@ -310,6 +326,89 @@ def fetch_trajectory_task_ids(
         except (TypeError, ValueError) as exc:
             raise BridgeError("trajectory reporting API returned an invalid next_offset") from exc
     return task_ids
+
+
+def load_rubric_overlay(path: Path | None) -> dict[str, dict[str, Any]]:
+    """Clean rubric proposals to run instead of the packaged ones, by task ID.
+
+    The proposals are advisory: they carry status PENDING_AUTHOR_CONFIRMATION
+    and do not amend accepted gold. So they never decide whether a task may
+    run -- the reporting API stays the only source of approval, sign-off, and
+    the task prompt -- and this supplies only the rubric text the judge scores.
+    """
+    if path is None:
+        return {}
+    try:
+        raw = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BridgeError(f"cannot read rubric overlay {path}: {exc}") from exc
+    values = raw.get("tasks") if isinstance(raw, Mapping) else raw
+    if not isinstance(values, list) or not values:
+        raise BridgeError("rubric overlay must be an array or an object with a tasks array")
+    overlay: dict[str, dict[str, Any]] = {}
+    for position, value in enumerate(values):
+        if not isinstance(value, Mapping):
+            raise BridgeError(f"rubric overlay item {position} is not an object")
+        task_id = _text(value.get("task_id"), 300)
+        rubrics = value.get("rubrics")
+        if not task_id or not isinstance(rubrics, list) or not rubrics:
+            raise BridgeError(f"rubric overlay item {position} needs a task_id and rubrics")
+        if task_id in overlay:
+            raise BridgeError(f"duplicate task_id in rubric overlay: {task_id}")
+        overlay[task_id] = {
+            "prompt": _text(value.get("confirmed_task") or value.get("task"), 200_000),
+            "rubrics": [rubric for rubric in rubrics if isinstance(rubric, Mapping)],
+        }
+    return overlay
+
+
+def apply_rubric_overlay(
+    tasks: Sequence[dict[str, Any]], overlay: Mapping[str, Mapping[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Swap in the clean rubrics, refusing any task the overlay disagrees about.
+
+    A proposal is only meaningful against the request it was written for, and
+    only for the exact rubrics that request was approved with. If either has
+    moved since the proposal was generated, the overlay is stale for that task
+    and it is dropped rather than run against rubrics nobody proposed.
+    """
+    updated: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    for task in tasks:
+        task_id = _text(task.get("task_id"), 300)
+        proposal = overlay.get(task_id)
+        if proposal is None:
+            continue
+        content = task.get("content") if isinstance(task.get("content"), Mapping) else {}
+        final = content.get("final") if isinstance(content.get("final"), Mapping) else {}
+        packaged = content.get("rubrics") if isinstance(content.get("rubrics"), list) else []
+        prompt = _text(final.get("request"), 200_000)
+        if proposal["prompt"] and proposal["prompt"].strip() != prompt.strip():
+            rejected.append({"task_id": task_id, "reason": "overlay prompt differs from the approved request"})
+            continue
+        proposed = {_text(rubric.get("rubric_id"), 100): rubric for rubric in proposal["rubrics"]}
+        packaged_ids = [_text(rubric.get("rubric_id"), 100) for rubric in packaged if isinstance(rubric, Mapping)]
+        if sorted(proposed) != sorted(packaged_ids) or len(packaged_ids) != len(set(packaged_ids)):
+            rejected.append({"task_id": task_id, "reason": "overlay rubric IDs differ from the approved set"})
+            continue
+        rubrics = []
+        for rubric in packaged:
+            replacement = proposed[_text(rubric.get("rubric_id"), 100)]
+            requirement = _text(replacement.get("requirement") or replacement.get("final"), 30_000)
+            if not requirement:
+                rubrics = []
+                break
+            rubrics.append({
+                **rubric,
+                "final": requirement,
+                "requirement": requirement,
+                "verification": _text(replacement.get("verification"), 20_000),
+            })
+        if not rubrics:
+            rejected.append({"task_id": task_id, "reason": "overlay rubric text is empty"})
+            continue
+        updated.append({**task, "content": {**content, "rubrics": rubrics}})
+    return updated, rejected
 
 
 def runnable_reason(
@@ -929,12 +1028,28 @@ def ensure_gpt54_overlay(paths: JobPaths) -> Path:
     )
 
 
+def claude_runner(osworld_root: Path) -> Path:
+    """The fork's Claude runner, which its own mm_agents.anthropic backs."""
+    runner = osworld_root.expanduser().resolve() / CLAUDE_RUNNER_PATH
+    if not runner.is_file():
+        raise BridgeError(f"Claude runner not found in the OSWorld checkout: {runner}")
+    return runner
+
+
 def agent_model(args: argparse.Namespace) -> str:
-    return args.openai_model if args.agent_backend == "openai" else args.meta_model
+    if args.agent_backend == "openai":
+        return args.openai_model
+    if args.agent_backend == "anthropic":
+        return args.anthropic_model
+    return args.meta_model
 
 
 def agent_label(args: argparse.Namespace) -> str:
-    return "OSWorld GPT54Agent" if args.agent_backend == "openai" else "OSWorld MuseSparkAgent"
+    if args.agent_backend == "openai":
+        return "OSWorld GPT54Agent"
+    if args.agent_backend == "anthropic":
+        return "OSWorld AnthropicAgent"
+    return "OSWorld MuseSparkAgent"
 
 
 def validate_osworld(args: argparse.Namespace, paths: JobPaths, muse_runner: Path) -> None:
@@ -984,6 +1099,8 @@ def osworld_command(args: argparse.Namespace, paths: JobPaths) -> list[str]:
         "--max_retries", str(args.max_retries),
         "--num_envs", str(args.num_envs),
         "--sleep_after_execution", str(args.sleep_after_execution),
+        "--screen_width", str(args.screen_width),
+        "--screen_height", str(args.screen_height),
         "--result_dir", str(paths.results),
         "--test_config_base_dir", str(paths.configs),
         "--test_all_meta_path", str(paths.meta),
@@ -1015,6 +1132,8 @@ def openai_osworld_command(args: argparse.Namespace, paths: JobPaths) -> list[st
         "--max_trajectory_length", str(args.max_trajectory_length),
         "--num_envs", str(args.num_envs),
         "--sleep_after_execution", str(args.sleep_after_execution),
+        "--screen_width", str(args.screen_width),
+        "--screen_height", str(args.screen_height),
         "--result_dir", str(paths.results),
         "--test_config_base_dir", str(paths.configs),
         "--test_all_meta_path", str(paths.meta),
@@ -1026,6 +1145,63 @@ def openai_osworld_command(args: argparse.Namespace, paths: JobPaths) -> list[st
     if args.provider_name == "aws":
         command.extend(["--region", args.aws_region])
     return command
+
+
+def anthropic_osworld_command(args: argparse.Namespace, paths: JobPaths) -> list[str]:
+    """Drive upstream's run_multienv_claude.py through the same launcher shim.
+
+    The shim is what lets a hash-pinned upstream runner accept the fork's
+    apptainer provider; it patches whichever agent modules import, so the
+    Claude overlay simply skips the OpenAI and Meta patches.
+    """
+    root = args.osworld_root.expanduser().resolve()
+    command = [
+        str(root / ".venv/bin/python"),
+        str(Path(__file__).with_name("muse_spark_launcher.py")),
+        "--provider_name", args.provider_name,
+        "--headless",
+        "--action_space", "pyautogui",
+        "--observation_type", "screenshot",
+        "--model", args.anthropic_model,
+        # The checkout's runner takes --effort (output_config) and a
+        # --no-thinking switch; upstream's --thinking does not exist here.
+        "--effort", args.anthropic_effort,
+        "--max_tokens", str(args.anthropic_max_tokens),
+        "--max_steps", str(args.max_steps),
+        "--max_trajectory_length", str(args.max_trajectory_length),
+        "--num_envs", str(args.num_envs),
+        "--sleep_after_execution", str(args.sleep_after_execution),
+        "--screen_width", str(args.screen_width),
+        "--screen_height", str(args.screen_height),
+        "--result_dir", str(paths.results),
+        "--test_config_base_dir", str(paths.configs),
+        "--test_all_meta_path", str(paths.meta),
+        "--domain", args.domain,
+        "--client_password", args.client_password,
+    ]
+    if args.provider_name in {"vmware", "docker"}:
+        command.extend(["--path_to_vm", str(args.path_to_vm.expanduser().resolve())])
+    if args.provider_name == "aws":
+        command.extend(["--region", args.aws_region])
+    return command
+
+
+def anthropic_child_environment(api_key: str, runner: Path, osworld_root: Path) -> dict[str, str]:
+    """Only the Anthropic key reaches the child; the judge's key is not needed there.
+
+    No overlay is prepended: mm_agents.anthropic must resolve to the checkout's
+    own agent, which is the one the runner was written against.
+    """
+    environment = sanitized_environment()
+    pythonpath = [str(osworld_root.expanduser().resolve())]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment.update({
+        "ANTHROPIC_API_KEY": api_key,
+        "MUSE_SPARK_RUNNER_PATH": str(runner),
+        "PYTHONPATH": os.pathsep.join(pythonpath),
+    })
+    return environment
 
 
 def openai_child_environment(openai_key: str, runner: Path, osworld_root: Path) -> dict[str, str]:
@@ -1047,6 +1223,10 @@ def run_osworld(args: argparse.Namespace, paths: JobPaths, agent_key: str) -> No
         runner = ensure_gpt54_overlay(paths)
         command = openai_osworld_command(args, paths)
         environment = openai_child_environment(agent_key, runner, args.osworld_root)
+    elif args.agent_backend == "anthropic":
+        runner = claude_runner(args.osworld_root)
+        command = anthropic_osworld_command(args, paths)
+        environment = anthropic_child_environment(agent_key, runner, args.osworld_root)
     else:
         runner = ensure_muse_spark_overlay(paths)
         command = osworld_command(args, paths)
@@ -1067,9 +1247,9 @@ def trajectory_command(args: argparse.Namespace, paths: JobPaths, *, plan: bool)
         "--runs-dir", str(paths.runs),
         "--task-source-json", str(paths.tasks),
         "--output-dir", str(paths.trajectory_output),
-        "--provider", "openai" if args.agent_backend == "openai" else "meta",
+        "--provider", judge_provider(args),
         "--judge-impl", args.judge_impl,
-        "--model", args.judge_model if args.agent_backend == "openai" else args.meta_model,
+        "--model", args.meta_model if args.agent_backend == "muse-spark" else args.judge_model,
         "--queue", args.queue,
         "--num-workers", str(args.judge_workers),
         "--max-images", str(args.judge_max_images),
@@ -1086,20 +1266,22 @@ def trajectory_command(args: argparse.Namespace, paths: JobPaths, *, plan: bool)
     return command
 
 
-def publish_trajectories(args: argparse.Namespace, paths: JobPaths, agent_key: str, *, plan: bool) -> None:
+def publish_trajectories(args: argparse.Namespace, paths: JobPaths, judge_key: str, *, plan: bool) -> None:
     if not paths.runs.is_dir():
         raise BridgeError(f"OSWorld runs do not exist: {paths.runs}")
     if plan:
         subprocess.run(trajectory_command(args, paths, plan=True), check=True)
         return
-    if args.agent_backend == "openai":
-        # The judge talks to OpenAI directly; only the scoped key is forwarded.
+    provider = judge_provider(args)
+    if provider != "meta":
+        # Only the judge's own scoped key is forwarded, under the name that
+        # provider's SDK reads. For a Claude run this is not the agent's key.
         environment = sanitized_environment()
-        environment["OPENAI_API_KEY"] = agent_key
+        environment[JUDGE_KEY_NAMES[provider]] = judge_key
         subprocess.run(trajectory_command(args, paths, plan=False), check=True, env=environment)
         return
     with meta_proxy(
-        agent_key,
+        judge_key,
         args.meta_model,
         args.meta_base_url,
         args.meta_session_id,
@@ -1128,10 +1310,41 @@ def require_meta_key() -> str:
     )
 
 
+def judge_provider(args: argparse.Namespace) -> str:
+    """Which API the rubric judge talks to.
+
+    The canonical judge picks its backend from the model name, so the model is
+    the single source of truth here -- deciding it from the agent backend
+    instead would send a Gemini judge an OpenAI key.
+    """
+    if args.agent_backend == "muse-spark":
+        return "meta"
+    model = (args.judge_model or "").lower()
+    return "gemini" if model.startswith("gemini") else "openai"
+
+
+JUDGE_KEY_NAMES = {"openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}
+
+
 def require_agent_key(args: argparse.Namespace) -> str:
     if args.agent_backend == "openai":
         return require_secret("OPENAI_API_KEY")
+    if args.agent_backend == "anthropic":
+        return require_secret("ANTHROPIC_API_KEY")
     return require_meta_key()
+
+
+def require_judge_key(args: argparse.Namespace) -> str:
+    """The judge's key, which is not always the agent's.
+
+    The judge is chosen independently of the agent so that a new agent's scores
+    stay comparable with the corpus the baseline was measured on. Changing the
+    agent must not silently change the judge, or its key.
+    """
+    provider = judge_provider(args)
+    if provider == "meta":
+        return require_meta_key()
+    return require_secret(JUDGE_KEY_NAMES[provider])
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1150,6 +1363,20 @@ def parser() -> argparse.ArgumentParser:
     )
     value.add_argument("--limit", type=int, default=1)
     value.add_argument("--include-existing-trajectories", action="store_true")
+    value.add_argument(
+        "--rubric-overlay-json",
+        type=Path,
+        default=None,
+        help="clean rubric proposals to judge against instead of the packaged rubrics; "
+             "restricts the run to the task IDs it names. Approval and the task prompt "
+             "still come from the reporting API",
+    )
+    value.add_argument(
+        "--dedupe-by-run-label-prefix",
+        default="",
+        help="count a task as already done only when it has a trajectory whose run_label "
+             "starts with this prefix, so a campaign re-running covered tasks terminates",
+    )
     value.add_argument(
         "--dedupe-by-model",
         action="store_true",
@@ -1191,6 +1418,10 @@ def parser() -> argparse.ArgumentParser:
         help="Maximum Meta SDK retries for a desktop-agent request",
     )
     value.add_argument("--client-password", default="password")
+    # The guest renders at this size and is screenshotted every step, so it
+    # drives the VM's memory use and the payload the judge is later sent.
+    value.add_argument("--screen-width", type=int, default=1920)
+    value.add_argument("--screen-height", type=int, default=1080)
     value.add_argument("--meta-model", default=DEFAULT_META_MODEL)
     value.add_argument("--meta-base-url", default=DEFAULT_META_BASE_URL)
     value.add_argument("--meta-session-id", default=DEFAULT_META_SESSION_ID)
@@ -1201,6 +1432,13 @@ def parser() -> argparse.ArgumentParser:
         help="desktop agent: Meta Muse Spark (default) or upstream OSWorld's OpenAI GPT-5.4-style agent",
     )
     value.add_argument("--openai-model", default=DEFAULT_OPENAI_MODEL)
+    value.add_argument("--anthropic-model", default=DEFAULT_ANTHROPIC_MODEL)
+    value.add_argument(
+        "--anthropic-effort", default=DEFAULT_ANTHROPIC_EFFORT,
+        choices=("max", "high", "medium", "low"),
+        help="output_config effort for the Claude agent",
+    )
+    value.add_argument("--anthropic-max-tokens", type=int, default=16_000)
     value.add_argument(
         "--openai-reasoning-effort",
         choices=("none", "low", "medium", "high", "xhigh"),
@@ -1262,12 +1500,17 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.stage in {"fetch", "all"} and not args.plan:
             token = require_secret("APOLLO_REPORTING_TOKEN")
             all_tasks = fetch_reporting_tasks(args.api_url, token)
+            overlay = load_rubric_overlay(args.rubric_overlay_json)
+            overlay_rejected: list[dict[str, str]] = []
+            if overlay:
+                all_tasks, overlay_rejected = apply_rubric_overlay(all_tasks, overlay)
             existing_task_ids = (
                 set() if args.include_existing_trajectories
                 else fetch_trajectory_task_ids(
                     args.api_url,
                     token,
                     model=agent_model(args) if args.dedupe_by_model else None,
+                    run_label_prefix=args.dedupe_by_run_label_prefix or None,
                 )
             )
             selected, skipped = select_tasks(
@@ -1289,14 +1532,16 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "job": manifest,
                 "skipped_count": len(skipped),
                 "existing_trajectory_tasks": len(existing_task_ids),
+                "rubric_overlay_tasks": len(overlay),
+                "rubric_overlay_rejected": overlay_rejected,
             }, indent=2))
 
         if args.stage in {"run", "all"} and not args.plan:
             run_osworld(args, paths, require_agent_key(args))
 
         if args.stage in {"publish", "all"}:
-            agent_key = "" if args.plan else require_agent_key(args)
-            publish_trajectories(args, paths, agent_key, plan=args.plan)
+            judge_key = "" if args.plan else require_judge_key(args)
+            publish_trajectories(args, paths, judge_key, plan=args.plan)
     except (BridgeError, OSError, subprocess.CalledProcessError) as exc:
         raise SystemExit(f"error: {exc}") from exc
 

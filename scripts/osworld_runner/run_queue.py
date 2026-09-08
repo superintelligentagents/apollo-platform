@@ -32,6 +32,8 @@ from scripts.osworld_runner.run import (
     DEFAULT_OSWORLD_ROOT,
     fetch_reporting_tasks,
     fetch_trajectory_task_ids,
+    load_rubric_overlay,
+    apply_rubric_overlay,
     get_json,
     read_task_id_list,
     select_tasks,
@@ -78,6 +80,36 @@ def run_command(command: Sequence[str], output: Path) -> None:
         )
 
 
+def required_keys(agent_backend: str, judge_model: str = "") -> tuple[str, ...]:
+    """Secrets a shard needs before it starts.
+
+    The agent and the judge are chosen independently, so their keys are too: a
+    Claude run judged by Gemini needs an Anthropic key and a Gemini one, and
+    neither an OpenAI key nor the Meta key it used to demand by default.
+    """
+    agent = {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+    }.get(agent_backend, "MUSE_SPARK_API_KEY")
+    if agent_backend == "muse-spark":
+        return (agent,)   # the Meta judge reaches the same key through a proxy
+    judge = "GEMINI_API_KEY" if judge_model.lower().startswith("gemini") else "OPENAI_API_KEY"
+    return (agent,) if agent == judge else (agent, judge)
+
+
+def agent_model_for(args: argparse.Namespace) -> str | None:
+    """The model name trajectories are published under, for this backend.
+
+    Dedup compares against it, so a backend missing here would silently dedupe
+    against no model at all and re-run tasks it had already covered.
+    """
+    if args.agent_backend == "openai":
+        return args.openai_model
+    if args.agent_backend == "anthropic":
+        return args.anthropic_model
+    return None
+
+
 def available_tasks(
     queue: str,
     token: str,
@@ -86,10 +118,17 @@ def available_tasks(
     shard_index: int,
     excluded_ids: frozenset[str] = frozenset(),
     dedupe_model: str | None = None,
+    dedupe_run_label_prefix: str | None = None,
+    rubric_overlay_json: Path | None = None,
 ) -> tuple[int, int]:
     api_url = DEFAULT_APIS[queue]
     tasks = fetch_reporting_tasks(api_url, token)
-    existing = fetch_trajectory_task_ids(api_url, token, model=dedupe_model)
+    overlay = load_rubric_overlay(rubric_overlay_json)
+    if overlay:
+        tasks, _ = apply_rubric_overlay(tasks, overlay)
+    existing = fetch_trajectory_task_ids(
+        api_url, token, model=dedupe_model, run_label_prefix=dedupe_run_label_prefix
+    )
     selected, _ = select_tasks(
         tasks,
         queue=queue,
@@ -348,13 +387,22 @@ def compact_batch(batch_dir: Path) -> None:
             path.unlink()
 
 
+# Each judge words an all-failed batch differently, and matching only one of
+# them turns a batch whose VMs all died into a dead shard instead of a recorded
+# empty batch -- work the queue would otherwise have retried.
+EMPTY_BATCH_MARKERS = (
+    "no eligible trajectory runs found",   # the in-tree judge
+    "No completed runs found in",          # the canonical judge
+)
+
+
 def batch_ran_empty(command_log: Path) -> bool:
     """True when publish failed because every task in the batch failed to run."""
     try:
         tail = command_log.read_bytes()[-20_000:].decode("utf-8", "replace")
     except OSError:
         return False
-    return "no eligible trajectory runs found" in tail
+    return any(marker in tail for marker in EMPTY_BATCH_MARKERS)
 
 
 def publish_batch_with_retry(
@@ -416,15 +464,23 @@ def command_base(args: argparse.Namespace, batch_dir: Path) -> list[str]:
         "--agent-backend", args.agent_backend,
         "--openai-model", args.openai_model,
         "--openai-reasoning-effort", args.openai_reasoning_effort,
+        "--anthropic-model", args.anthropic_model,
+        "--anthropic-effort", args.anthropic_effort,
         "--judge-model", args.judge_model,
         "--judge-max-images", str(args.judge_max_images),
         "--judge-impl", args.judge_impl,
         "--start-url-mode", args.start_url_mode,
+        "--screen-width", str(args.screen_width),
+        "--screen-height", str(args.screen_height),
     ]
     if args.dedupe_by_model:
         command.append("--dedupe-by-model")
     if args.exclude_task_ids_file is not None:
         command.extend(["--exclude-task-ids-file", str(args.exclude_task_ids_file)])
+    if args.rubric_overlay_json is not None:
+        command.extend(["--rubric-overlay-json", str(args.rubric_overlay_json)])
+    if args.dedupe_by_run_label_prefix:
+        command.extend(["--dedupe-by-run-label-prefix", args.dedupe_by_run_label_prefix])
     return command
 
 
@@ -434,8 +490,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--batch-size", type=int, default=3)
     value.add_argument("--num-envs", type=int, default=3)
     value.add_argument("--judge-workers", type=int, default=3)
-    value.add_argument("--max-steps", type=int, default=120)
-    value.add_argument("--max-trajectory-length", type=int, default=120)
+    value.add_argument("--max-steps", type=int, default=100)
+    value.add_argument("--max-trajectory-length", type=int, default=100)
     value.add_argument("--request-timeout", type=float, default=600.0)
     value.add_argument("--max-retries", type=int, default=3)
     value.add_argument("--min-free-gib", type=float, default=35.0)
@@ -451,7 +507,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--shard-index", type=int, default=0)
     value.add_argument("--max-batches", type=int, default=0)
     value.add_argument("--exclude-task-ids-file", type=Path, default=None)
-    value.add_argument("--agent-backend", choices=("muse-spark", "openai"), default="muse-spark")
+    value.add_argument("--agent-backend", choices=("muse-spark", "openai", "anthropic"), default="muse-spark")
+    value.add_argument("--anthropic-model", default="claude-opus-5")
+    value.add_argument("--anthropic-effort", default="high")
     value.add_argument("--openai-model", default="gpt-5.6-luna")
     value.add_argument(
         "--openai-reasoning-effort",
@@ -460,9 +518,14 @@ def parser() -> argparse.ArgumentParser:
     )
     value.add_argument("--judge-model", default="gpt-5.4-mini")
     value.add_argument("--dedupe-by-model", action="store_true")
+    value.add_argument("--rubric-overlay-json", type=Path, default=None)
+    value.add_argument("--dedupe-by-run-label-prefix", default="")
+    value.add_argument("--run-label-prefix", default="Apollo author-approved")
     value.add_argument("--judge-max-images", type=int, default=0)
     value.add_argument("--judge-impl", choices=("repo", "canonical"), default="canonical")
     value.add_argument("--start-url-mode", choices=("google", "site_scope"), default="google")
+    value.add_argument("--screen-width", type=int, default=1920)
+    value.add_argument("--screen-height", type=int, default=1080)
     value.add_argument(
         "--block-marker",
         type=Path,
@@ -481,10 +544,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.shard_count < 1 or args.shard_index < 0 or args.shard_index >= args.shard_count:
         raise SystemExit("shard index must be between 0 and shard-count - 1")
     token = os.environ.get("APOLLO_REPORTING_TOKEN", "").strip()
-    key_name = "OPENAI_API_KEY" if args.agent_backend == "openai" else "MUSE_SPARK_API_KEY"
-    agent_key = os.environ.get(key_name, "").strip()
-    if not token or not agent_key:
-        raise SystemExit(f"APOLLO_REPORTING_TOKEN and {key_name} are required")
+    missing = [name for name in required_keys(args.agent_backend, args.judge_model)
+               if not os.environ.get(name, "").strip()]
+    if not token:
+        missing.insert(0, "APOLLO_REPORTING_TOKEN")
+    if missing:
+        raise SystemExit(f"{', '.join(missing)} required for the {args.agent_backend} backend")
 
     root = args.work_root.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -565,10 +630,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 shard_count=args.shard_count,
                 shard_index=args.shard_index,
                 excluded_ids=excluded_ids,
-                dedupe_model=(
-                    (args.openai_model if args.agent_backend == "openai" else None)
-                    if args.dedupe_by_model else None
-                ),
+                dedupe_model=(agent_model_for(args) if args.dedupe_by_model else None),
+                dedupe_run_label_prefix=args.dedupe_by_run_label_prefix or None,
+                rubric_overlay_json=args.rubric_overlay_json,
             )
             state["remaining_runnable"] = remaining
             state["existing_trajectory_task_ids"] = existing
@@ -589,7 +653,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             selected_count = min(args.batch_size, remaining)
             vendor = "OpenAI" if args.agent_backend == "openai" else "Meta"
             run_label = (
-                f"Apollo author-approved {vendor} production shard "
+                f"{args.run_label_prefix} {vendor} production shard "
                 f"{args.shard_index + 1}/{args.shard_count} batch {batch_number:06d}"
             )
             log(
@@ -619,10 +683,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.queue, token,
                         shard_count=args.shard_count, shard_index=args.shard_index,
                         excluded_ids=excluded_ids,
-                        dedupe_model=(
-                            (args.openai_model if args.agent_backend == "openai" else None)
-                            if args.dedupe_by_model else None
-                        ),
+                        dedupe_model=(agent_model_for(args) if args.dedupe_by_model else None),
+                        dedupe_run_label_prefix=args.dedupe_by_run_label_prefix or None,
+                        rubric_overlay_json=args.rubric_overlay_json,
                     )
                     if still == 0:
                         state["status"] = "complete"

@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import logging
 import os
 import random
 import runpy
+import sys
 import time
+import types
 from pathlib import Path
 from typing import Any
 
@@ -178,6 +181,36 @@ def _remove_with_anonymous_volumes(self: Container, **kwargs: Any) -> Any:
 _add_argument = argparse.ArgumentParser.add_argument
 
 
+def _satisfy_unconditional_aws_import(provider_name: str) -> None:
+    """Let the Claude runner start off AWS.
+
+    Upstream's run_multienv_claude.py imports the AWS provider manager before
+    it knows which provider it is on, and that module raises unless AWS VPC
+    settings are present -- so every environment process dies at startup on any
+    other provider. The OpenAI runner guards the same import with a provider
+    check; this one does not, and upstream main still does not.
+
+    Stand in for the module rather than inventing AWS settings that are not
+    real. The only value taken from it is an AMI used as `snapshot_name`, and
+    the apptainer provider documents that argument as ignored.
+    """
+    if provider_name == "aws":
+        return
+    name = "desktop_env.providers.aws.manager"
+    if name in sys.modules:
+        return
+    module = types.ModuleType(name)
+    module.IMAGE_ID_MAP = collections.defaultdict(lambda: {(1920, 1080): "unused-off-aws"})
+    sys.modules[name] = module
+
+
+def _provider_from_argv(argv: list[str]) -> str:
+    try:
+        return argv[argv.index("--provider_name") + 1]
+    except (ValueError, IndexError):
+        return ""
+
+
 def _add_argument_with_apptainer(self: argparse.ArgumentParser, *args: Any, **kwargs: Any) -> Any:
     """Let the hash-pinned upstream runner accept the fork's apptainer provider."""
     choices = kwargs.get("choices")
@@ -335,6 +368,7 @@ def main() -> None:
     httpx.post = _post_with_session
     Container.remove = _remove_with_anonymous_volumes
     argparse.ArgumentParser.add_argument = _add_argument_with_apptainer
+    _satisfy_unconditional_aws_import(_provider_from_argv(sys.argv))
     # Each backend's agent module resolves from its own pinned overlay; patch
     # whichever ones are importable so retry policy is governed for both.
     try:
