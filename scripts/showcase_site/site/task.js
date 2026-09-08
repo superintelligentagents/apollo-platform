@@ -22,8 +22,8 @@ function gradeMarkup(grade) {
   </details>`;
 }
 
-function runMarkup(run, label, maxSteps, runSlug, playerId) {
-  const capped = run.truncated ? `<span class="cap">step cap</span>` : `<span class="complete-mark">within budget</span>`;
+function runMarkup(run, label, runSlug, playerId) {
+  const capped = run.truncated ? `<span class="cap">interaction cap</span>` : `<span class="complete-mark">within budget</span>`;
   return `<article class="run-card">
     <header class="run-card-head">
       <div><p class="eyebrow">Evaluated agent</p><h3>${escapeHtml(label)}</h3></div>
@@ -31,14 +31,13 @@ function runMarkup(run, label, maxSteps, runSlug, playerId) {
     </header>
     <div class="run-facts">
       <span><strong>${run.rubrics_passed}/${run.rubrics_scored}</strong> rubrics passed</span>
-      <span><strong>${run.steps}</strong> steps</span>
       ${capped}
     </div>
-    ${run.truncated ? `<p class="cap-note">This run stopped at the shared ${maxSteps}-step budget. Read low scores with that limit in mind.</p>` : ""}
+    ${run.truncated ? `<p class="cap-note">This run reached the shared interaction budget. Read low scores with that limit in mind.</p>` : ""}
     <section class="inline-player" data-player="${playerId}" aria-label="${escapeHtml(label)} trajectory slideshow">
       <header class="inline-player-head">
         <button type="button" data-prev aria-label="Previous ${escapeHtml(label)} step">←</button>
-        <output data-position aria-live="polite">1 / ${run.trajectory.length}</output>
+        <output data-position aria-live="polite">Frame 1</output>
         <button type="button" data-next aria-label="Next ${escapeHtml(label)} step">→</button>
       </header>
       <div class="inline-shot-stage" data-stage aria-busy="true">
@@ -99,7 +98,7 @@ function createRunPreview(root, run) {
     loadId += 1;
     const thisLoad = loadId;
     clearTimeout(timer);
-    position.textContent = `${index + 1} / ${run.trajectory.length}`;
+    position.textContent = `Frame ${index + 1}`;
     previous.disabled = index === 0;
     next.disabled = index === run.trajectory.length - 1;
     scrubber.value = String(index + 1);
@@ -130,7 +129,7 @@ function createRunPreview(root, run) {
       stage.setAttribute("aria-busy", "false");
       schedule();
     };
-    image.alt = `Recorded browser state at ${run.model} trajectory step ${step.step}`;
+    image.alt = `Recorded browser state from ${run.model} at frame ${index + 1}`;
     image.src = url;
   };
 
@@ -187,7 +186,7 @@ async function init() {
         const response = await fetch(`/data/runs/${encodeURIComponent(reference.run)}.json`);
         if (!response.ok) throw new Error(`Run request failed (${response.status})`);
         const run = await response.json();
-        return { playerId, run, markup: runMarkup(run, label, data.max_steps, reference.run, playerId) };
+        return { playerId, run, markup: runMarkup(run, label, reference.run, playerId) };
       } catch (error) {
         return {
           markup: `<article class="run-card empty"><p class="eyebrow">Evaluated agent</p><h3>${escapeHtml(label)}</h3><p>${escapeHtml(error.message)}</p></article>`,

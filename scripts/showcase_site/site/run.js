@@ -141,7 +141,7 @@ function loadScreenshot(step) {
     elements.shotStage.setAttribute("aria-busy", "false");
     scheduleNext();
   };
-  elements.screenshot.alt = `Recorded browser state at trajectory step ${step.step}`;
+  elements.screenshot.alt = `Recorded browser state at frame ${stepIndex + 1}`;
   elements.screenshot.src = url;
   elements.fullSize.href = url;
 }
@@ -150,14 +150,14 @@ function drawStep() {
   const step = run.trajectory[stepIndex];
   if (!step) return;
 
-  elements.position.textContent = `${stepIndex + 1} / ${run.trajectory.length}`;
-  elements.stepTitle.textContent = `Step ${step.step}`;
+  elements.position.textContent = `Frame ${stepIndex + 1}`;
+  elements.stepTitle.textContent = `Frame ${stepIndex + 1}`;
   elements.action.textContent = step.action || "No action recorded.";
   elements.response.textContent = step.response || "No agent response recorded.";
   elements.previous.disabled = stepIndex === 0;
   elements.next.disabled = stepIndex === run.trajectory.length - 1;
   elements.scrubber.value = String(stepIndex + 1);
-  elements.scrubber.setAttribute("aria-valuetext", `Step ${stepIndex + 1} of ${run.trajectory.length}`);
+  elements.scrubber.setAttribute("aria-valuetext", `Frame ${stepIndex + 1}`);
   elements.progress.style.width = `${((stepIndex + 1) / run.trajectory.length) * 100}%`;
   history.replaceState(null, "", `${location.pathname}${location.search}#step-${step.step}`);
   updateRubricProgress();
@@ -234,7 +234,7 @@ function updateRubricProgress() {
   marker?.setAttribute("cx", x.toFixed(2));
   marker?.setAttribute("cy", y.toFixed(2));
   elements.scoreAtStep.value = item.score.toFixed(3);
-  elements.progressRubrics.textContent = `${item.passed}/${run.rubrics_scored} supported by step ${run.trajectory[stepIndex].step}`;
+  elements.progressRubrics.textContent = `${item.passed}/${run.rubrics_scored} supported by this frame`;
 }
 
 function showInspector(mode) {
@@ -301,7 +301,7 @@ async function init() {
     document.getElementById("meta").innerHTML = `
       <div class="summary-score"><strong>${run.score.toFixed(3)}</strong><span>rubric score</span></div>
       <div><strong>${run.rubrics_passed}/${run.rubrics_scored}</strong><span>rubrics passed</span></div>
-      <div><strong>${run.steps}</strong><span>steps${run.truncated ? " · cap" : ""}</span></div>`;
+      <div><strong>${run.truncated ? "Reached" : "Within"}</strong><span>interaction budget</span></div>`;
     document.getElementById("prompt").textContent = currentTask?.request || "Task prompt unavailable.";
     document.getElementById("promptPreview").textContent = currentTask?.request
       ? `${currentTask.request.replace(/\s+/g, " ").slice(0, 150)}${currentTask.request.length > 150 ? "…" : ""}`

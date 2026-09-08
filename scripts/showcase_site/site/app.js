@@ -167,7 +167,7 @@ function renderOverview() {
 
   document.getElementById("sub").textContent =
     `${tasks.length} screened, long-horizon tasks test whether agents can research, compare, and act across real websites. ` +
-    `Each agent receives the same ${dataset.max_steps}-step budget. A separate judge scores every requirement against the complete visual record.`;
+    `Each agent receives the same interaction budget. A separate judge scores every requirement against the complete visual record.`;
   document.getElementById("heroMetric").innerHTML = `
     <strong>${fmt(bestMean)}</strong>
     <span>best mean rubric score</span>`;
@@ -377,12 +377,12 @@ function drawFeaturedStep() {
   const step = featuredRun?.trajectory[featuredStepIndex];
   if (!step) return;
 
-  featuredElements.position.textContent = `Frame ${featuredStepIndex + 1} of ${featuredRun.trajectory.length}`;
+  featuredElements.position.textContent = `Frame ${featuredStepIndex + 1}`;
   featuredElements.action.textContent = compactCopy(step.action || step.response || "No action was recorded for this frame.");
   featuredElements.previous.disabled = featuredStepIndex === 0;
   featuredElements.next.disabled = featuredStepIndex === featuredRun.trajectory.length - 1;
   featuredElements.scrubber.value = String(featuredStepIndex + 1);
-  featuredElements.scrubber.setAttribute("aria-valuetext", `Frame ${featuredStepIndex + 1} of ${featuredRun.trajectory.length}`);
+  featuredElements.scrubber.setAttribute("aria-valuetext", `Frame ${featuredStepIndex + 1}`);
   updateFeaturedRubricProgress();
   featuredImageLoadId += 1;
   const thisLoad = featuredImageLoadId;
@@ -414,7 +414,7 @@ function drawFeaturedStep() {
     featuredElements.frame.setAttribute("aria-busy", "false");
     scheduleFeaturedStep();
   };
-  featuredElements.image.alt = `Recorded browser state from ${featuredLabel(featuredModel)} at step ${step.step}`;
+  featuredElements.image.alt = `Recorded browser state from ${featuredLabel(featuredModel)} at frame ${featuredStepIndex + 1}`;
   featuredElements.image.src = `/api/shot?key=${encodeURIComponent(step.screenshot_key)}`;
 }
 
@@ -474,7 +474,7 @@ function renderFeaturedTaskOptions() {
     return `<button type="button" data-task-id="${escapeHtml(task.task_id)}" aria-pressed="false">
       <span>${String(index + 1).padStart(2, "0")} · ${escapeHtml(task.category || "Web research")}</span>
       <strong>${escapeHtml(compactCopy(task.title || task.request, 88))}</strong>
-      <small><b>${run.score.toFixed(3)}</b> score · ${run.steps} steps · ${escapeHtml(run.rubrics_passed.replace("/", " of "))} rubrics</small>
+      <small><b>${run.score.toFixed(3)}</b> score · ${escapeHtml(run.rubrics_passed.replace("/", " of "))} rubrics</small>
     </button>`;
   }).join("");
   featuredElements.select.innerHTML = featuredTasks.map((task) => {
@@ -619,7 +619,7 @@ function sortValue(task, key) {
 function scoreItem(task, model, shortLabel) {
   const run = task.runs[model];
   if (!run) return `<div class="task-score empty" title="No run was published. This outcome counts as zero in benchmark results."><span>${shortLabel}</span><strong>0.000</strong><small>Missing run · counted as failure</small></div>`;
-  const cap = run.truncated ? `<em title="Stopped at the ${dataset.max_steps}-step limit">cap</em>` : "";
+  const cap = run.truncated ? `<em title="Reached the shared interaction limit">cap</em>` : "";
   return `<a class="task-score" href="/run?id=${encodeURIComponent(run.run)}" aria-label="Watch ${escapeHtml(dataset.models[model])} trajectory, score ${run.score.toFixed(3)}">
     <span>${escapeHtml(shortLabel)} ${cap}</span>
     <strong>${run.score.toFixed(3)}</strong>
