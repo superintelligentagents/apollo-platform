@@ -62,7 +62,8 @@ BUILT_FILES=$(unzip -l "$WORK/deploy.zip" | tail -1 | awk '{print $2}')
 # -q closes the pipe on its first match, and the SIGPIPE that kills unzip
 # becomes a failed pipeline under `set -o pipefail`.
 BUILT_DEPS=$(unzip -l "$WORK/deploy.zip" | grep -c 'node_modules/' || true)
-echo "=== built $WORK/deploy.zip ($(stat -c %s "$WORK/deploy.zip") bytes, $BUILT_FILES entries vs $LIVE_FILES live, $BUILT_DEPS bundled deps)"
+BUILT_BYTES=$(wc -c < "$WORK/deploy.zip" | tr -d ' ')
+echo "=== built $WORK/deploy.zip ($BUILT_BYTES bytes, $BUILT_FILES entries vs $LIVE_FILES live, $BUILT_DEPS bundled deps)"
 [[ "$BUILT_FILES" == "$LIVE_FILES" ]] || { echo "FAIL: rebuilt package has $BUILT_FILES entries, live has $LIVE_FILES" >&2; exit 1; }
 [[ "$BUILT_DEPS" -gt 100 ]] || { echo "FAIL: rebuilt package has no bundled dependencies" >&2; exit 1; }
 diff -q <(unzip -p "$WORK/deploy.zip" lambda_presign.js) "$SOURCE" >/dev/null \

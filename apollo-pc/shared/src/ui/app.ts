@@ -91,9 +91,44 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
   let requestedScreenOnLogin = typeof window === "undefined" ? null : screenFromHash(window.location.hash);
 
   let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
-  function flushAutosave() {
-    if (!state.identity) return;
-    void saveDecisions(adapter.storage, participantKey(state.identity), state);
+  function paintSaveStatus() {
+    if (typeof document === "undefined") return;
+    const label = state.saveStatus === "saving"
+      ? "Saving…"
+      : state.saveStatus === "error"
+        ? "Save failed — keep this tab open"
+        : state.lastSavedAt
+          ? `Saved locally ${new Date(state.lastSavedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+          : "Saved locally";
+    for (const node of document.querySelectorAll<HTMLElement>("[data-save-status]")) {
+      node.textContent = label;
+      node.dataset.state = state.saveStatus;
+    }
+  }
+
+  async function flushAutosave() {
+    if (!state.identity) return false;
+    if (autosaveTimer) {
+      clearTimeout(autosaveTimer);
+      autosaveTimer = null;
+    }
+    state.saveStatus = "saving";
+    paintSaveStatus();
+    const saved = await saveDecisions(adapter.storage, participantKey(state.identity), state);
+    state.saveStatus = saved ? "saved" : "error";
+    if (saved) state.lastSavedAt = new Date().toISOString();
+    paintSaveStatus();
+    return saved;
+  }
+
+  if (typeof window !== "undefined") {
+    const flushPendingAutosave = () => {
+      if (autosaveTimer) void flushAutosave();
+    };
+    window.addEventListener("pagehide", flushPendingAutosave);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") flushPendingAutosave();
+    });
   }
 
   function defaultIncluded(record: SourceRecord): boolean {
@@ -231,7 +266,9 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
     },
     autosave() {
       if (autosaveTimer) clearTimeout(autosaveTimer);
-      autosaveTimer = setTimeout(flushAutosave, 400);
+      state.saveStatus = "saving";
+      paintSaveStatus();
+      autosaveTimer = setTimeout(() => void flushAutosave(), 400);
     },
     update(patch) {
       Object.assign(state, patch);
@@ -254,7 +291,10 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
           ]);
           state.records = new Map(records.map((r) => [r.id, r]));
           state.entities = savedEntities?.entities ?? [];
-          if (saved) applyDecisions(state, saved);
+          if (saved) {
+            applyDecisions(state, saved);
+            state.lastSavedAt = saved.savedAt;
+          }
           state.uploadedCount = log.length;
           state.uploadedBySource = log.reduce((totals, entry) => {
             if (entry.source_counts) {
@@ -642,7 +682,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         if (!state.bundleId || !state.bundleId.startsWith(`pc/${uploadParticipantId}/internal/`)) {
           state.bundleCreatedAt = new Date().toISOString();
           state.bundleId = buildBundleId(uploadIdentity, state.bundleCreatedAt);
-          flushAutosave();
+          void flushAutosave();
         }
         const bundleId = state.bundleId;
         state.busy = "Preparing your bundle…";
@@ -726,7 +766,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
           state.bundleCreatedAt = null;
           state.tasks = [];
           state.privacyAudit = null;
-          flushAutosave();
+          void flushAutosave();
           notify("Bundle submitted. Thank you — this is exactly the data we need.", "ok");
           goto("home");
         } catch (err) {
@@ -846,7 +886,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
     }
     render();
     window.scrollTo({ top: 0 });
-    flushAutosave();
+    void flushAutosave();
   }
 
   function goto(screen: Screen) {

@@ -60,6 +60,7 @@ describe("task writing data and app guides", () => {
     ctx.state.taskDraft = draft("mypcbench-lockedin");
 
     const root = renderTaskEdit(ctx);
+    expect(root.querySelector('[data-save-status]')?.textContent).toBe("Saved locally");
     expect(root.textContent).toContain("MyPCBench app guide & data filter");
     expect(root.textContent).toContain("LOCKEDIN · LIKE LINKEDIN");
     expect(root.querySelector<HTMLAnchorElement>('.task-app-guide a')?.href).toBe("https://lockedin.mypcbench.app/profile?_autologin=1");

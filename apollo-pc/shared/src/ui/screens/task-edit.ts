@@ -237,6 +237,11 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
           },
         },
         "Discard"
+      ),
+      el(
+        "span",
+        { class: "task-save-status mono", role: "status", "aria-live": "polite", "data-save-status": "", "data-state": ctx.state.saveStatus },
+        ctx.state.saveStatus === "error" ? "Save failed — keep this tab open" : ctx.state.saveStatus === "saving" ? "Saving…" : "Saved locally",
       )
     );
 

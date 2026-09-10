@@ -51,6 +51,11 @@ import {
   excludeReopenedForReviewer,
   buildAdminItemFromDocuments,
   buildDashboardIndexRecord,
+  buildAuthorDashboardIndexRecord,
+  authorDashboardEntityKey,
+  buildDashboardConditionalPutRequest,
+  mergeDashboardIndexRecord,
+  indexedAuthorTaskStatus,
   buildDashboardStatusUpdateRequest,
   dashboardRecordMatchesSource,
   dashboardSourceCondition,
@@ -263,6 +268,86 @@ test("builds a compact additive dashboard index without authored body text", () 
   assert.match(record.task_content_hash, /^[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(record).includes(source.task.agent_request), false);
   assert.equal(JSON.stringify(record).includes("Compare three routes."), false);
+});
+
+test("partitions task history by author without collisions at annotator scale", () => {
+  const keys = new Set();
+  for (let author = 0; author < 500; author += 1) {
+    const participantId = `worker-${String(author).padStart(3, "0")}`;
+    for (let task = 0; task < 20; task += 1) {
+      const taskId = `task-${String(task).padStart(8, "0")}`;
+      const record = {
+        scope: "pc",
+        entity_key: `TASK#${taskId}`,
+        entity_type: "TASK",
+        task_id: taskId,
+        source_key: `prolific/journeys/${participantId}/pc/${participantId}/internal/bundle-${author}/tasks/${taskId}.json`,
+        indexed_at: "2026-09-10T12:00:00.000Z",
+      };
+      const authorRecord = buildAuthorDashboardIndexRecord(record);
+      assert.equal(authorDashboardEntityKey(record), authorRecord.entity_key);
+      assert.match(authorRecord.entity_key, new RegExp(`^AUTHOR#${participantId}#TASK#`));
+      keys.add(authorRecord.entity_key);
+    }
+  }
+  assert.equal(keys.size, 10_000);
+});
+
+test("dashboard registration uses optimistic concurrency and preserves reviewed state", () => {
+  const pending = {
+    scope: "pc",
+    entity_key: "TASK#task-12345678",
+    task_id: "task-12345678",
+    source_key: "prolific/journeys/alice/pc/alice/internal/bundle/tasks/task-12345678.json",
+    status: "pending",
+    indexed_at: "2026-09-10T12:00:00.000Z",
+  };
+  const approved = {
+    ...pending,
+    status: "approved",
+    reviewer: "Reviewer",
+    done_target: "pc-review/finished/task.json",
+    index_revision: "revision-1",
+  };
+  const merged = mergeDashboardIndexRecord(approved, pending);
+  assert.equal(merged.status, "approved");
+  assert.equal(merged.done_target, approved.done_target);
+
+  const current = buildDashboardConditionalPutRequest({
+    tableName: "dashboard",
+    record: merged,
+    existing: approved,
+    nextRevision: "revision-2",
+  });
+  assert.equal(current.ConditionExpression, "#revision = :expectedRevision");
+  assert.equal(current.ExpressionAttributeValues[":expectedRevision"], "revision-1");
+  assert.equal(current.Item.index_revision, "revision-2");
+
+  const legacy = buildDashboardConditionalPutRequest({
+    tableName: "dashboard",
+    record: pending,
+    existing: pending,
+    nextRevision: "revision-1",
+  });
+  assert.equal(legacy.ConditionExpression, "attribute_not_exists(#revision)");
+  const fresh = buildDashboardConditionalPutRequest({
+    tableName: "dashboard",
+    record: pending,
+    existing: null,
+    nextRevision: "revision-1",
+  });
+  assert.equal(fresh.ConditionExpression, "attribute_not_exists(#entity)");
+});
+
+test("author history distinguishes audit backlog from review backlog", () => {
+  const record = { status: "pending", task_content_hash: "hash" };
+  assert.equal(indexedAuthorTaskStatus(record), "awaiting_codex");
+  assert.equal(indexedAuthorTaskStatus({
+    ...record,
+    pre_qc_complete: true,
+    pre_qc_task_content_hash: "hash",
+  }), "pending");
+  assert.equal(indexedAuthorTaskStatus({ ...record, status: "approved" }), "approved");
 });
 
 test("keeps distribution metadata outside the task-content hash", () => {

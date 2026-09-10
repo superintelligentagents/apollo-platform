@@ -732,7 +732,14 @@ async function completedPreQcSubmissionKeysFromSources(keys, candidates) {
       const selected = selectLlmReviewArtifact(applicable, taskContentHash);
       if (!selected || selected.contentHash !== taskContentHash) return;
       const artifact = await readJson(selected.key).then(({ json }) => json);
-      if (isCompletedReviewerPreQcArtifact(artifact)) ready.add(subKey);
+      const complete = isCompletedReviewerPreQcArtifact(artifact);
+      if (DASHBOARD_TABLE) {
+        const record = await dashboardIndexRecord(taskId);
+        if (dashboardRecordMatchesSource(record, subKey)) {
+          await updateDashboardPreQcIndex(record, taskContentHash, selected, artifact);
+        }
+      }
+      if (complete) ready.add(subKey);
     } catch {
       // A task that cannot be read or fingerprinted is not ready for review.
     }
@@ -2013,6 +2020,29 @@ export function buildDashboardIndexRecord(item, scope = dashboardIndexScope(), i
   };
 }
 
+export function dashboardAuthorParticipantId(record) {
+  const participantId = participantIdFromSubKey(record?.source_key);
+  return VALID_PID.test(String(participantId || "")) ? participantId : null;
+}
+
+export function authorDashboardEntityKey(record) {
+  const participantId = dashboardAuthorParticipantId(record);
+  if (!participantId || !record?.task_id) return null;
+  return `AUTHOR#${participantId}#TASK#${b64url(record.task_id)}`;
+}
+
+export function buildAuthorDashboardIndexRecord(record) {
+  const entityKey = authorDashboardEntityKey(record);
+  if (!entityKey) return null;
+  return {
+    ...record,
+    entity_key: entityKey,
+    entity_type: "AUTHOR_TASK",
+    author_participant_id: dashboardAuthorParticipantId(record),
+    source_index_revision: record.index_revision || "",
+  };
+}
+
 export function dashboardSubmissionFromIndexRecord(record, now = Date.now()) {
   const status = effectiveIndexedStatus(record, now);
   const inReview = status === "in_review";
@@ -3018,11 +3048,13 @@ export async function putDashboardIndexItem(item, options = {}) {
   if (!DASHBOARD_TABLE) return false;
   const record = buildDashboardIndexRecord(item);
   if (!record) return false;
-  const existing = await dashboardDb.send(new GetCommand({
-    TableName: DASHBOARD_TABLE,
-    Key: { scope: record.scope, entity_key: record.entity_key },
-    ConsistentRead: true,
-  })).then((response) => response.Item ?? null);
+  const durable = await putDashboardTaskRecord(record, options);
+  await syncAuthorDashboardIndex(durable.task_id);
+  invalidateDashboardIndexCache();
+  return true;
+}
+
+export function mergeDashboardIndexRecord(existing, record, options = {}) {
   // A delayed registration must never roll a reviewed task back to pending.
   const existingStatus = existing ? effectiveIndexedStatus(existing) : "pending";
   const matchingAudit = existing && existing.task_content_hash === record.task_content_hash
@@ -3067,9 +3099,76 @@ export async function putDashboardIndexItem(item, options = {}) {
         lock_expires_at: existing.lock_expires_at,
       }
     : { ...record, ...matchingAudit };
-  await dashboardDb.send(new PutCommand({ TableName: DASHBOARD_TABLE, Item: durable }));
-  invalidateDashboardIndexCache();
+  return durable;
+}
+
+export function buildDashboardConditionalPutRequest({ tableName, record, existing, nextRevision }) {
+  if (!tableName || !record?.scope || !record?.entity_key || !nextRevision) return null;
+  const request = {
+    TableName: tableName,
+    Item: { ...record, index_revision: nextRevision },
+    ExpressionAttributeNames: { "#entity": "entity_key" },
+  };
+  if (!existing) {
+    request.ConditionExpression = "attribute_not_exists(#entity)";
+    return request;
+  }
+  request.ExpressionAttributeNames["#revision"] = "index_revision";
+  if (existing.index_revision) {
+    request.ConditionExpression = "#revision = :expectedRevision";
+    request.ExpressionAttributeValues = { ":expectedRevision": existing.index_revision };
+  } else {
+    request.ConditionExpression = "attribute_not_exists(#revision)";
+  }
+  return request;
+}
+
+async function conditionalPutDashboardRecord(record, merge, options = {}) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const existing = await dashboardDb.send(new GetCommand({
+      TableName: DASHBOARD_TABLE,
+      Key: { scope: record.scope, entity_key: record.entity_key },
+      ConsistentRead: true,
+    })).then((response) => response.Item ?? null);
+    if (options.rejectOlder && existing?.indexed_at && record?.indexed_at
+      && String(existing.indexed_at) > String(record.indexed_at)) return existing;
+    const next = merge ? merge(existing, record, options) : record;
+    const request = buildDashboardConditionalPutRequest({
+      tableName: DASHBOARD_TABLE,
+      record: next,
+      existing,
+      nextRevision: randomUUID(),
+    });
+    try {
+      await dashboardDb.send(new PutCommand(request));
+      return request.Item;
+    } catch (error) {
+      if (error?.name !== "ConditionalCheckFailedException" || attempt === 4) throw error;
+    }
+  }
+  throw new Error("Dashboard index update exhausted its conflict retries");
+}
+
+async function putDashboardTaskRecord(record, options = {}) {
+  return conditionalPutDashboardRecord(record, mergeDashboardIndexRecord, options);
+}
+
+async function putAuthorDashboardIndexRecord(taskRecord) {
+  const authorRecord = buildAuthorDashboardIndexRecord(taskRecord);
+  if (!authorRecord) return false;
+  await conditionalPutDashboardRecord(authorRecord, null, { rejectOlder: true });
   return true;
+}
+
+async function syncAuthorDashboardIndex(taskId) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const record = await dashboardIndexRecord(taskId);
+    if (!record) return false;
+    await putAuthorDashboardIndexRecord(record);
+    const current = await dashboardIndexRecord(taskId);
+    if (current?.index_revision === record.index_revision) return true;
+  }
+  throw new Error("Author dashboard index did not converge on the current task revision");
 }
 
 export async function markDashboardIndexReady(expectedCount, backfilledAt = new Date().toISOString()) {
@@ -3120,6 +3219,123 @@ export async function loadDashboardIndexRecords() {
   return records;
 }
 
+export async function loadAuthorDashboardIndexRecords(participantId) {
+  if (!DASHBOARD_TABLE || !VALID_PID.test(String(participantId || ""))) return [];
+  const records = [];
+  let ExclusiveStartKey;
+  do {
+    const response = await dashboardDb.send(new QueryCommand({
+      TableName: DASHBOARD_TABLE,
+      KeyConditionExpression: "#scope = :scope AND begins_with(#entity, :author)",
+      ExpressionAttributeNames: { "#scope": "scope", "#entity": "entity_key" },
+      ExpressionAttributeValues: { ":scope": dashboardIndexScope(), ":author": `AUTHOR#${participantId}#TASK#` },
+      ExclusiveStartKey,
+      ConsistentRead: true,
+    }));
+    records.push(...(response.Items ?? []));
+    ExclusiveStartKey = response.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return records;
+}
+
+async function dashboardAuthorIndexReady() {
+  if (!DASHBOARD_TABLE) return false;
+  const response = await dashboardDb.send(new GetCommand({
+    TableName: DASHBOARD_TABLE,
+    Key: { scope: dashboardIndexScope(), entity_key: "AUTHOR_META" },
+    ConsistentRead: true,
+  }));
+  return response.Item?.ready === true;
+}
+
+export function indexedAuthorTaskStatus(record, now = Date.now()) {
+  const status = effectiveIndexedStatus(record, now);
+  if (status !== "pending") return status;
+  const preQcCurrent = record?.pre_qc_complete === true
+    && record.pre_qc_task_content_hash
+    && record.pre_qc_task_content_hash === record.task_content_hash;
+  return preQcCurrent ? "pending" : "awaiting_codex";
+}
+
+async function indexedMyTasksPage(participantId, body) {
+  if (!(await dashboardAuthorIndexReady())) return null;
+  const records = await loadAuthorDashboardIndexRecords(participantId);
+  records.sort((a, b) => String(b.submitted_at || "").localeCompare(String(a.submitted_at || ""))
+    || String(b.source_key || "").localeCompare(String(a.source_key || "")));
+  const offset = Math.max(0, Number(body.offset) || 0);
+  const limit = Math.min(200, Math.max(1, Number(body.limit) || 50));
+  const pageRecords = records.slice(offset, offset + limit);
+  const unresolvedAuditKeys = pageRecords
+    .filter((record) => indexedAuthorTaskStatus(record) === "awaiting_codex")
+    .map((record) => record.source_key);
+  const audited = unresolvedAuditKeys.length
+    ? await completedPreQcSubmissionKeys(unresolvedAuditKeys)
+    : new Set();
+  const approvedTotal = records.filter((record) => effectiveIndexedStatus(record) === "approved").length;
+  const awaitingSignoffTotal = records.filter((record) => (
+    effectiveIndexedStatus(record) === "approved" && !record.signoff_at
+  )).length;
+  const buildItem = async (record) => {
+    const source = await readJson(record.source_key).then(({ json }) => json).catch(() => null);
+    const task = source?.task ?? source;
+    const original = cleanTaskSnapshot(task);
+    const rubrics = cleanRubrics(null, original, null);
+    const indexedStatus = indexedAuthorTaskStatus(record);
+    const status = indexedStatus === "awaiting_codex" && audited.has(record.source_key)
+      ? "pending"
+      : indexedStatus;
+    const item = {
+      task_id: cleanText(source?.task_id || record.task_id, 300),
+      sub_key: record.source_key,
+      title: cleanText(task?.task_title ?? task?.title ?? record.original_title, 300),
+      request: String(task?.agent_request ?? task?.request ?? "").slice(0, 300),
+      status,
+      submitted_at: source?.created_at || record.submitted_at || null,
+      content_hash: original ? reportingTaskContentHash(original, null, rubrics) : record.task_content_hash || null,
+      rejection_count: Math.max(0, Math.floor(Number(record.appeal_number) || 0)) + (status === "rejected" ? 1 : 0),
+    };
+    if (status === "approved") {
+      const finished = record.done_target
+        ? await readJson(record.done_target).then(({ json }) => json).catch(() => null)
+        : null;
+      item.reviewer_changed = record.changed_in_qc == null ? reviewerChangedTask(finished) : Boolean(record.changed_in_qc);
+      item.revision_count = Number(record.final_gold_revision) || finalGoldRevision(finished);
+      item.signed_off_at = record.signoff_at || "";
+      item.signoff_action = record.signoff_action || "";
+      item.needs_signoff = !record.signoff_at;
+    }
+    if (status === "rejected") {
+      const rejected = record.done_target
+        ? await readJson(record.done_target).then(({ json }) => json).catch(() => null)
+        : null;
+      item.rejection_reason = cleanText(rejected?.reason || record.rejection_reason, 500) || "";
+      item.can_appeal = rejectionCanAppeal(item.rejection_count, rejected);
+      if (item.rejection_count === 1 && !item.can_appeal) {
+        item.appeal_unavailable_reason = "This rejection cannot be appealed yet. Ask the task lead to unlock it.";
+      }
+    }
+    if (status === "returned") {
+      const returned = record.done_target
+        ? await readJson(record.done_target).then(({ json }) => json).catch(() => null)
+        : null;
+      item.returned_reason = cleanText(returned?.reason || record.rejection_reason, 500) || "";
+    }
+    return item;
+  };
+  const items = [];
+  for (let index = 0; index < pageRecords.length; index += 25) {
+    items.push(...await Promise.all(pageRecords.slice(index, index + 25).map(buildItem)));
+  }
+  return {
+    items,
+    offset,
+    limit,
+    source_total: records.length,
+    approved_total: approvedTotal,
+    awaiting_signoff_total: awaitingSignoffTotal,
+  };
+}
+
 async function updateDashboardPreQcIndex(record, taskContentHash, candidate = null, artifact = null) {
   if (!DASHBOARD_TABLE || !record?.task_id || !record?.source_key || !taskContentHash) return false;
   const complete = candidate ? isCompletedReviewerPreQcArtifact(artifact) : false;
@@ -3131,6 +3347,7 @@ async function updateDashboardPreQcIndex(record, taskContentHash, candidate = nu
     ":status": cleanText(artifact?.status, 80),
     ":complete": complete,
     ":indexed": new Date().toISOString(),
+    ":indexRevision": randomUUID(),
   };
   const sourceCondition = dashboardSourceCondition(record.source_key);
   try {
@@ -3138,10 +3355,11 @@ async function updateDashboardPreQcIndex(record, taskContentHash, candidate = nu
       TableName: DASHBOARD_TABLE,
       Key: { scope: dashboardIndexScope(), entity_key: `TASK#${record.task_id}` },
       ConditionExpression: sourceCondition.ConditionExpression,
-      UpdateExpression: "SET task_content_hash = :hash, pre_qc_artifact_key = :artifact, pre_qc_task_content_hash = :reviewHash, pre_qc_pipeline_version = :version, pre_qc_status = :status, pre_qc_complete = :complete, pre_qc_indexed_at = :indexed",
+      UpdateExpression: "SET task_content_hash = :hash, pre_qc_artifact_key = :artifact, pre_qc_task_content_hash = :reviewHash, pre_qc_pipeline_version = :version, pre_qc_status = :status, pre_qc_complete = :complete, pre_qc_indexed_at = :indexed, indexed_at = :indexed, index_revision = :indexRevision",
       ExpressionAttributeNames: sourceCondition.ExpressionAttributeNames,
       ExpressionAttributeValues: { ...values, ...sourceCondition.ExpressionAttributeValues },
     }));
+    await syncAuthorDashboardIndex(record.task_id);
     return complete;
   } catch (error) {
     if (error?.name === "ConditionalCheckFailedException") return false;
@@ -3545,6 +3763,7 @@ export function buildDashboardStatusUpdateRequest({
     ":amendedAt": details.amended_at || "",
     ":revision": Number(details.final_gold_revision) || 0,
     ":indexed": indexedAt,
+    ":indexRevision": randomUUID(),
     ":expectedSource": expectedSourceKey,
   };
   const clearSignoff = status === "pending"
@@ -3554,7 +3773,7 @@ export function buildDashboardStatusUpdateRequest({
     TableName: tableName,
     Key: { scope, entity_key: `TASK#${taskId}` },
     ConditionExpression: "attribute_exists(#entity) AND #source = :expectedSource",
-    UpdateExpression: `SET #status = :status, reviewer = :reviewer, reviewed_at = :reviewed, rejection_reason = :reason, done_target = :target, lock_expires_at = :expires, changed = :changed, changed_in_qc = :changedInQc, final_title = :finalTitle, final_difficulty = :finalDifficulty, final_region = :finalRegion, final_subjects = :finalSubjects, claimed_at = :claimedAt, amended_by = :amendedBy, amended_at = :amendedAt, final_gold_revision = :revision, indexed_at = :indexed${clearSignoff}`,
+    UpdateExpression: `SET #status = :status, reviewer = :reviewer, reviewed_at = :reviewed, rejection_reason = :reason, done_target = :target, lock_expires_at = :expires, changed = :changed, changed_in_qc = :changedInQc, final_title = :finalTitle, final_difficulty = :finalDifficulty, final_region = :finalRegion, final_subjects = :finalSubjects, claimed_at = :claimedAt, amended_by = :amendedBy, amended_at = :amendedAt, final_gold_revision = :revision, indexed_at = :indexed, index_revision = :indexRevision${clearSignoff}`,
     ExpressionAttributeNames: { "#entity": "entity_key", "#status": "status", "#source": "source_key" },
     ExpressionAttributeValues: values,
   };
@@ -3572,6 +3791,7 @@ async function setDashboardIndexStatus(taskId, status, details = {}) {
   });
   try {
     await dashboardDb.send(new UpdateCommand(request));
+    await syncAuthorDashboardIndex(taskId);
     invalidateDashboardIndexCache();
     return true;
   } catch (error) {
@@ -4739,7 +4959,14 @@ async function recoverStaleFinalizingReview(subKey) {
           done_target: descriptor.target,
         });
       } else {
-        await setDashboardIndexStatus(rawTaskId, "pending", { expected_source_key: subKey });
+        await setDashboardIndexStatus(rawTaskId, "returned", {
+          expected_source_key: subKey,
+          reviewer: creditedReviewer,
+          reviewed_at: finalCompletedAt,
+          claimed_at: String(done.claimed_at || lockRecord.json.claimed_at || ""),
+          rejection_reason: cleanText(outcomeDocument.reason, 500),
+          done_target: descriptor.target,
+        });
       }
     },
     // This must remain last: the finalizing lock is the durable retry trigger
@@ -6950,6 +7177,10 @@ async function handleReview(path, body) {
     if (!VALID_PID.test(participantId)) {
       return respond(400, { error: "Invalid participant_id" }, { "Cache-Control": "no-store" });
     }
+    const indexedPage = await indexedMyTasksPage(participantId, body);
+    if (indexedPage) {
+      return respond(200, indexedPage, { "Cache-Control": "no-store" });
+    }
     const { byTaskDir, lockSet, doneByEncodedKey, inboxAge } = await loadReviewIndex({
       readDoneRecords: true,
       doneRecordFilter: (key) => participantIdFromSubKey(key) === participantId,
@@ -7142,7 +7373,14 @@ async function handleReview(path, body) {
       }
       const retryEtag = await verifyLock(sub_key, token);
       if (retryEtag) await deleteLockIfUnchanged(sub_key, retryEtag);
-      await setDashboardIndexStatus(rawTaskId, "pending", { expected_source_key: sub_key })
+      const existingReturned = await readJson(returnedKey).then(({ json }) => json).catch(() => null);
+      await setDashboardIndexStatus(rawTaskId, "returned", {
+        expected_source_key: sub_key,
+        reviewer,
+        reviewed_at: cleanText(existingDone.completed_at || existingReturned?.returned_at, 60),
+        rejection_reason: cleanText(existingReturned?.reason, 500),
+        done_target: returnedKey,
+      })
         .catch((error) => console.error("Dashboard return index update failed", error));
       return respond(200, { ok: true, returned_key: returnedKey, idempotent: true }, { "Cache-Control": "no-store" });
     }
@@ -7193,7 +7431,14 @@ async function handleReview(path, body) {
       return respond(409, { error: "This task was already finished by another reviewer" }, { "Cache-Control": "no-store" });
     }
     await deleteLockIfUnchanged(sub_key, etag);
-    await setDashboardIndexStatus(rawTaskId, "pending", { expected_source_key: sub_key })
+    await setDashboardIndexStatus(rawTaskId, "returned", {
+      expected_source_key: sub_key,
+      reviewer,
+      reviewed_at: completedAt,
+      claimed_at: claimedAt,
+      rejection_reason: cleanText(returnedDoc.reason, 500),
+      done_target: returnedKey,
+    })
       .catch((error) => console.error("Dashboard return index update failed", error));
     adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
     return respond(200, { ok: true, returned_key: returnedKey }, { "Cache-Control": "no-store" });

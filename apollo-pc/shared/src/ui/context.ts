@@ -111,6 +111,8 @@ export type AppState = {
   myTaskSelection: import("../review-client").MyTaskItem | null;
   tasks: PCTask[];
   taskDraft: TaskDraft | null;
+  saveStatus: "saved" | "saving" | "error";
+  lastSavedAt: string | null;
   activeTemplate: PCTemplate | null;
   // Record-picker search inside task-edit.
   pickerQuery: string;
@@ -216,6 +218,8 @@ export function initialState(): AppState {
     myTaskSelection: null,
     tasks: [],
     taskDraft: null,
+    saveStatus: "saved",
+    lastSavedAt: null,
     activeTemplate: null,
     pickerQuery: "",
     pickerSource: "all",

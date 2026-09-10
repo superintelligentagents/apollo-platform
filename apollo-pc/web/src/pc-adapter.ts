@@ -1,6 +1,13 @@
-import { presignEndpoint, uploadJsonBrowser, type PlatformAdapter } from "@apollo-pc/shared";
+import {
+  createDurableKeyValueStore,
+  openStore,
+  presignEndpoint,
+  uploadJsonBrowser,
+  type PlatformAdapter,
+} from "@apollo-pc/shared";
 
 export function createPcAdapter(): PlatformAdapter {
+  const storage = createDurableKeyValueStore(openStore(), localStorage);
   return {
     platform: "web",
     async uploadJson(opts) {
@@ -16,13 +23,6 @@ export function createPcAdapter(): PlatformAdapter {
         opts.body
       );
     },
-    storage: {
-      async get(key) {
-        return localStorage.getItem(key);
-      },
-      async set(key, value) {
-        localStorage.setItem(key, value);
-      },
-    },
+    storage,
   };
 }
