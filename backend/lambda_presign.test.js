@@ -322,6 +322,7 @@ test("dashboard registration uses optimistic concurrency and preserves reviewed 
   });
   assert.equal(current.ConditionExpression, "#revision = :expectedRevision");
   assert.equal(current.ExpressionAttributeValues[":expectedRevision"], "revision-1");
+  assert.deepEqual(current.ExpressionAttributeNames, { "#revision": "index_revision" });
   assert.equal(current.Item.index_revision, "revision-2");
 
   const legacy = buildDashboardConditionalPutRequest({
@@ -331,6 +332,7 @@ test("dashboard registration uses optimistic concurrency and preserves reviewed 
     nextRevision: "revision-1",
   });
   assert.equal(legacy.ConditionExpression, "attribute_not_exists(#revision)");
+  assert.deepEqual(legacy.ExpressionAttributeNames, { "#revision": "index_revision" });
   const fresh = buildDashboardConditionalPutRequest({
     tableName: "dashboard",
     record: pending,
@@ -338,6 +340,7 @@ test("dashboard registration uses optimistic concurrency and preserves reviewed 
     nextRevision: "revision-1",
   });
   assert.equal(fresh.ConditionExpression, "attribute_not_exists(#entity)");
+  assert.deepEqual(fresh.ExpressionAttributeNames, { "#entity": "entity_key" });
 });
 
 test("author history distinguishes audit backlog from review backlog", () => {

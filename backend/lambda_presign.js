@@ -3107,9 +3107,10 @@ export function buildDashboardConditionalPutRequest({ tableName, record, existin
   const request = {
     TableName: tableName,
     Item: { ...record, index_revision: nextRevision },
-    ExpressionAttributeNames: { "#entity": "entity_key" },
+    ExpressionAttributeNames: {},
   };
   if (!existing) {
+    request.ExpressionAttributeNames["#entity"] = "entity_key";
     request.ConditionExpression = "attribute_not_exists(#entity)";
     return request;
   }
