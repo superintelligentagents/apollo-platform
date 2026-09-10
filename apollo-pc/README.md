@@ -16,8 +16,10 @@ and `pc-review/` queue. The workspace is standalone and does not import `@odysse
 
 ## How it works
 
-1. **Import** — participants export their own email (`.mbox`) and calendar (`.ics`) data, or
-   add PDF, Word, text, Markdown, CSV, JSON, or HTML documents. Parsing is 100% in-browser;
+1. **Upload & import data** — one workspace accepts exported email (`.mbox`), calendar (`.ics`),
+   and PDF, Word, text, Markdown, CSV, JSON, or HTML documents, then immediately shows the
+   imported records, app-guided filters, privacy controls, selection state, and submit handoff.
+   Parsing is 100% in-browser;
    original document files never upload. A date-window select
    (default 12 months) drops older records *at parse time*. Email bodies are truncated
    (5 KB head+tail), extracted document text is capped at 200 KB, attachments are reduced to
@@ -28,11 +30,12 @@ and `pc-review/` queue. The workspace is standalone and does not import `@odysse
 3. **People & entities** — recurring people are detected across imported sources and
    pseudonymized with **one consistent alias per person** so cross-source
    correlation survives. Merchants keep real names. The real→alias map **never uploads**.
-4. **Discover tasks** — local email/calendar/document signals rank all 17 apps in the live
-   MyPCBench catalog. App and category filters partition history by its closest real-world
-   analogue. Each recommendation first opens the exact autologin app route, then creates a
-   complete prefilled task with the matching `referenced_record_ids`. Five generic templates
-   remain available.
+4. **Write tasks** — local email/calendar/document signals rank all 17 apps in the live
+   MyPCBench catalog. Every app is both a writing guideline and a data filter, using its
+   real-world analogue to partition history. Each recommendation first opens the exact autologin
+   app route, then creates a complete prefilled task with the matching `referenced_record_ids`.
+   The task editor can import and automatically attach documents without leaving the draft.
+   Five generic templates remain available.
 5. **Submit** — records and tasks serialize through `redact.ts` (edits → rules → masks → aliases),
    then an independent bundle-wide privacy audit fails closed on unapproved PII. Passing files
    split into `records_{kind}[_partN].json` files under the 5 MB presign cap, uploaded

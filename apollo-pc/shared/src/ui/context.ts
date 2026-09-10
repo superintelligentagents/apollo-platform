@@ -118,6 +118,7 @@ export type AppState = {
   pickerPage: number;
   pickerOpenId: string | null;
   pickerOpenBody: string | null;
+  pickerApp: string;
   discoveryCategory: AppCategory | "all";
 
   filters: ItemFilters;
@@ -221,6 +222,7 @@ export function initialState(): AppState {
     pickerPage: 0,
     pickerOpenId: null,
     pickerOpenBody: null,
+    pickerApp: "",
     discoveryCategory: "all",
     filters: emptyFilters(),
     openItemId: null,

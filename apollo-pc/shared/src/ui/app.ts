@@ -30,7 +30,7 @@ import { renderMetrics } from "./screens/metrics";
 import { renderExamples } from "./screens/examples";
 import { renderProgress } from "./screens/progress";
 import { renderReview } from "./screens/review";
-import { renderCalendarImport, renderDocumentImport, renderMailImport, renderSources } from "./screens/sources";
+import { renderCalendarImport, renderDocumentImport, renderMailImport } from "./screens/sources";
 import { renderTaskEdit } from "./screens/task-edit";
 import { renderMyTask, renderMyTasks, resetMyTasksViewState } from "./screens/my-tasks";
 import { renderTasks } from "./screens/tasks";
@@ -449,6 +449,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
 
       startTask(template: PCTemplate) {
         state.activeTemplate = template;
+        state.pickerApp = "";
         state.taskDraft = {
           region: "",
           subjects: [],
@@ -472,6 +473,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       startRecommendedTask(recommendation: AppRecommendation) {
         const source = recommendation.app.task;
         state.activeTemplate = null;
+        state.pickerApp = recommendation.app.id;
         state.taskDraft = {
           region: "GLOBAL",
           subjects: [...source.subjects],
@@ -496,6 +498,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         const task = state.tasks.find((t) => t.task_id === taskId);
         if (!task) return;
         state.activeTemplate = null;
+        state.pickerApp = "";
         state.taskDraft = {
           region: task.metadata?.region ?? "",
           subjects: task.metadata?.subjects ?? [],
@@ -849,9 +852,8 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
     );
     const NAV: Array<{ label: string; target: Screen; owns: Screen[] }> = [
       { label: "Dashboard", target: "home", owns: ["home", "progress"] },
-      { label: "1. Import data", target: "sources", owns: ["sources", "import-mail", "import-calendar", "import-documents"] },
-      { label: "2. Upload data", target: "items", owns: ["items", "upload-email", "upload-calendar", "upload-documents", "entities", "review"] },
-      { label: "3. Discover tasks", target: "tasks", owns: ["tasks", "task-edit"] },
+      { label: "1. Upload & import data", target: "items", owns: ["sources", "import-mail", "import-calendar", "import-documents", "items", "upload-email", "upload-calendar", "upload-documents", "entities", "review"] },
+      { label: "2. Write tasks", target: "tasks", owns: ["tasks", "task-edit"] },
       { label: "Metrics & admin", target: "metrics", owns: ["metrics"] },
       { label: "Examples", target: "examples", owns: ["examples"] },
       { label: "My tasks", target: "my-tasks", owns: ["my-tasks", "my-task"] },
@@ -891,7 +893,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
     const screens: Record<Screen, (c: Ctx) => HTMLElement> = {
       login: renderLogin,
       home: renderHome,
-      sources: renderSources,
+      sources: renderItems,
       "import-mail": renderMailImport,
       "import-calendar": renderCalendarImport,
       "import-documents": renderDocumentImport,

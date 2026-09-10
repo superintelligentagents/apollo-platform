@@ -3,16 +3,10 @@ import { SOURCE_CARDS } from "../../sources/registry";
 import type { EmailRecord, SourceKind } from "../../types";
 import type { Ctx } from "../context";
 import type { Screen } from "../context";
+import { renderItems } from "./items";
 
 export function renderSources(ctx: Ctx): HTMLElement {
-  const email = [...ctx.state.records.values()].filter((record) => record.source === "email" || record.source === "orders").length;
-  const calendar = [...ctx.state.records.values()].filter((record) => record.source === "calendar").length;
-  const documents = [...ctx.state.records.values()].filter((record) => record.source === "documents").length;
-  return el("section", { class: "screen narrow workflow-hub" }, el("p", { class: "step-kicker mono" }, "STEP 1"), el("h2", { class: "display" }, "Import data"), el("p", { class: "screen-sub" }, "Choose a source. Import and recommendation analysis stay on this device."), hubLink("Mail", email ? `${email.toLocaleString()} records imported` : "Gmail Takeout or .eml", () => ctx.actions.goto("import-mail")), hubLink("Calendar", calendar ? `${calendar.toLocaleString()} events imported` : ".ics calendar file", () => ctx.actions.goto("import-calendar")), hubLink("Documents", documents ? `${documents.toLocaleString()} documents imported` : "PDF, Word, or text", () => ctx.actions.goto("import-documents")));
-}
-
-function hubLink(title: string, detail: string, onclick: () => void): HTMLElement {
-  return el("button", { class: "workflow-hub-link", type: "button", onclick }, el("span", null, el("strong", null, title), el("small", null, detail)), el("span", { "aria-hidden": "true" }, "→"));
+  return renderItems(ctx);
 }
 
 export function renderMailImport(ctx: Ctx): HTMLElement {

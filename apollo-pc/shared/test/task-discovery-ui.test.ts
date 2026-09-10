@@ -19,8 +19,9 @@ describe("task discovery UI", () => {
     const startRecommendedTask = vi.fn();
     const ctx = { state, actions: { isIncluded: () => true, startRecommendedTask, startTask: vi.fn(), goto: vi.fn(), editTask: vi.fn(), deleteTask: vi.fn() }, rerender: vi.fn() } as unknown as Ctx;
     const root = renderTasks(ctx);
+    expect(root.textContent).toContain("Write tasks with recommendations");
     expect(root.textContent).toContain("ANALYZED LOCALLY");
-    expect(root.textContent).toContain("ALL 17 LIVE APPS");
+    expect(root.textContent).toContain("ALL 17 LIVE APP GUIDES");
     const dinoco = root.querySelector<HTMLAnchorElement>('[data-testid="open-app-dinoco"]')!;
     expect(dinoco.href).toBe("https://dinoco.mypcbench.app/book?_autologin=1");
     root.querySelector<HTMLButtonElement>('[data-testid="write-task-lockedin"]')!.click();

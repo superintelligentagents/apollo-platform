@@ -29,11 +29,10 @@ export function renderHome(ctx: Ctx): HTMLElement {
     el(
       "section",
       { class: "dashboard-workflows major-workflows" },
-      majorWorkflow("1", "Import data", `${(importedEmail + importedCalendar + importedDocuments).toLocaleString()} records`, "sources", ctx),
-      majorWorkflow("2", "Upload data", `${(selectedEmail + selectedCalendar + selectedDocuments).toLocaleString()} selected`, "items", ctx),
-      majorWorkflow("3", "Discover tasks", `${ctx.state.tasks.length.toLocaleString()} saved`, "tasks", ctx),
-      majorWorkflow("4", "My tasks", "Feedback, revisions & sign-off", "my-tasks", ctx),
-      majorWorkflow("5", "Metrics & admin", "Contributions and team quality", "metrics", ctx)
+      majorWorkflow("1", "Upload & import data", `${(importedEmail + importedCalendar + importedDocuments).toLocaleString()} imported · ${(selectedEmail + selectedCalendar + selectedDocuments).toLocaleString()} selected`, "items", ctx),
+      majorWorkflow("2", "Write tasks", `${ctx.state.tasks.length.toLocaleString()} saved · recommendations from your data`, "tasks", ctx),
+      majorWorkflow("3", "My tasks", "Feedback, revisions & sign-off", "my-tasks", ctx),
+      majorWorkflow("4", "Metrics & admin", "Contributions and team quality", "metrics", ctx)
     )
   );
 }

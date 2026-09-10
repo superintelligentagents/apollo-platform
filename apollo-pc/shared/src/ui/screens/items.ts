@@ -3,6 +3,7 @@ import { appIdsForRecord, historyAppCounts, MYPCBENCH_APPS } from "../../app-cat
 import { CALENDAR_CATEGORIES, EMAIL_CATEGORIES, linkEmailAndCalendar } from "../../organize";
 import { emailMatchesActivity, type EmailActivityStat, type EmailActivitySummary, type EmailDirection } from "../../email-activity";
 import type { EmailServiceOption } from "../../email-services";
+import { SOURCE_CARDS } from "../../sources/registry";
 import type { EmailRecord, SourceKind, SourceRecord } from "../../types";
 import { chip, el, fmtDay, fmtTime } from "../components/helpers";
 import type { Ctx } from "../context";
@@ -18,32 +19,7 @@ let linkedCache: { records: Map<string, SourceRecord>; size: number; links: Retu
 const pendingFilterRenders = new WeakMap<object, ReturnType<typeof setTimeout>>();
 
 export function renderItems(ctx: Ctx): HTMLElement {
-  const index = mailboxIndexFor(ctx.state.records, ctx.state.identity?.email ?? "");
-  const email = index.emailData;
-  const calendar = index.calendars;
-  const documents = index.bySource.get("documents") ?? [];
-  const selected = (items: SourceRecord[]) => items.filter((record) => ctx.actions.isIncluded(record)).length;
-  const selectedTotal = selected(email) + selected(calendar) + selected(documents);
-  return el(
-    "section",
-    { class: "screen narrow workflow-hub" },
-    el("p", { class: "step-kicker mono" }, "STEP 2"),
-    el("h2", { class: "display" }, "Upload data"),
-    el("p", { class: "screen-sub" }, "Choose the records you want to share."),
-    uploadHubLink("Mail", `${selected(email).toLocaleString()} selected`, () => ctx.actions.goto("upload-email")),
-    uploadHubLink("Calendar", `${selected(calendar).toLocaleString()} selected`, () => ctx.actions.goto("upload-calendar")),
-    uploadHubLink("Documents", `${selected(documents).toLocaleString()} selected`, () => ctx.actions.goto("upload-documents")),
-    el(
-      "div",
-      { class: "workflow-hub-footer" },
-      el("button", { class: "btn primary", type: "button", onclick: () => ctx.actions.goto("review") }, selectedTotal ? `Review ${selectedTotal.toLocaleString()} selected` : "Review upload"),
-      el("button", { class: "text-button", type: "button", onclick: () => ctx.actions.goto("entities") }, "Privacy and aliases")
-    )
-  );
-}
-
-function uploadHubLink(title: string, detail: string, onclick: () => void): HTMLElement {
-  return el("button", { class: "workflow-hub-link", type: "button", onclick }, el("span", null, el("strong", null, title), el("small", null, detail)), el("span", { "aria-hidden": "true" }, "→"));
+  return renderUpload(ctx);
 }
 
 export function renderEmailItems(ctx: Ctx): HTMLElement {
@@ -101,13 +77,15 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar" | "documents")
   };
 
   const root = el("section", { class: "screen wide" });
+  if (!onlySource) root.append(el("p", { class: "step-kicker mono" }, "STEP 1 · DATA"));
   root.append(
-    el("h2", { class: "display" }, onlySource === "email" ? "Upload email data" : onlySource === "calendar" ? "Upload calendar data" : onlySource === "documents" ? "Upload document text" : "Upload data"),
+    el("h2", { class: "display" }, onlySource === "email" ? "Mail data" : onlySource === "calendar" ? "Calendar data" : onlySource === "documents" ? "Document data" : "Upload & import data"),
     el(
       "p",
       { class: "screen-sub" },
-      onlySource === "email" ? "Choose the mail you want to share." : onlySource === "calendar" ? "Choose the events you want to share." : onlySource === "documents" ? "Review extracted text, edit it if needed, and choose the documents you want to share." : "Choose what you want to share."
-    )
+      onlySource === "email" ? "Add mail files, then choose the messages you want to share." : onlySource === "calendar" ? "Add calendar files, then choose the events you want to share." : onlySource === "documents" ? "Add documents, review their locally extracted text, and choose what you want to share." : "Add files, inspect the imported records, and choose what can upload—all in one workspace. Nothing leaves this browser until final review."
+    ),
+    dataImportPanel(ctx, onlySource)
   );
   if (allRecords.length) {
     root.append(
@@ -127,7 +105,12 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar" | "documents")
   }
 
   if (onlySource && !allRecords.length) {
-    root.append(el("section", { class: "simple-empty" }, el("h3", null, onlySource === "email" ? "Import mail first" : onlySource === "calendar" ? "Import a calendar first" : "Import a document first"), el("p", null, onlySource === "email" ? "After import, this page will show email search, categories, parsed purchases, and editing controls." : onlySource === "calendar" ? "After import, this page will show event search, categories, repeating-event controls, and editing controls." : "After import, this page will show the locally extracted text and privacy editing controls."), el("button", { class: "btn primary", type: "button", onclick: () => ctx.actions.goto(onlySource === "email" ? "import-mail" : onlySource === "calendar" ? "import-calendar" : "import-documents") }, onlySource === "email" ? "Go to Import mail" : onlySource === "calendar" ? "Go to Import calendar" : "Go to Import documents")));
+    root.append(el("section", { class: "simple-empty" }, el("h3", null, "Choose files above to begin"), el("p", null, onlySource === "email" ? "Imported mail will appear here with search, categories, parsed purchases, and privacy controls." : onlySource === "calendar" ? "Imported events will appear here with search, repeating-event controls, and privacy controls." : "Extracted document text will appear here with editing and privacy controls.")));
+    return root;
+  }
+
+  if (!onlySource && !allRecords.length) {
+    root.append(el("section", { class: "simple-empty data-empty" }, el("h3", null, "Add your first source"), el("p", null, "Choose mail, calendar, or document files above. Imported records and app-guided filters will appear here.")));
     return root;
   }
 
@@ -231,7 +214,85 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar" | "documents")
       )
     );
   }
+  root.append(
+    el(
+      "div",
+      { class: "data-workspace-footer" },
+      el("div", null, el("strong", null, `${selectedCount.toLocaleString()} selected for upload`), el("p", null, "Review privacy masks and the exact bundle before anything is sent.")),
+      el("button", { class: "btn", type: "button", onclick: () => ctx.actions.goto("entities") }, "Privacy & aliases"),
+      el("button", { class: "btn primary", type: "button", disabled: selectedCount === 0, onclick: () => ctx.actions.goto("review") }, "Review & submit →")
+    )
+  );
   return root;
+}
+
+function dataImportPanel(ctx: Ctx, onlySource?: "email" | "calendar" | "documents"): HTMLElement {
+  const kinds = (["email", "calendar", "documents"] as const).filter((kind) => !onlySource || kind === onlySource);
+  const panel = el(
+    "section",
+    { class: "data-import-panel", "aria-label": "Add data files" },
+    el(
+      "div",
+      { class: "data-import-head" },
+      el("div", null, el("p", { class: "section-label" }, "ADD FILES"), el("h3", null, "Import locally, then choose what uploads")),
+      onlySource === "documents" ? null : dateWindowControl(ctx)
+    )
+  );
+  const controls = el("div", { class: "data-import-grid" });
+  for (const kind of kinds) controls.append(dataImportControl(ctx, kind));
+  panel.append(controls);
+  return panel;
+}
+
+function dateWindowControl(ctx: Ctx): HTMLElement {
+  return el(
+    "label",
+    { class: "field data-date-window" },
+    el("span", { class: "field-label" }, "Mail & calendar window"),
+    el(
+      "select",
+      { class: "field-input compact", onchange: (event: Event) => { ctx.state.dateFloorMonths = Number((event.target as HTMLSelectElement).value); ctx.autosave(); } },
+      ...([[6, "Last 6 months"], [12, "Last 12 months"], [24, "Last 2 years"], [0, "Everything"]] as const).map(([value, label]) => el("option", { value: String(value), selected: ctx.state.dateFloorMonths === value }, label))
+    )
+  );
+}
+
+function dataImportControl(ctx: Ctx, kind: "email" | "calendar" | "documents"): HTMLElement {
+  const meta = SOURCE_CARDS.find((card) => card.kind === kind)!;
+  const records = [...ctx.state.records.values()].filter((record) => record.source === kind || (kind === "email" && record.source === "orders"));
+  const selected = records.filter((record) => ctx.actions.isIncluded(record)).length;
+  const guideCount = new Set(records.flatMap((record) => appIdsForRecord(record))).size;
+  const importing = ctx.state.importing?.kind === kind ? ctx.state.importing.progress : null;
+  const input = el("input", {
+    type: "file",
+    multiple: true,
+    accept: meta.parser!.accept.join(","),
+    style: "display:none",
+    "data-testid": `data-file-input-${kind}`,
+    onchange: (event: Event) => {
+      const element = event.target as HTMLInputElement;
+      const files = [...(element.files ?? [])];
+      element.value = "";
+      if (files.length) void ctx.actions.importFiles(kind, files);
+    },
+  }) as HTMLInputElement;
+  const label = kind === "email" ? "Mail" : kind === "calendar" ? "Calendar" : "Documents";
+  const hint = kind === "email" ? ".mbox or .eml" : kind === "calendar" ? ".ics files" : "PDF, Word, or text";
+  return el(
+    "article",
+    { class: `data-import-card data-import-${kind}` },
+    input,
+    el("span", { class: "item-kind mono" }, label.toUpperCase()),
+    el("strong", null, label),
+    el("p", null, importing ? `${importing.recordsEmitted.toLocaleString()} read so far` : records.length ? `${records.length.toLocaleString()} imported · ${selected.toLocaleString()} selected` : hint),
+    records.length ? el("small", { class: "mono" }, `${guideCount.toLocaleString()} MyPCBench guide${guideCount === 1 ? "" : "s"} matched`) : null,
+    el(
+      "div",
+      { class: "data-import-actions" },
+      el("button", { class: `btn ${records.length ? "ghost" : "primary"}`, type: "button", disabled: !!ctx.state.importing, "data-testid": `data-import-${kind}`, onclick: () => input.click() }, importing ? "Reading…" : records.length ? "Add more" : "Choose files"),
+      records.length ? el("button", { class: "text-button", type: "button", onclick: () => { Object.assign(ctx.state.filters, { source: kind, app: "", category: "all", status: "all", page: 0 }); ctx.rerender(); } }, "Review") : null
+    )
+  );
 }
 
 function calculateLinks(records: Map<string, SourceRecord>): ReturnType<typeof linkEmailAndCalendar> {

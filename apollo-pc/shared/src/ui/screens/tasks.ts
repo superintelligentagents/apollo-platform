@@ -19,10 +19,10 @@ export function renderTasks(ctx: Ctx): HTMLElement {
   const recommendationByApp = new Map(recommendApps(eligible, MYPCBENCH_APPS.length).map((item) => [item.app.id, item]));
   const root = el("section", { class: "screen discovery-screen" });
   root.append(
-    el("p", { class: "step-kicker mono" }, "STEP 3 · DISCOVER"),
-    el("h2", { class: "display" }, "Turn your history into a task"),
-    el("p", { class: "screen-sub" }, "Apollo groups selected mail, calendar events, and documents by the real-world service they resemble. Open the matching MyPCBench app, try the workflow yourself, then start from a task draft with the relevant records attached."),
-    el("div", { class: "discovery-actions" }, el("button", { class: "btn primary", type: "button", onclick: () => ctx.actions.goto("sources") }, "Import more history"), el("button", { class: "btn", type: "button", onclick: () => ctx.actions.goto("import-documents") }, "Add a document"), el("a", { class: "btn ghost", href: "https://mypcbench.com/apps", target: "_blank", rel: "noreferrer" }, "See all live apps ↗"))
+    el("p", { class: "step-kicker mono" }, "STEP 2 · WRITE TASKS"),
+    el("h2", { class: "display" }, "Write tasks with recommendations"),
+    el("p", { class: "screen-sub" }, "Each MyPCBench app is a task guide and a history filter. Apollo matches selected mail, calendar events, and documents to the closest real-world analogue, then gives you a complete draft to refine after trying the workflow yourself."),
+    el("div", { class: "discovery-actions" }, el("button", { class: "btn primary", type: "button", onclick: () => ctx.actions.goto("items") }, "Upload or import data"), el("a", { class: "btn ghost", href: "https://mypcbench.com/apps", target: "_blank", rel: "noreferrer" }, "See all live apps ↗"))
   );
 
   const freeForm = PC_TEMPLATES.find((template) => template.id === "free-form-long-horizon")!;
@@ -30,17 +30,17 @@ export function renderTasks(ctx: Ctx): HTMLElement {
 
   if (s.tasks.length) root.append(savedTasks(ctx));
 
-  root.append(el("div", { class: "discovery-section-head" }, el("div", null, el("p", { class: "section-label" }, "RECOMMENDED FROM YOUR HISTORY"), el("h3", null, recommendations.length ? `${recommendations.length} workflows with supporting context` : "Import history to get recommendations")), el("span", { class: "privacy-local-badge mono" }, "ANALYZED LOCALLY")));
+  root.append(el("div", { class: "discovery-section-head" }, el("div", null, el("p", { class: "section-label" }, "RECOMMENDED TASK GUIDES FROM YOUR HISTORY"), el("h3", null, recommendations.length ? `${recommendations.length} workflows with supporting context` : "Upload or import data to get recommendations")), el("span", { class: "privacy-local-badge mono" }, "ANALYZED LOCALLY")));
   if (recommendations.length) {
     root.append(el("div", { class: "recommendation-grid" }, ...recommendations.map((recommendation, index) => recommendationCard(ctx, recommendation, index + 1))));
   } else {
-    root.append(el("section", { class: "recommendation-empty" }, el("strong", null, "No selected history yet"), el("p", null, "Import mail or calendar history, or add a resume, tax form, note, PDF, Word document, or text file. Apollo will suggest supported app workflows without sending that history anywhere."), el("button", { class: "btn primary", type: "button", onclick: () => ctx.actions.goto("sources") }, "Choose a source →")));
+    root.append(el("section", { class: "recommendation-empty" }, el("strong", null, "No selected data yet"), el("p", null, "Add mail, calendar history, a resume, tax form, note, PDF, Word document, or text file. Apollo will recommend app-guided tasks without sending that data anywhere."), el("button", { class: "btn primary", type: "button", onclick: () => ctx.actions.goto("items") }, "Upload or import data →")));
   }
 
   const categories = Object.keys(APP_CATEGORY_LABELS) as AppCategory[];
   const visibleApps = MYPCBENCH_APPS.filter((candidate) => s.discoveryCategory === "all" || candidate.category === s.discoveryCategory);
   root.append(
-    el("div", { class: "discovery-section-head app-library-head" }, el("div", null, el("p", { class: "section-label" }, "ALL 17 LIVE APPS"), el("h3", null, "Choose a workflow directly"))),
+    el("div", { class: "discovery-section-head app-library-head" }, el("div", null, el("p", { class: "section-label" }, "ALL 17 LIVE APP GUIDES"), el("h3", null, "Choose a guideline and filter directly"))),
     el("div", { class: "category-chips app-category-chips", role: "group", "aria-label": "Filter apps by category" }, categoryButton(ctx, "all", "All", MYPCBENCH_APPS.length), ...categories.map((category) => categoryButton(ctx, category, APP_CATEGORY_LABELS[category], MYPCBENCH_APPS.filter((candidate) => candidate.category === category).length))),
     el("div", { class: "app-library" }, ...visibleApps.map((candidate) => appLibraryRow(ctx, candidate, recommendationByApp.get(candidate.id))))
   );
@@ -70,7 +70,7 @@ function recommendationCard(ctx: Ctx, recommendation: AppRecommendation, rank: n
 
 function appLibraryRow(ctx: Ctx, candidate: MyPCBenchApp, recommendation?: AppRecommendation): HTMLElement {
   const draft: AppRecommendation = recommendation ?? { app: candidate, score: 0, recordIds: [], reason: `Open the ${candidate.analogue}-style clone and turn a real workflow into a task.` };
-  return el("article", { class: "app-library-row", "data-app-id": candidate.id }, el("div", { class: "app-library-copy" }, el("span", { class: "app-analogue mono" }, APP_CATEGORY_LABELS[candidate.category].toUpperCase()), el("strong", null, candidate.name), el("p", null, `${candidate.description} Based on ${candidate.analogue}.`)), el("span", { class: `app-history-count mono ${recommendation ? "matched" : ""}` }, recommendation ? `${recommendation.recordIds.length} matches` : "No matches yet"), el("div", { class: "app-library-actions" }, el("a", { class: "btn ghost small", href: candidate.url, target: "_blank", rel: "noreferrer" }, "Open app ↗"), el("button", { class: "btn small", type: "button", onclick: () => ctx.actions.startRecommendedTask(draft) }, "Write task")));
+  return el("article", { class: "app-library-row", "data-app-id": candidate.id }, el("div", { class: "app-library-copy" }, el("span", { class: "app-analogue mono" }, APP_CATEGORY_LABELS[candidate.category].toUpperCase()), el("strong", null, candidate.name), el("p", null, `${candidate.description} Use the ${candidate.analogue} analogue as the guideline.`)), el("span", { class: `app-history-count mono ${recommendation ? "matched" : ""}` }, recommendation ? `${recommendation.recordIds.length} matching records` : "No matches yet"), el("div", { class: "app-library-actions" }, el("a", { class: "btn ghost small", href: candidate.url, target: "_blank", rel: "noreferrer" }, "Open app ↗"), el("button", { class: "btn small", type: "button", onclick: () => ctx.actions.startRecommendedTask(draft) }, "Use guide")));
 }
 
 function categoryButton(ctx: Ctx, category: AppCategory | "all", label: string, count: number): HTMLElement {

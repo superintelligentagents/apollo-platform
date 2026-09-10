@@ -1,4 +1,5 @@
 import { metadataFields } from "../components/metadata";
+import { appIdsForRecord, MYPCBENCH_APPS, type MyPCBenchApp } from "../../app-catalog";
 import { MIN_STEP_LENGTH, PC_TEMPLATES } from "../../templates";
 import type { SourceRecord } from "../../types";
 import { el } from "../components/helpers";
@@ -11,9 +12,13 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
   if (!draft) return root;
   const template = s.activeTemplate ?? PC_TEMPLATES.find((t) => t.id === draft.templateId) ?? null;
   const isFreeForm = template?.id === "free-form-long-horizon";
+  const savedGuideId = draft.templateId.startsWith("mypcbench-") ? draft.templateId.slice("mypcbench-".length) : "";
+  const guideId = s.pickerApp === "__all__" ? "" : s.pickerApp || savedGuideId;
+  const guide = MYPCBENCH_APPS.find((app) => app.id === guideId) ?? null;
 
-  root.append(el("h2", { class: "display" }, template ? template.title : "Edit task"));
-  if (template) root.append(el("p", { class: "screen-sub" }, template.tagline));
+  root.append(el("p", { class: "step-kicker mono" }, "WRITE TASK"), el("h2", { class: "display" }, guide ? guide.task.title : template ? template.title : "Edit task"));
+  if (guide) root.append(el("p", { class: "screen-sub" }, `${guide.name} follows the ${guide.analogue} workflow. Use the guide, attached records, and live app to refine this task.`));
+  else if (template) root.append(el("p", { class: "screen-sub" }, template.tagline));
 
   const layout = el("div", { class: "task-edit-layout" });
 
@@ -237,11 +242,24 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
 
   // ---- Right: selected data for inspiration and optional grounding
   const picker = el("aside", { class: "record-picker data-inspiration", "aria-label": "Uploaded data inspiration" });
+  const documentInput = el("input", {
+    type: "file",
+    multiple: true,
+    accept: ".pdf,.docx,.txt,.md,.csv,.json,.html,.htm",
+    style: "display:none",
+    "data-testid": "task-document-upload",
+    onchange: (event: Event) => {
+      const input = event.target as HTMLInputElement;
+      const files = [...(input.files ?? [])];
+      input.value = "";
+      if (files.length) void importTaskDocuments(ctx, draft.taskId, files);
+    },
+  }) as HTMLInputElement;
   picker.append(
     el("div", { class: "inspiration-head" },
-      el("p", { class: "step-kicker mono" }, "YOUR DATA"),
-      el("h3", null, "Find task inspiration"),
-      el("p", { class: "field-hint" }, "Browse selected mail, calendar events, and document text. Check a record to attach it.")
+      el("div", null, el("p", { class: "step-kicker mono" }, "YOUR DATA"), el("h3", null, "Find task inspiration"), el("p", { class: "field-hint" }, "Browse selected mail, calendar events, and document text. Check a record to attach it.")),
+      documentInput,
+      el("button", { class: "btn primary small", type: "button", disabled: !!s.importing, "data-testid": "task-add-document", onclick: () => documentInput.click() }, s.importing?.kind === "documents" ? "Reading document…" : "+ Upload document")
     ),
     el(
       "div",
@@ -250,12 +268,16 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
     )
   );
 
+  picker.append(appGuideControl(ctx, draft, guideId, guide));
+
   const selectedRecords = [...s.records.values()].filter((r) =>
     (r.source === "email" || r.source === "calendar" || r.source === "documents") && ctx.actions.isIncluded(r)
   );
-  const emailCount = selectedRecords.filter((r) => r.source === "email").length;
-  const calendarCount = selectedRecords.filter((r) => r.source === "calendar").length;
-  const documentCount = selectedRecords.filter((r) => r.source === "documents").length;
+  const attached = new Set(draft.referencedRecordIds);
+  const guidedRecords = selectedRecords.filter((record) => !guideId || attached.has(record.id) || appIdsForRecord(record).includes(guideId));
+  const emailCount = guidedRecords.filter((r) => r.source === "email").length;
+  const calendarCount = guidedRecords.filter((r) => r.source === "calendar").length;
+  const documentCount = guidedRecords.filter((r) => r.source === "documents").length;
   const setPickerSource = (source: typeof s.pickerSource) => {
     s.pickerSource = source;
     s.pickerPage = 0;
@@ -264,7 +286,7 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
     ctx.rerender();
   };
   picker.append(el("div", { class: "picker-tabs", role: "group", "aria-label": "Filter inspiration by source" },
-    pickerTab("All", selectedRecords.length, s.pickerSource === "all", () => setPickerSource("all")),
+    pickerTab("All", guidedRecords.length, s.pickerSource === "all", () => setPickerSource("all")),
     pickerTab("Mail", emailCount, s.pickerSource === "email", () => setPickerSource("email")),
     pickerTab("Calendar", calendarCount, s.pickerSource === "calendar", () => setPickerSource("calendar")),
     pickerTab("Documents", documentCount, s.pickerSource === "documents", () => setPickerSource("documents")),
@@ -286,9 +308,8 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
   });
   picker.append(search);
 
-  const attached = new Set(draft.referencedRecordIds);
   const q = s.pickerQuery.trim().toLowerCase();
-  const matches = selectedRecords
+  const matches = guidedRecords
     .filter((r) => s.pickerSource === "all" || (s.pickerSource === "selected" ? attached.has(r.id) : r.source === s.pickerSource))
     .filter((r) => !q || pickerSearchText(r).includes(q))
     .sort((a, b) => Number(attached.has(b.id)) - Number(attached.has(a.id)) || (b.timestamp || "").localeCompare(a.timestamp || ""));
@@ -354,7 +375,7 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
       row
     );
   }
-  if (!matches.length) list.append(el("p", { class: "empty-note" }, s.pickerSource === "selected" ? "No records attached to this task yet." : selectedRecords.length ? "No records match this filter." : "Select mail, calendar, or document records for upload to see them here."));
+  if (!matches.length) list.append(el("p", { class: "empty-note" }, s.pickerSource === "selected" ? "No records attached to this task yet. Upload a document here or check a record in another tab." : selectedRecords.length ? "No records match this app guide and filter." : "Upload a document here, or add mail and calendar data in the data workspace."));
   picker.append(list);
   if (pickerPages > 1) picker.append(el("div", { class: "picker-pager" },
     el("button", { class: "btn ghost small", type: "button", disabled: pickerPage === 0, onclick: () => { s.pickerPage = pickerPage - 1; s.pickerOpenId = null; s.pickerOpenBody = null; ctx.rerender(); } }, "← Previous"),
@@ -365,6 +386,72 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
   layout.append(form, picker);
   root.append(layout);
   return root;
+}
+
+function appGuideControl(ctx: Ctx, draft: NonNullable<Ctx["state"]["taskDraft"]>, guideId: string, guide: MyPCBenchApp | null): HTMLElement {
+  const select = el(
+    "select",
+    {
+      class: "field-input compact",
+      "data-testid": "task-app-guide",
+      onchange: (event: Event) => {
+        ctx.state.pickerApp = (event.target as HTMLSelectElement).value || "__all__";
+        ctx.state.pickerPage = 0;
+        ctx.state.pickerOpenId = null;
+        ctx.state.pickerOpenBody = null;
+        ctx.rerender();
+      },
+    },
+    el("option", { value: "", selected: !guideId }, "All data · no app filter"),
+    ...MYPCBENCH_APPS.map((app) => el("option", { value: app.id, selected: guideId === app.id }, `${app.name} · like ${app.analogue}`))
+  );
+  const root = el("section", { class: `task-app-guide ${guide ? "active" : ""}` }, el("label", { class: "field" }, el("span", { class: "field-label" }, "MyPCBench app guide & data filter"), select));
+  if (!guide) {
+    root.append(el("p", { class: "field-hint" }, "Choose any of the 17 apps to filter your data and use its workflow as a writing guideline."));
+    return root;
+  }
+  const alreadyApplied = draft.templateId === `mypcbench-${guide.id}`;
+  root.append(
+    el("div", { class: "task-app-guide-copy" }, el("span", { class: "app-analogue mono" }, `${guide.name.toUpperCase()} · LIKE ${guide.analogue.toUpperCase()}`), el("strong", null, guide.task.title), el("p", null, guide.description), el("p", { class: "mono app-guide-steps" }, guide.task.steps.map((step, index) => `${index + 1}. ${step.title}`).join("  ·  "))),
+    el("div", { class: "task-app-guide-actions" }, el("a", { class: "btn ghost small", href: guide.url, target: "_blank", rel: "noreferrer" }, `Open ${guide.name} ↗`), alreadyApplied ? el("span", { class: "chip ok" }, "Guide applied") : el("button", { class: "btn small", type: "button", "data-testid": "apply-app-guide", onclick: () => applyAppGuide(ctx, draft, guide) }, "Use as task starting point"))
+  );
+  return root;
+}
+
+function applyAppGuide(ctx: Ctx, draft: NonNullable<Ctx["state"]["taskDraft"]>, guide: MyPCBenchApp): void {
+  if (draft.request.trim() && !window.confirm("Replace the current task wording with this app guide? Attached records will stay selected.")) return;
+  const source = guide.task;
+  Object.assign(draft, {
+    templateId: `mypcbench-${guide.id}`,
+    category: source.category,
+    title: source.title,
+    request: source.request,
+    steps: source.steps.map((step, index) => ({ ...step, order: index })),
+    successCriteria: [...source.successCriteria],
+    requiredOutputs: [...source.requiredOutputs],
+    subjects: [...source.subjects],
+    notes: `MyPCBench app: ${guide.name}`,
+  });
+  ctx.state.pickerApp = guide.id;
+  ctx.autosave();
+  ctx.rerender();
+}
+
+async function importTaskDocuments(ctx: Ctx, taskId: string, files: File[]): Promise<void> {
+  const before = new Set([...ctx.state.records.values()].filter((record) => record.source === "documents").map((record) => record.id));
+  await ctx.actions.importFiles("documents", files);
+  const draft = ctx.state.taskDraft;
+  if (!draft || draft.taskId !== taskId) return;
+  for (const record of ctx.state.records.values()) {
+    if (record.source !== "documents" || !ctx.actions.isIncluded(record)) continue;
+    const matchesChosenFile = files.some((file) => record.filename === file.name && record.size === file.size);
+    if (before.has(record.id) && !matchesChosenFile) continue;
+    if (!draft.referencedRecordIds.includes(record.id)) draft.referencedRecordIds.push(record.id);
+  }
+  ctx.state.pickerSource = "documents";
+  ctx.state.pickerPage = 0;
+  ctx.autosave();
+  ctx.rerender();
 }
 
 function pickerTab(label: string, count: number, active: boolean, onclick: () => void): HTMLElement {

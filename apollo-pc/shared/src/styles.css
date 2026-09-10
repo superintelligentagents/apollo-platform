@@ -1705,6 +1705,22 @@ body {
 }
 
 /* Items screen */
+.data-import-panel { margin: 26px 0 18px; padding: 20px; border: 1px solid var(--line); border-radius: 16px; background: var(--paper); }
+.data-import-head { display: flex; align-items: end; justify-content: space-between; gap: 24px; margin-bottom: 16px; }
+.data-import-head .section-label { margin-bottom: 4px; }
+.data-import-head h3 { margin: 0; font: 600 20px/1.2 var(--display); letter-spacing: -.02em; }
+.data-date-window { width: min(230px, 100%); }
+.data-import-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.data-import-card { display: flex; min-width: 0; flex-direction: column; align-items: flex-start; gap: 6px; padding: 16px; border: 1px solid var(--line); border-radius: 12px; background: #fff; }
+.data-import-card > strong { font-family: var(--display); font-size: 18px; }
+.data-import-card > p { min-height: 20px; margin: 0; color: var(--ink-soft); font-size: 13px; }
+.data-import-card > small { color: var(--cobalt-deep); font-size: 10.5px; }
+.data-import-actions { display: flex; align-items: center; gap: 12px; margin-top: auto; padding-top: 10px; }
+.data-empty { max-width: none; text-align: center; }
+.data-workspace-footer { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 24px; padding: 18px 20px; border: 1px solid var(--line); border-radius: 14px; background: var(--paper); }
+.data-workspace-footer > div { margin-right: auto; }
+.data-workspace-footer strong { font-size: 14px; }
+.data-workspace-footer p { margin: 3px 0 0; color: var(--ink-soft); font-size: 12px; }
 .upload-workflows { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin: 24px 0 16px; }
 .upload-workflow-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 16px; min-height: 132px; padding: 22px; color: var(--ink); background: #fff; border: 1px solid var(--line); border-radius: 16px; font: inherit; text-align: left; cursor: pointer; transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease; }
 .upload-workflow-card:hover:not(:disabled), .upload-workflow-card.active { border-color: var(--cobalt); box-shadow: 0 8px 24px rgba(22, 45, 39, .08); transform: translateY(-1px); }
@@ -1909,10 +1925,20 @@ textarea.record-field { resize: vertical; line-height: 1.5; }
 .task-options[open] { padding-bottom: 8px; }
 .task-options[open] { display: flex; flex-direction: column; gap: 14px; }
 .record-picker { position: sticky; top: 72px; display: flex; flex-direction: column; gap: 10px; max-height: calc(100dvh - 92px); padding: 8px 0 8px 24px; overflow: hidden; background: transparent; border-left: 1px solid var(--line); }
+.inspiration-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.inspiration-head > div { min-width: 0; }
 .inspiration-head h3 { margin: 5px 0 6px; font-family: var(--display); font-size: 21px; letter-spacing: -.025em; }
 .inspiration-head p:last-child { max-width: 38ch; margin: 0; line-height: 1.45; }
 .picker-message:empty { display: none; }
-.picker-tabs { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; padding: 3px; background: var(--paper); border-radius: 8px; }
+.task-app-guide { display: flex; flex-direction: column; gap: 9px; padding: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); }
+.task-app-guide.active { border-color: rgba(49, 95, 85, .34); background: var(--cobalt-wash); }
+.task-app-guide-copy { display: flex; flex-direction: column; gap: 5px; }
+.task-app-guide-copy > strong { font-family: var(--display); font-size: 16px; }
+.task-app-guide-copy > p { margin: 0; color: var(--ink-soft); font-size: 12px; line-height: 1.45; }
+.task-app-guide-copy .app-guide-steps { color: var(--cobalt-deep); font-size: 10px; }
+.task-app-guide-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.task-app-guide-actions a { text-decoration: none; }
+.picker-tabs { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 2px; padding: 3px; background: var(--paper); border-radius: 8px; }
 .picker-tab { display: flex; align-items: center; justify-content: center; min-height: 34px; padding: 6px; color: var(--ink-soft); background: transparent; border: 0; border-radius: 5px; font: inherit; font-size: 11.5px; font-weight: 600; cursor: pointer; }
 .picker-tab:hover { color: var(--ink); background: var(--paper); }
 .picker-tab.active { color: #fff; background: var(--cobalt); }
@@ -1941,6 +1967,10 @@ textarea.record-field { resize: vertical; line-height: 1.5; }
 @media (max-width: 980px) { .items-layout.with-drawer { grid-template-columns: 1fr; } .item-drawer { position: static; max-height: none; } .task-edit-layout { grid-template-columns: 1fr; } .record-picker { position: static; max-height: 640px; } }
 
 @media (max-width: 900px) {
+  .data-import-head { align-items: stretch; flex-direction: column; gap: 12px; }
+  .data-import-grid { grid-template-columns: 1fr; }
+  .data-workspace-footer { align-items: stretch; flex-direction: column; }
+  .data-workspace-footer > div { margin: 0 0 4px; }
   .upload-workflows { grid-template-columns: 1fr; }
   .selection-summary { grid-template-columns: 1fr auto; }
   .selection-summary p { grid-column: 1 / -1; grid-row: 2; }
@@ -1955,6 +1985,8 @@ textarea.record-field { resize: vertical; line-height: 1.5; }
 }
 
 @media (max-width: 620px) {
+  .inspiration-head { flex-direction: column; }
+  .picker-tabs { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .dashboard-counts { grid-template-columns: 1fr; }
   .major-workflow { grid-template-columns: 24px 1fr auto; gap: 10px; }
   .major-workflow small { display: none; }

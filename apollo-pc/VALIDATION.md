@@ -15,9 +15,9 @@ PC Lambda code SHA-256: `GuXzERUGKcryZk29ibKyTRGDzbRY98KrrI+NlHDPF64=`.
 
 | Area | Result and evidence |
 | --- | --- |
-| Mail/calendar/document import, receipt mining, source selection and filters | Browser-local PDF, DOCX, text, Markdown, CSV, JSON, and HTML extraction added. Original files never upload; document text passes through the existing selection, editing, masking, aliasing, privacy audit, and bundle split. Parser/UI tests pass, including PDF/DOCX fixtures and a 100,000-message mailbox case. |
+| Mail/calendar/document import, receipt mining, source selection and filters | One data workspace now combines file import, parsed-record review, selection, app-guided filters, privacy controls, and the submit handoff. Browser-local PDF, DOCX, text, Markdown, CSV, JSON, and HTML extraction is supported. Original files never upload; document text passes through the existing editing, masking, aliasing, privacy audit, and bundle split. |
 | Field edits, replacement rules, entity aliases, privacy audit, bundle splitting | Existing PC privacy and upload tests pass. New author revisions and appeal prose are audited before outbound mutations. |
-| Task discovery and authoring | All 17 live MyPCBench apps have exact autologin links, real-world analogues, category partitions, deterministic local history ranking, and complete grounded task drafts. Added region/subject metadata, shared curated examples, and metadata propagation through privacy-safe review sidecars. |
+| Task recommendations and authoring | **Write tasks** uses all 17 live MyPCBench apps as writing guidelines and record filters, with exact autologin links, real-world analogues, category partitions, deterministic local history ranking, and complete grounded drafts. The editor also imports documents in place and automatically attaches the imported records. |
 | My tasks | New list/detail screens, search/filter/sort, pagination, reviewer diffs, history, revisions, appeals, acceptance and amendments; ported author UI tests pass. Browser fixture verified desktop and 390px mobile layouts, navigation and editor controls. |
 | Review | Return-to-author, rubric insertion/removal/reordering, stable source mapping, sign-off callout and session skip hints added. Existing approval/rejection contracts and new ordering/API tests pass. |
 | Grade | Existing shortcuts and four outcome choices preserved. Added per-rubric lineage diffs and previous human grades; API carries both from AWS. |
@@ -30,14 +30,14 @@ PC Lambda code SHA-256: `GuXzERUGKcryZk29ibKyTRGDzbRY98KrrI+NlHDPF64=`.
 
 ## Automated checks
 
-- PC: 216 tests passed across 33 files.
+- PC: 219 tests passed across 34 files.
 - Shared backend: 113 tests passed.
 - Apollo v2 regression: 186 passed, 1 optional real-history test skipped.
 - OSWorld runner: 23 Python tests; PC context provisioner: 2 Node tests; trajectory packaging/judging: 37 Python tests.
 - PC TypeScript check and production Vite build passed.
 - Scoped diff whitespace check passed.
 
-These are 577 passing tests, plus the live integration scenarios below. Unit tests
+These are 580 passing tests, plus the live integration scenarios below. Unit tests
 and synthetic browser fixtures do not constitute a full production participant
 session or a newly executed model audit.
 
