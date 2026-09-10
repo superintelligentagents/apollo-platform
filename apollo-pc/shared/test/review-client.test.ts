@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { authorEdit, authorAmend, authorSignoff, myTaskPage, reviewReturn, reviewClaim, trajectoryClaim, sessionSkips, rememberReviewSkip, rememberTrajectorySkip, buildReviewedTask, rejectionReviewBlock, reviewReject, seedRubrics, upgradeRubrics } from "../src/review-client";
+import { authorEdit, authorAmend, authorSignoff, myTaskPage, reviewReturn, reviewClaim, reviewSubmit, trajectoryClaim, sessionSkips, rememberReviewSkip, rememberTrajectorySkip, buildReviewedTask, rejectionReviewBlock, reviewReject, seedRubrics, upgradeRubrics } from "../src/review-client";
 import type { ReviewLongTask } from "../src/types";
 
 const task = {
@@ -84,6 +84,24 @@ describe("PC parity contracts", () => {
     expect(result.task.steps.map((s: any) => s.order)).toEqual([0, 1]);
     expect(result.review.rubrics[1].source_index).toBe(0);
     expect(task.task.steps).toHaveLength(1);
+  });
+  it("enforces rubric verification and stable reviewer attribution before approval", async () => {
+    const fetcher = vi.fn(async () => ({ ok: true, json: async () => ({ ok: true }) }));
+    vi.stubGlobal("fetch", fetcher);
+    const claim = { subKey: "submission.json", token: "token", task, lockTtlMs: 30 * 60 * 1000, claimedAtMs: Date.now() };
+    const rubrics = seedRubrics(task);
+    const base = { title: "Original", request: "Original request", difficulty: "high", rubrics };
+
+    await expect(reviewSubmit("key", "Dana", claim, { ...base, evergreenVerified: true }, "dana-pid"))
+      .rejects.toThrow("Verify every rubric");
+    rubrics[0].checked = true;
+    await expect(reviewSubmit("key", "Dana", claim, { ...base, evergreenVerified: false }, "dana-pid"))
+      .rejects.toThrow("still works later");
+    await reviewSubmit("key", "Dana", claim, { ...base, evergreenVerified: true }, "dana-pid");
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(JSON.parse(String(calls[0][1].body))).toMatchObject({ reviewer_pid: "dana-pid" });
   });
   it("routes every author mutation and return to the PC API", async () => {
     const fetcher = vi.fn(async () => ({ ok: true, json: async () => ({ ok: true, items: [], source_total: 250, offset: 200, limit: 50 }) }));

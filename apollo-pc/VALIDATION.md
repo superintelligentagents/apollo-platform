@@ -1,7 +1,7 @@
 # PC collector parity validation — 2026-09-10
 
 Deployed to https://apollo-pc-site.vercel.app on 2026-09-10.
-Frontend release: `2026-09-10.5`. Production returned the expected unified-data,
+Frontend release: `2026-09-10.6`. Production returned the expected unified-data,
 long-horizon task, resume example, 17-app-guide, app-path, app-filter, and in-editor
 document-upload markers from the deployed route chunks. Computer-use passes covered the dashboard, unified data
 workspace, recommendations, exact app links, guided task editor, review/submit flow,
@@ -11,7 +11,11 @@ page, and verified the exact draft was restored. The post-deploy browser console
 clear. The `2026-09-10.5` pass additionally imported a synthetic resume locally,
 verified it was the sole relevant recommendation, opened the seven-phase LockedIn
 workflow with the resume attached, confirmed draft recovery after reload, and checked
-the deployed resume example and a live mail/calendar recommendation path.
+the deployed resume example and a live mail/calendar recommendation path. The
+`2026-09-10.6` pass aligned rubric authoring and review with v2: a 15-character
+sentence floor, no silent loss of touched short steps, mandatory verification of
+every rubric plus the evergreen check, refresh-safe removal/undo, stable Codex
+verdict mapping after reorder/removal, and stable reviewer IDs on approvals.
 
 Deployment: https://apollo-pc-site-pn6p1it4o-lawrences-projects-aa5ba59b.vercel.app
 Vercel deployment ID: `dpl_3HDcgpeSMPDfCer75YCimAEvu3Hq`.
@@ -35,7 +39,7 @@ skipped so unrelated PC pull requests do not fail on the absent showcase directo
 | Resume example | **Examples** leads with an actionable resume workflow: upload a resume, build a grounded LockedIn task, reconcile newer recruiting mail and the next 30 days of calendar events, prepare unsent follow-ups, and produce an evidence-backed change log. With a matching document already present, the action opens the prefilled task directly. |
 | Draft durability | Authoring data is stored in IndexedDB with a synchronous local-storage mirror for lifecycle flushes and migration from older browser-only drafts. The editor reports saving, saved, and failed states, writes on edits, and flushes when the page hides. IndexedDB quota failure and migration are covered by tests; production computer use verified save and reload recovery. |
 | My tasks | New list/detail screens, search/filter/sort, pagination, reviewer diffs, history, revisions, appeals, acceptance and amendments; ported author UI tests pass. Browser fixture verified desktop and 390px mobile layouts, navigation and editor controls. |
-| Review | Return-to-author, rubric insertion/removal/reordering, stable source mapping, sign-off callout and session skip hints added. Existing approval/rejection contracts and new ordering/API tests pass. |
+| Review | Return-to-author, rubric insertion/removal/reordering/undo, stable source and Codex-result mapping, sign-off callout and session skip hints added. Approval is blocked unless at least one rubric exists, every rubric is verified after its latest edit, and the evergreen check is confirmed. The API client repeats those gates, and approvals carry the stable reviewer ID used by team metrics. Existing approval/rejection contracts and the ordering, persistence, attribution, and enforcement tests pass. |
 | Grade | Existing shortcuts and four outcome choices preserved. Added per-rubric lineage diffs and previous human grades; API carries both from AWS. |
 | Identity | Author lookup and reviewer/creator assignment use the same protected participant ID as PC uploads. Explicit study IDs remain unchanged. |
 | Runtime access | Team key is validated against PC before device-local storage. No build-time review key. Built JavaScript checked against the configured key without printing it. |
@@ -48,14 +52,14 @@ skipped so unrelated PC pull requests do not fail on the absent showcase directo
 
 ## Automated checks
 
-- PC: 226 tests passed across 37 files.
+- PC: 229 tests passed across 37 files.
 - Shared backend: 116 tests passed.
 - Apollo v2 regression: 186 passed, 1 optional real-history test skipped.
 - OSWorld runner: 23 Python tests; PC context provisioner: 2 Node tests; trajectory packaging/judging: 37 Python tests.
 - PC TypeScript check and production Vite build passed.
 - Scoped diff whitespace check passed.
 
-These are 590 passing tests, plus the live integration scenarios below. Unit tests
+These are 593 passing tests, plus the live integration scenarios below. Unit tests
 and synthetic browser fixtures do not constitute a full production participant
 session or a newly executed model audit.
 

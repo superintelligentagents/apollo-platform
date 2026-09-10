@@ -19,9 +19,9 @@ export function renderTaskReviewQueue(ctx: Ctx): HTMLElement {
   let held: ClaimSnapshot | null = null;
   if (state.reviewClaim) {
     const fresh = Date.now() - state.reviewClaim.claimedAtMs < state.reviewClaim.lockTtlMs;
-    if (fresh) held = { claim: state.reviewClaim, rubrics: state.reviewRubrics, edits: state.reviewEdits };
+    if (fresh) held = { claim: state.reviewClaim, rubrics: state.reviewRubrics, removedRubrics: state.reviewRemovedRubrics, edits: state.reviewEdits };
     else {
-      ctx.update({ reviewClaim: null, reviewRubrics: null, reviewEdits: null });
+      ctx.update({ reviewClaim: null, reviewRubrics: null, reviewRemovedRubrics: null, reviewEdits: null });
       void clearClaimSnapshot(ctx.adapter.storage);
     }
   }
@@ -33,8 +33,8 @@ export function renderTaskReviewQueue(ctx: Ctx): HTMLElement {
     resume.replaceChildren(el("section", { class: "qc-resume" },
       el("div", null, el("strong", null, "Task review in progress"), el("p", { class: "muted small" }, `${minutes} min left on your lock`)),
       el("div", { class: "qc-resume-actions" },
-        el("button", { class: "btn primary small", type: "button", onclick: () => { ctx.update({ reviewClaim: snapshot.claim, reviewRubrics: snapshot.rubrics, reviewEdits: snapshot.edits }); ctx.actions.goto("task-review-edit"); } }, "Resume"),
-        el("button", { class: "btn ghost small", type: "button", onclick: async () => { await reviewRelease(state.reviewKey!, snapshot.claim).catch(() => {}); held = null; ctx.update({ reviewClaim: null, reviewRubrics: null, reviewEdits: null }); await clearClaimSnapshot(ctx.adapter.storage); drawResume(); void refresh(); } }, "Release")
+        el("button", { class: "btn primary small", type: "button", onclick: () => { ctx.update({ reviewClaim: snapshot.claim, reviewRubrics: snapshot.rubrics, reviewRemovedRubrics: snapshot.removedRubrics ?? null, reviewEdits: snapshot.edits }); ctx.actions.goto("task-review-edit"); } }, "Resume"),
+        el("button", { class: "btn ghost small", type: "button", onclick: async () => { await reviewRelease(state.reviewKey!, snapshot.claim).catch(() => {}); held = null; ctx.update({ reviewClaim: null, reviewRubrics: null, reviewRemovedRubrics: null, reviewEdits: null }); await clearClaimSnapshot(ctx.adapter.storage); drawResume(); void refresh(); } }, "Release")
       )
     ));
   };

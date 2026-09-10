@@ -6,7 +6,7 @@ import { appendUploadLog, loadUploadLog, STORAGE_KEYS, type PlatformAdapter } fr
 import type { ReviewClaim, TrajectoryClaim } from "../review-client";
 import { buildBundleId, participantId as schemaParticipantId, participantUploadIdentity, validateBundle } from "../schema";
 import { META_KEYS, openStore, type RecordStore } from "../store";
-import { seedCriteriaFromSteps, substantiveSteps, type PCTemplate } from "../templates";
+import { seedCriteriaFromSteps, shortTouchedSteps, substantiveSteps, type PCTemplate } from "../templates";
 import type {
   Entity,
   ItemDecision,
@@ -593,13 +593,19 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         if (!draft) return false;
         const errors: Record<string, string> = {};
         const request = draft.request.trim();
+        const tooShortSteps = shortTouchedSteps(draft.steps);
         const steps = substantiveSteps(draft.steps);
         const isAppGuided = draft.templateId.startsWith("mypcbench-");
         if (request.length < 15) errors.request = "Write the request out — a sentence or two.";
         if (isAppGuided && request.length < 120) errors.request = "Keep the full goal, constraints, connected apps, and final deliverable in the request.";
         if (/\[[^\]]+\]/.test(request)) errors.request = "Replace the [bracketed] placeholders with your own details.";
-        if (!steps.length) errors.steps = "Fill in at least one task step — a sentence is enough.";
-        if (isAppGuided && steps.length < 4) errors.steps = "Keep at least four dependent phases so this remains a long-horizon app workflow.";
+        if (tooShortSteps.length) {
+          errors.steps = `Finish ${tooShortSteps.map((step) => `“${step.title.trim() || "Untitled"}”`).join(", ")} as a complete rubric sentence, or clear ${tooShortSteps.length === 1 ? "it" : "them"}.`;
+        } else if (!steps.length) {
+          errors.steps = "Fill in at least one task step — a sentence is enough.";
+        } else if (isAppGuided && steps.length < 4) {
+          errors.steps = "Keep at least four dependent phases so this remains a long-horizon app workflow.";
+        }
         if (!draft.region) errors.region = "Choose the country or Global.";
         if (!draft.subjects.length) errors.subjects = "Choose at least one subject.";
         const template = state.activeTemplate;
@@ -818,13 +824,15 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       startReview(claim: ReviewClaim) {
         state.reviewClaim = claim;
         state.reviewRubrics = null;
+        state.reviewRemovedRubrics = null;
         state.reviewEdits = null;
-        void import("../review-client").then(({ saveClaimSnapshot }) => saveClaimSnapshot(adapter.storage, { claim, rubrics: null, edits: null }));
+        void import("../review-client").then(({ saveClaimSnapshot }) => saveClaimSnapshot(adapter.storage, { claim, rubrics: null, removedRubrics: null, edits: null }));
         goto("task-review-edit");
       },
       endReview(message: string) {
         state.reviewClaim = null;
         state.reviewRubrics = null;
+        state.reviewRemovedRubrics = null;
         state.reviewEdits = null;
         void import("../review-client").then(({ clearClaimSnapshot }) => clearClaimSnapshot(adapter.storage));
         notify(message, "ok");

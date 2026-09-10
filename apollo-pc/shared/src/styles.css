@@ -1516,7 +1516,16 @@ body {
 .pc-codex-check b { color: var(--green); font-size: 11px; }
 .pc-codex-check.attention b { color: #79591c; }
 .pc-review-rubrics { display: grid; gap: 9px; margin-top: 12px; }
+.pc-rubric-empty { margin: 0; padding: 12px; border: 1px dashed var(--line); border-radius: 10px; }
 .pc-rubric-row { display: grid; grid-template-columns: 34px 24px minmax(0, 1fr); gap: 9px; padding: 13px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.pc-removed-rubrics { display: grid; gap: 7px; margin-top: 14px; padding: 11px; border: 1px solid #ecd9ae; border-radius: 10px; background: var(--amber-wash); }
+.pc-removed-rubrics[hidden] { display: none; }
+.pc-removed-rubrics-head, .pc-removed-rubric-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.pc-removed-rubrics-head { color: #6d5010; font-size: 12px; }
+.pc-removed-rubrics-head span { color: var(--ink-faint); font-size: 11px; }
+.pc-removed-rubric-row { padding: 8px 9px; border: 1px solid #ecd9ae; border-radius: 8px; background: var(--surface); }
+.pc-removed-rubric-copy { display: flex; flex-direction: column; min-width: 0; }
+.pc-removed-rubric-copy strong, .pc-removed-rubric-copy small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pc-rubric-num { padding-top: 2px; color: var(--ink-faint); }
 .pc-rubric-check { width: 19px; height: 19px; margin-top: 1px; accent-color: var(--green); }
 .pc-rubric-content { min-width: 0; }

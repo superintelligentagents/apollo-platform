@@ -60,4 +60,37 @@ describe("Apollo PC task review", () => {
     root.querySelector<HTMLButtonElement>(".pc-rubric-summary")!.click();
     expect(root.querySelector<HTMLTextAreaElement>(".pc-rubric-text")!.value).toBe(task.task.steps![0].description);
   });
+
+  it("requires every rubric and evergreen confirmation, and can undo a rubric removal", () => {
+    const state = initialState();
+    state.reviewKey = "key";
+    state.reviewClaim = { subKey: "pc/review_task.json", token: "token", task, lockTtlMs: 1_800_000, claimedAtMs: Date.now() };
+    const ctx = { state, adapter: { storage: { get: vi.fn(async () => null), set: vi.fn(async () => {}) } }, actions: { reviewerName: () => "Reviewer", reviewerPid: () => "reviewer-pid" } } as unknown as Ctx;
+    const root = renderTaskReviewEdit(ctx);
+    const approve = Array.from(root.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "Approve task")!;
+    const rubricCheck = root.querySelector<HTMLInputElement>(".pc-rubric-check")!;
+    const evergreen = root.querySelector<HTMLInputElement>('.pc-evergreen-check input[type="checkbox"]')!;
+
+    expect(approve.disabled).toBe(true);
+    rubricCheck.checked = true;
+    rubricCheck.dispatchEvent(new Event("change", { bubbles: true }));
+    evergreen.checked = true;
+    evergreen.dispatchEvent(new Event("change", { bubbles: true }));
+    expect(approve.disabled).toBe(false);
+
+    root.querySelector<HTMLButtonElement>(".pc-rubric-summary")!.click();
+    const editor = root.querySelector<HTMLTextAreaElement>(".pc-rubric-text")!;
+    editor.value += " Updated.";
+    editor.dispatchEvent(new Event("input", { bubbles: true }));
+    expect(approve.disabled).toBe(true);
+
+    const remove = Array.from(root.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "Remove step")!;
+    remove.click();
+    expect(root.querySelectorAll(".pc-rubric-row")).toHaveLength(0);
+    expect(root.querySelector(".pc-removed-rubrics")?.textContent).toContain("Undo");
+    const undo = Array.from(root.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent === "Undo")!;
+    undo.click();
+    expect(root.querySelectorAll(".pc-rubric-row")).toHaveLength(1);
+    expect(state.reviewRemovedRubrics).toEqual([]);
+  });
 });

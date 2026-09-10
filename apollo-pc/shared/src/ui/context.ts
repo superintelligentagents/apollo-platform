@@ -144,6 +144,7 @@ export type AppState = {
   reviewKey: string | null;
   reviewClaim: import("../review-client").ReviewClaim | null;
   reviewRubrics: import("../review-client").RubricRow[] | null;
+  reviewRemovedRubrics: import("../review-client").RemovedRubric[] | null;
   reviewEdits: { title: string; request: string; difficulty: string; evergreenChecked?: boolean } | null;
   trajectoryClaim: import("../review-client").TrajectoryClaim | null;
   trajectoryJudgment: import("../review-client").TrajectoryJudgmentDraft | null;
@@ -244,6 +245,7 @@ export function initialState(): AppState {
     reviewKey: null,
     reviewClaim: null,
     reviewRubrics: null,
+    reviewRemovedRubrics: null,
     reviewEdits: null,
     trajectoryClaim: null,
     trajectoryJudgment: null,

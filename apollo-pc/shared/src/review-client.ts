@@ -56,6 +56,11 @@ export interface RubricRow {
   seedVersion: 2 | 3;
 }
 
+export interface RemovedRubric {
+  row: RubricRow;
+  index: number;
+}
+
 export interface LlmRubricReviewForHuman {
   rubric_id: string;
   verdict: "POSSIBLE" | "SHORTFALL" | "IMPOSSIBLE" | "WORKER_ERROR";
@@ -309,8 +314,8 @@ export function upgradeRubrics(task: ReviewLongTask, rows: RubricRow[]): RubricR
 }
 
 export function buildReviewedTask(task: ReviewLongTask, edited: { title: string; request: string; difficulty: string; rubrics: RubricRow[]; evergreenVerified?: boolean }): Record<string, unknown> {
-  const stepRows = edited.rubrics.filter((row) => row.kind === "step");
-  const criterionRows = edited.rubrics.filter((row) => row.kind === "criterion");
+  const stepRows = edited.rubrics.filter((row) => row.kind === "step" && row.text.trim());
+  const criterionRows = edited.rubrics.filter((row) => row.kind === "criterion" && row.text.trim());
   const finalSteps = stepRows.map((row, index) => ({
     ...(row.sourceIndex === null ? {} : task.task.steps?.[row.sourceIndex]),
     order: index,
@@ -341,8 +346,25 @@ export function buildReviewedTask(task: ReviewLongTask, edited: { title: string;
   };
 }
 
-export async function reviewSubmit(reviewKey: string, reviewer: string, claim: ReviewClaim, edited: { title: string; request: string; difficulty: string; rubrics: RubricRow[]; evergreenVerified?: boolean }): Promise<void> {
-  await post("/review/submit", { reviewKey, reviewer, sub_key: claim.subKey, token: claim.token, reviewed: buildReviewedTask(claim.task, edited) });
+export async function reviewSubmit(
+  reviewKey: string,
+  reviewer: string,
+  claim: ReviewClaim,
+  edited: { title: string; request: string; difficulty: string; rubrics: RubricRow[]; evergreenVerified?: boolean },
+  reviewerPid?: string
+): Promise<void> {
+  const substantive = edited.rubrics.filter((row) => row.text.trim());
+  if (!substantive.length) throw new Error("Write at least one rubric line before approving.");
+  if (substantive.some((row) => !row.checked)) throw new Error("Verify every rubric before approving.");
+  if (!edited.evergreenVerified) throw new Error("Confirm that the task still works later before approving.");
+  await post("/review/submit", {
+    reviewKey,
+    reviewer,
+    reviewer_pid: reviewerPid,
+    sub_key: claim.subKey,
+    token: claim.token,
+    reviewed: buildReviewedTask(claim.task, edited),
+  });
 }
 
 export function seedTrajectoryJudgment(run: TrajectoryRun): TrajectoryJudgmentDraft {
@@ -393,7 +415,13 @@ export async function trajectorySubmit(reviewKey: string, reviewer: string, revi
 }
 
 type Store = { get(key: string): Promise<string | null>; set(key: string, value: string): Promise<void> };
-export interface ClaimSnapshot { claim: ReviewClaim; rubrics: RubricRow[] | null; edits: { title: string; request: string; difficulty: string; evergreenChecked?: boolean } | null }
+export interface ClaimSnapshot {
+  claim: ReviewClaim;
+  rubrics: RubricRow[] | null;
+  // Optional so snapshots from earlier PC builds still resume.
+  removedRubrics?: RemovedRubric[] | null;
+  edits: { title: string; request: string; difficulty: string; evergreenChecked?: boolean } | null;
+}
 export interface TrajectoryClaimSnapshot { claim: TrajectoryClaim; judgment: TrajectoryJudgmentDraft }
 
 async function save(storage: Store, key: string, value: unknown): Promise<void> {
