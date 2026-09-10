@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { recommendApps } from "../src/app-catalog";
+import { appIdsForRecord, recommendAppsAsync } from "../src/app-catalog";
 import type { EmailRecord } from "../src/types";
 import { applyDecisions, serializeDecisions } from "../src/ui/autosave";
 import { initialState, type Ctx } from "../src/ui/context";
@@ -37,7 +37,7 @@ function largeMailbox(): Map<string, EmailRecord> {
 }
 
 describe("100k-message mailbox performance", () => {
-  it("indexes once, reuses the result, and searches without reclassification or resorting", () => {
+  it("indexes once, keeps recommendation work responsive, and reuses app matches in the editor", async () => {
     const records = largeMailbox();
     const buildStarted = performance.now();
     const index = mailboxIndexFor(records, "owner@example.com");
@@ -73,11 +73,20 @@ describe("100k-message mailbox performance", () => {
     expect(searchMs).toBeLessThan(1_500);
 
     const recommendationsStarted = performance.now();
-    const recommendations = recommendApps(records.values(), 17);
+    const recommendationPromise = recommendAppsAsync(records.values(), 17, 500);
+    const firstYieldMs = performance.now() - recommendationsStarted;
+    // The task screen can paint after one small chunk instead of blocking on
+    // the entire mailbox analysis.
+    expect(firstYieldMs).toBeLessThan(100);
+    const recommendations = await recommendationPromise;
     const recommendationsMs = performance.now() - recommendationsStarted;
     expect(recommendations[0].app.id).toBe("hoolimail");
     expect(recommendations[0].recordIds).toHaveLength(24);
     expect(recommendationsMs).toBeLessThan(4_000);
+
+    const editorMatchStarted = performance.now();
+    for (const record of records.values()) appIdsForRecord(record);
+    expect(performance.now() - editorMatchStarted).toBeLessThan(250);
   });
 
   it("persists a source-wide private choice without 100k decision objects", () => {

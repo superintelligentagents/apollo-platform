@@ -97,6 +97,9 @@ export type AppState = {
   // Compact source-wide choices keep a 100k-message "select all/private"
   // action from creating and serializing 100k identical decisions.
   sourceInclusionDefaults: Partial<Record<SourceKind, boolean>>;
+  // Bumped whenever records or their inclusion state change. Mailbox-wide UI
+  // indexes use this to invalidate without hashing 100k entries on each paint.
+  historyRevision: number;
   // Email ids that a mined receipt points back at (promoted to included even
   // when they look promotional).
   receiptEmailIds: Set<string>;
@@ -208,6 +211,7 @@ export function initialState(): AppState {
     records: new Map(),
     decisions: new Map(),
     sourceInclusionDefaults: {},
+    historyRevision: 0,
     receiptEmailIds: new Set(),
     entities: [],
     entityScope: "people",

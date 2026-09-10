@@ -5,6 +5,22 @@ import type { SourceRecord } from "../../types";
 import { el } from "../components/helpers";
 import type { Ctx } from "../context";
 
+type PickerHistoryCache = {
+  records: Ctx["state"]["records"];
+  recordCount: number;
+  historyRevision: number;
+  guideId: string;
+  attachmentKey: string;
+  selectedRecordCount: number;
+  guidedRecords: SourceRecord[];
+  emailCount: number;
+  calendarCount: number;
+  documentCount: number;
+};
+
+const pickerHistoryCache = new WeakMap<Ctx["state"], PickerHistoryCache>();
+const pickerSearchCache = new WeakMap<SourceRecord, string>();
+
 export function renderTaskEdit(ctx: Ctx): HTMLElement {
   const s = ctx.state;
   const draft = s.taskDraft;
@@ -292,14 +308,9 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
 
   picker.append(appGuideControl(ctx, draft, guideId, guide));
 
-  const selectedRecords = [...s.records.values()].filter((r) =>
-    (r.source === "email" || r.source === "calendar" || r.source === "documents") && ctx.actions.isIncluded(r)
-  );
   const attached = new Set(draft.referencedRecordIds);
-  const guidedRecords = selectedRecords.filter((record) => !guideId || attached.has(record.id) || appIdsForRecord(record).includes(guideId));
-  const emailCount = guidedRecords.filter((r) => r.source === "email").length;
-  const calendarCount = guidedRecords.filter((r) => r.source === "calendar").length;
-  const documentCount = guidedRecords.filter((r) => r.source === "documents").length;
+  const history = pickerHistoryFor(ctx, guideId, attached, draft.referencedRecordIds.join("\u0000"));
+  const { guidedRecords, emailCount, calendarCount, documentCount, selectedRecordCount } = history;
   const setPickerSource = (source: typeof s.pickerSource) => {
     s.pickerSource = source;
     s.pickerPage = 0;
@@ -333,8 +344,7 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
   const q = s.pickerQuery.trim().toLowerCase();
   const matches = guidedRecords
     .filter((r) => s.pickerSource === "all" || (s.pickerSource === "selected" ? attached.has(r.id) : r.source === s.pickerSource))
-    .filter((r) => !q || pickerSearchText(r).includes(q))
-    .sort((a, b) => Number(attached.has(b.id)) - Number(attached.has(a.id)) || (b.timestamp || "").localeCompare(a.timestamp || ""));
+    .filter((r) => !q || pickerSearchText(r).includes(q));
   const pickerPageSize = 50;
   const pickerPages = Math.max(1, Math.ceil(matches.length / pickerPageSize));
   const pickerPage = Math.min(s.pickerPage, pickerPages - 1);
@@ -397,7 +407,7 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
       row
     );
   }
-  if (!matches.length) list.append(el("p", { class: "empty-note" }, s.pickerSource === "selected" ? "No records attached to this task yet. Upload a document here or check a record in another tab." : selectedRecords.length ? "No records match this app guide and filter." : "Upload a document here, or add mail and calendar data in the data workspace."));
+  if (!matches.length) list.append(el("p", { class: "empty-note" }, s.pickerSource === "selected" ? "No records attached to this task yet. Upload a document here or check a record in another tab." : selectedRecordCount ? "No records match this app guide and filter." : "Upload a document here, or add mail and calendar data in the data workspace."));
   picker.append(list);
   if (pickerPages > 1) picker.append(el("div", { class: "picker-pager" },
     el("button", { class: "btn ghost small", type: "button", disabled: pickerPage === 0, onclick: () => { s.pickerPage = pickerPage - 1; s.pickerOpenId = null; s.pickerOpenBody = null; ctx.rerender(); } }, "← Previous"),
@@ -408,6 +418,50 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
   layout.append(form, picker);
   root.append(layout);
   return root;
+}
+
+function pickerHistoryFor(ctx: Ctx, guideId: string, attached: Set<string>, attachmentKey: string): PickerHistoryCache {
+  const s = ctx.state;
+  const cached = pickerHistoryCache.get(s);
+  if (
+    cached &&
+    cached.records === s.records &&
+    cached.recordCount === s.records.size &&
+    cached.historyRevision === s.historyRevision &&
+    cached.guideId === guideId &&
+    cached.attachmentKey === attachmentKey
+  ) return cached;
+
+  const guidedRecords: SourceRecord[] = [];
+  let selectedRecordCount = 0;
+  let emailCount = 0;
+  let calendarCount = 0;
+  let documentCount = 0;
+  for (const record of s.records.values()) {
+    if (record.source !== "email" && record.source !== "calendar" && record.source !== "documents") continue;
+    if (!ctx.actions.isIncluded(record)) continue;
+    selectedRecordCount++;
+    if (guideId && !attached.has(record.id) && !appIdsForRecord(record).includes(guideId)) continue;
+    guidedRecords.push(record);
+    if (record.source === "email") emailCount++;
+    else if (record.source === "calendar") calendarCount++;
+    else documentCount++;
+  }
+  guidedRecords.sort((a, b) => Number(attached.has(b.id)) - Number(attached.has(a.id)) || (b.timestamp || "").localeCompare(a.timestamp || ""));
+  const next: PickerHistoryCache = {
+    records: s.records,
+    recordCount: s.records.size,
+    historyRevision: s.historyRevision,
+    guideId,
+    attachmentKey,
+    selectedRecordCount,
+    guidedRecords,
+    emailCount,
+    calendarCount,
+    documentCount,
+  };
+  pickerHistoryCache.set(s, next);
+  return next;
 }
 
 function appGuideControl(ctx: Ctx, draft: NonNullable<Ctx["state"]["taskDraft"]>, guideId: string, guide: MyPCBenchApp | null): HTMLElement {
@@ -481,15 +535,19 @@ function pickerTab(label: string, count: number, active: boolean, onclick: () =>
 }
 
 function pickerSearchText(r: SourceRecord): string {
-  if (r.source === "email") return `${r.subject} ${r.snippet}`.toLowerCase();
-  if (r.source === "calendar") return `${r.summary} ${r.description}`.toLowerCase();
-  if (r.source === "documents") return `${r.filename} ${r.title} ${r.text}`.toLowerCase();
-  return "";
+  const cached = pickerSearchCache.get(r);
+  if (cached !== undefined) return cached;
+  let text = "";
+  if (r.source === "email") text = `${r.searchText} ${r.snippet.toLowerCase()}`;
+  else if (r.source === "calendar") text = `${r.searchText} ${r.description.toLowerCase()}`;
+  else if (r.source === "documents") text = r.searchText;
+  pickerSearchCache.set(r, text);
+  return text;
 }
 
 function pickerPreview(r: SourceRecord): string {
-  if (r.source === "email") return r.snippet || "No email content preview";
-  if (r.source === "calendar") return r.description || "No description";
+  if (r.source === "email") return r.snippet.slice(0, 180) || "No email content preview";
+  if (r.source === "calendar") return r.description.slice(0, 180) || "No description";
   if (r.source === "documents") return r.text.slice(0, 180) || "No extracted text";
   return "";
 }

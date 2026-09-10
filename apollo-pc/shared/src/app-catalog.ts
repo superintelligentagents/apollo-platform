@@ -182,9 +182,9 @@ function step(title: string, description: string): { title: string; description:
 }
 
 export function recordAppScore(record: SourceRecord, candidate: MyPCBenchApp): number {
-  const text = recordSignal(record);
-  const serviceId = record.source === "email" ? emailService(record)?.id : undefined;
-  return recordAppScoreFromSignal(record, candidate, text, serviceId);
+  const appIndex = APP_INDEX_BY_ID.get(candidate.id);
+  if (appIndex === undefined) return 0;
+  return analyzeRecord(record).matches.find((match) => match.appIndex === appIndex)?.score ?? 0;
 }
 
 function recordAppScoreFromSignal(record: SourceRecord, candidate: MyPCBenchApp, text: string, serviceId?: string): number {
@@ -200,16 +200,36 @@ function recordAppScoreFromSignal(record: SourceRecord, candidate: MyPCBenchApp,
   return score;
 }
 
-const appIdsCache = new WeakMap<SourceRecord, string[]>();
+type RecordAppAnalysis = {
+  ids: string[];
+  matches: Array<{ appIndex: number; score: number }>;
+};
 
-export function appIdsForRecord(record: SourceRecord): string[] {
-  const cached = appIdsCache.get(record);
+const APP_INDEX_BY_ID = new Map(MYPCBENCH_APPS.map((candidate, index) => [candidate.id, index]));
+
+// Recommendation discovery and the task editor inspect the same records. Keep
+// one analysis per immutable record so opening a recommendation does not repeat
+// the most expensive mailbox-wide classification pass.
+const appAnalysisCache = new WeakMap<SourceRecord, RecordAppAnalysis>();
+
+function analyzeRecord(record: SourceRecord): RecordAppAnalysis {
+  const cached = appAnalysisCache.get(record);
   if (cached) return cached;
   const text = recordSignal(record);
   const serviceId = record.source === "email" ? emailService(record)?.id : undefined;
-  const ids = MYPCBENCH_APPS.filter((candidate) => recordAppScoreFromSignal(record, candidate, text, serviceId) > 0).map((candidate) => candidate.id);
-  appIdsCache.set(record, ids);
-  return ids;
+  const matches: Array<{ appIndex: number; score: number }> = [];
+  for (let appIndex = 0; appIndex < MYPCBENCH_APPS.length; appIndex++) {
+    const candidate = MYPCBENCH_APPS[appIndex];
+    const score = recordAppScoreFromSignal(record, candidate, text, serviceId);
+    if (score > 0) matches.push({ appIndex, score });
+  }
+  const analysis = { ids: matches.map((match) => MYPCBENCH_APPS[match.appIndex].id), matches };
+  appAnalysisCache.set(record, analysis);
+  return analysis;
+}
+
+export function appIdsForRecord(record: SourceRecord): string[] {
+  return analyzeRecord(record).ids;
 }
 
 export function historyAppCounts(records: Iterable<SourceRecord>): Map<string, number> {
@@ -220,25 +240,27 @@ export function historyAppCounts(records: Iterable<SourceRecord>): Map<string, n
   return counts;
 }
 
-export function recommendApps(records: Iterable<SourceRecord>, limit = 6): AppRecommendation[] {
-  type Match = { record: SourceRecord; score: number };
-  type Summary = { app: MyPCBenchApp; score: number; topBySource: Map<SourceKind, Match[]>; sourceCounts: Map<SourceKind, number> };
-  const summaries: Summary[] = MYPCBENCH_APPS.map((app) => ({ app, score: 0, topBySource: new Map(), sourceCounts: new Map() }));
+type Match = { record: SourceRecord; score: number };
+type RecommendationSummary = { app: MyPCBenchApp; score: number; topBySource: Map<SourceKind, Match[]>; sourceCounts: Map<SourceKind, number> };
 
-  for (const record of records) {
-    const text = recordSignal(record);
-    const serviceId = record.source === "email" ? emailService(record)?.id : undefined;
-    for (const summary of summaries) {
-      const score = recordAppScoreFromSignal(record, summary.app, text, serviceId);
-      if (score <= 0) continue;
-      summary.score += score;
-      summary.sourceCounts.set(record.source, (summary.sourceCounts.get(record.source) ?? 0) + 1);
-      const sourceMatches = summary.topBySource.get(record.source) ?? [];
-      keepBestMatch(sourceMatches, { record, score });
-      summary.topBySource.set(record.source, sourceMatches);
-    }
+function recommendationSummaries(): RecommendationSummary[] {
+  return MYPCBENCH_APPS.map((app) => ({ app, score: 0, topBySource: new Map(), sourceCounts: new Map() }));
+}
+
+function addRecommendationRecord(summaries: RecommendationSummary[], record: SourceRecord): void {
+  const analysis = analyzeRecord(record);
+  for (const match of analysis.matches) {
+    const summary = summaries[match.appIndex];
+    const { score } = match;
+    summary.score += score;
+    summary.sourceCounts.set(record.source, (summary.sourceCounts.get(record.source) ?? 0) + 1);
+    const sourceMatches = summary.topBySource.get(record.source) ?? [];
+    keepBestMatch(sourceMatches, { record, score });
+    summary.topBySource.set(record.source, sourceMatches);
   }
+}
 
+function finishRecommendations(summaries: RecommendationSummary[], limit: number): AppRecommendation[] {
   return summaries
     .map((summary) => ({
       app: summary.app,
@@ -249,6 +271,35 @@ export function recommendApps(records: Iterable<SourceRecord>, limit = 6): AppRe
     .filter((recommendation) => recommendation.score > 0)
     .sort((a, b) => b.score - a.score || a.app.name.localeCompare(b.app.name))
     .slice(0, Math.max(0, limit));
+}
+
+export function recommendApps(records: Iterable<SourceRecord>, limit = 6): AppRecommendation[] {
+  const summaries = recommendationSummaries();
+
+  for (const record of records) {
+    addRecommendationRecord(summaries, record);
+  }
+
+  return finishRecommendations(summaries, limit);
+}
+
+export async function recommendAppsAsync(records: Iterable<SourceRecord>, limit = 6, chunkSize = 500, signal?: AbortSignal): Promise<AppRecommendation[]> {
+  const summaries = recommendationSummaries();
+  let processed = 0;
+  for (const record of records) {
+    if (signal?.aborted) return [];
+    addRecommendationRecord(summaries, record);
+    processed++;
+    if (processed % Math.max(1, chunkSize) === 0) {
+      await yieldToBrowser();
+      if (signal?.aborted) return [];
+    }
+  }
+  return finishRecommendations(summaries, limit);
+}
+
+function yieldToBrowser(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 function diverseRecordIds(topBySource: Map<SourceKind, Array<{ record: SourceRecord; score: number }>>): string[] {
@@ -310,19 +361,21 @@ function containsPhrase(text: string, phrase: string): boolean {
 function recordSignal(record: SourceRecord): string {
   switch (record.source) {
     case "email":
-      return [record.from.name, record.from.email, ...record.to.flatMap((address) => [address.name, address.email]), record.subject, record.snippet, ...record.labels].join(" ").toLowerCase();
+      return record.snippet ? `${record.searchText} ${record.snippet.toLowerCase()}` : record.searchText;
     case "calendar":
-      return [record.summary, record.description, record.location, record.organizer?.name, record.organizer?.email].filter(Boolean).join(" ").toLowerCase();
+      return record.description ? `${record.searchText} ${record.description.toLowerCase()}` : record.searchText;
     case "documents":
-      return [record.filename, record.title, record.text].join(" ").toLowerCase();
+      // Document searchText is already normalized and capped by the parser.
+      // Avoid repeatedly copying a potentially multi-megabyte extracted body.
+      return record.searchText;
     case "contacts":
-      return [record.fullName, record.org, ...record.emails].filter(Boolean).join(" ").toLowerCase();
+      return record.searchText;
     case "messages":
-      return [record.chatName, record.sender, record.text].join(" ").toLowerCase();
+      return `${record.searchText} ${record.text.toLowerCase()}`;
     case "orders":
-      return [record.merchant, ...record.items.map((item) => item.title)].join(" ").toLowerCase();
+      return `${record.searchText} ${record.items.map((item) => item.title).join(" ").toLowerCase()}`;
     case "transactions":
-      return [record.description, record.account, record.category].filter(Boolean).join(" ").toLowerCase();
+      return record.searchText;
   }
 }
 

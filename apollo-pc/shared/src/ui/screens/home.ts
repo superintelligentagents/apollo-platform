@@ -2,13 +2,24 @@ import { el } from "../components/helpers";
 import type { Ctx, Screen } from "../context";
 
 export function renderHome(ctx: Ctx): HTMLElement {
-  const records = [...ctx.state.records.values()];
-  const importedEmail = records.filter((record) => record.source === "email" || record.source === "orders").length;
-  const importedCalendar = records.filter((record) => record.source === "calendar").length;
-  const importedDocuments = records.filter((record) => record.source === "documents").length;
-  const selectedEmail = records.filter((record) => (record.source === "email" || record.source === "orders") && ctx.actions.isIncluded(record)).length;
-  const selectedCalendar = records.filter((record) => record.source === "calendar" && ctx.actions.isIncluded(record)).length;
-  const selectedDocuments = records.filter((record) => record.source === "documents" && ctx.actions.isIncluded(record)).length;
+  let importedEmail = 0;
+  let importedCalendar = 0;
+  let importedDocuments = 0;
+  let selectedEmail = 0;
+  let selectedCalendar = 0;
+  let selectedDocuments = 0;
+  for (const record of ctx.state.records.values()) {
+    if (record.source === "email" || record.source === "orders") {
+      importedEmail++;
+      if (ctx.actions.isIncluded(record)) selectedEmail++;
+    } else if (record.source === "calendar") {
+      importedCalendar++;
+      if (ctx.actions.isIncluded(record)) selectedCalendar++;
+    } else if (record.source === "documents") {
+      importedDocuments++;
+      if (ctx.actions.isIncluded(record)) selectedDocuments++;
+    }
+  }
   const uploaded = ctx.state.uploadedBySource;
 
   return el(

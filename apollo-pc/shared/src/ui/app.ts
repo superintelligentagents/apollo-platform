@@ -234,6 +234,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
     }
     if (orders.length) await store.putRecords(orders);
     if (added) {
+      state.historyRevision++;
       state.imports.orders = {
         stats: {
           recordsEmitted: [...state.records.values()].filter((r) => r.source === "orders").length,
@@ -377,6 +378,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
           );
           const fresh = result.records.filter((r) => !state.records.has(r.id));
           for (const r of result.records) state.records.set(r.id, r);
+          if (result.records.length) state.historyRevision++;
           await store.putRecords(result.records);
           state.imports[kind] = { stats: result.stats, issues: result.issues, importedAt: new Date().toISOString() };
           let mined = 0;
@@ -416,6 +418,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       toggleInclude(id: string) {
         const d = decisionFor(id);
         d.included = !d.included;
+        state.historyRevision++;
         invalidatePrivacyAudit();
         ctx.autosave();
         render();
@@ -433,6 +436,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
             state.decisions.set(id, { included, edits: {}, bodyEdit: null, maskOverrides: {} });
           }
         }
+        state.historyRevision++;
         invalidatePrivacyAudit();
         ctx.autosave();
         render();
@@ -440,6 +444,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
 
       bulkIncludeSources(sources: SourceKind[], included: boolean) {
         setSourcesIncluded(sources, included);
+        state.historyRevision++;
         invalidatePrivacyAudit();
         ctx.autosave();
         render();

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
-import type { DocumentRecord, EmailRecord, SourceRecord } from "../src/types";
+import type { CalendarRecord, DocumentRecord, EmailRecord, SourceRecord } from "../src/types";
 import { initialState, type Ctx } from "../src/ui/context";
 import { renderItems } from "../src/ui/screens/items";
 import { renderTaskEdit } from "../src/ui/screens/task-edit";
@@ -95,6 +95,38 @@ describe("task writing data and app guides", () => {
     expect(ctx.actions.importFiles).toHaveBeenCalledWith("documents", [file]);
     expect(ctx.state.taskDraft?.referencedRecordIds).toContain("new-resume");
     expect(ctx.state.pickerSource).toBe("documents");
+  });
+
+  it("keeps collapsed calendar rows small even when event descriptions are large", () => {
+    const ctx = baseCtx();
+    const description = "Calendar details ".repeat(100);
+    const event: CalendarRecord = {
+      id: "large-event",
+      source: "calendar",
+      sourceDetail: "ics",
+      timestamp: "2026-09-01T00:00:00Z",
+      searchText: "planning session calendar details",
+      uid: "large-event",
+      summary: "Planning session",
+      description,
+      location: "",
+      dtstart: "2026-09-01T00:00:00Z",
+      dtend: "2026-09-01T01:00:00Z",
+      allDay: false,
+      tzid: "UTC",
+      organizer: null,
+      attendees: [],
+      rrule: null,
+      recurrenceId: null,
+      status: null,
+    };
+    ctx.state.records.set(event.id, event);
+    ctx.state.taskDraft = draft("");
+
+    const root = renderTaskEdit(ctx);
+    const preview = root.querySelector<HTMLElement>(".picker-preview")!;
+    expect(preview.textContent).toBe(description.slice(0, 180));
+    expect(root.textContent).not.toContain(description);
   });
 });
 

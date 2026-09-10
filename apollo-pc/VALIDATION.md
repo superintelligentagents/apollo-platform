@@ -1,7 +1,7 @@
 # PC collector parity validation — 2026-09-10
 
 Deployed to https://apollo-pc-site.vercel.app on 2026-09-10.
-Frontend release: `2026-09-10.6`. Production returned the expected unified-data,
+Frontend release: `2026-09-10.7`. Production returned the expected unified-data,
 long-horizon task, resume example, 17-app-guide, app-path, app-filter, and in-editor
 document-upload markers from the deployed route chunks. Computer-use passes covered the dashboard, unified data
 workspace, recommendations, exact app links, guided task editor, review/submit flow,
@@ -19,7 +19,13 @@ verdict mapping after reorder/removal, and stable reviewer IDs on approvals. The
 production smoke loaded the ranked recommendation rail and all 17 guides over the
 existing large local QA mailbox, opened the seven-phase LockedIn editor, and
 confirmed that Review remains gated by the device-local team key. It did not submit
-a task or any private record.
+a task or any private record. The `2026-09-10.7` performance pass makes large-history
+recommendations incremental so the Write tasks screen paints after the first small
+chunk, shares completed app matches with the editor, caches the editor's filtered and
+sorted record index, limits collapsed calendar and email previews to 180 characters,
+and reduces Dashboard counting from six mailbox scans to one. The 100,000-message
+regression verifies a sub-100 ms first yield, complete recommendation analysis under
+four seconds, and reuse of all 100,000 app matches in the editor under 250 ms.
 
 Deployment target: the `apollo-pc-site` production project and
 https://apollo-pc-site.vercel.app alias.

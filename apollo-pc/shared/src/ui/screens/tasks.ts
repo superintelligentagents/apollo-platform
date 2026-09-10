@@ -1,8 +1,20 @@
-import { APP_CATEGORY_LABELS, MYPCBENCH_APPS, recommendApps, type AppCategory, type AppRecommendation, type MyPCBenchApp } from "../../app-catalog";
+import { APP_CATEGORY_LABELS, MYPCBENCH_APPS, recommendApps, recommendAppsAsync, type AppCategory, type AppRecommendation, type MyPCBenchApp } from "../../app-catalog";
 import { PC_TEMPLATES } from "../../templates";
 import type { SourceKind } from "../../types";
 import { chip, el } from "../components/helpers";
 import type { Ctx } from "../context";
+
+const SYNC_RECOMMENDATION_LIMIT = 2_000;
+
+type RecommendationCache = {
+  records: Ctx["state"]["records"];
+  recordCount: number;
+  historyRevision: number;
+  recommendations: AppRecommendation[] | null;
+  controller?: AbortController;
+};
+
+const recommendationCache = new WeakMap<Ctx["state"], RecommendationCache>();
 
 const CATEGORY_LABEL: Record<string, string> = {
   cross_source_reconciliation: "cross-source",
@@ -14,8 +26,9 @@ const CATEGORY_LABEL: Record<string, string> = {
 
 export function renderTasks(ctx: Ctx): HTMLElement {
   const s = ctx.state;
-  const eligible = [...s.records.values()].filter((record) => ctx.actions.isIncluded(record));
-  const allRecommendations = recommendApps(eligible, MYPCBENCH_APPS.length);
+  const recommendationState = recommendationsFor(ctx);
+  const allRecommendations = recommendationState.recommendations ?? [];
+  const recommendationsLoading = recommendationState.recommendations === null;
   const recommendations = allRecommendations.slice(0, 6);
   const recommendationByApp = new Map(allRecommendations.map((item) => [item.app.id, item]));
   const root = el("section", { class: "screen discovery-screen" });
@@ -31,8 +44,10 @@ export function renderTasks(ctx: Ctx): HTMLElement {
 
   if (s.tasks.length) root.append(savedTasks(ctx));
 
-  root.append(el("div", { class: "discovery-section-head" }, el("div", null, el("p", { class: "section-label" }, "RECOMMENDED TASK GUIDES FROM YOUR HISTORY"), el("h3", null, recommendations.length ? `${recommendations.length} workflow${recommendations.length === 1 ? "" : "s"} with supporting context` : "Upload or import data to get recommendations")), el("span", { class: "privacy-local-badge mono" }, "ANALYZED LOCALLY")));
-  if (recommendations.length) {
+  root.append(el("div", { class: "discovery-section-head" }, el("div", null, el("p", { class: "section-label" }, "RECOMMENDED TASK GUIDES FROM YOUR HISTORY"), el("h3", null, recommendationsLoading ? "Analyzing selected history…" : recommendations.length ? `${recommendations.length} workflow${recommendations.length === 1 ? "" : "s"} with supporting context` : "Upload or import data to get recommendations")), el("span", { class: "privacy-local-badge mono" }, "ANALYZED LOCALLY")));
+  if (recommendationsLoading) {
+    root.append(el("section", { class: "recommendation-empty", role: "status", "aria-live": "polite" }, el("strong", null, "Matching your history to the live apps…"), el("p", null, "You can start writing now. Recommendations will appear here as the local analysis finishes.")));
+  } else if (recommendations.length) {
     root.append(el("div", { class: "recommendation-grid" }, ...recommendations.map((recommendation, index) => recommendationCard(ctx, recommendation, index + 1))));
   } else {
     root.append(el("section", { class: "recommendation-empty" }, el("strong", null, "No selected data yet"), el("p", null, "Add mail, calendar history, a resume, tax form, note, PDF, Word document, or text file. Apollo will recommend app-guided tasks without sending that data anywhere."), el("button", { class: "btn primary", type: "button", onclick: () => ctx.actions.goto("items") }, "Upload or import data →")));
@@ -43,7 +58,7 @@ export function renderTasks(ctx: Ctx): HTMLElement {
   root.append(
     el("div", { class: "discovery-section-head app-library-head" }, el("div", null, el("p", { class: "section-label" }, "ALL 17 LIVE APP GUIDES"), el("h3", null, "Choose a guideline and filter directly"))),
     el("div", { class: "category-chips app-category-chips", role: "group", "aria-label": "Filter apps by category" }, categoryButton(ctx, "all", "All", MYPCBENCH_APPS.length), ...categories.map((category) => categoryButton(ctx, category, APP_CATEGORY_LABELS[category], MYPCBENCH_APPS.filter((candidate) => candidate.category === category).length))),
-    el("div", { class: "app-library" }, ...visibleApps.map((candidate) => appLibraryRow(ctx, candidate, recommendationByApp.get(candidate.id))))
+    el("div", { class: "app-library" }, ...visibleApps.map((candidate) => appLibraryRow(ctx, candidate, recommendationByApp.get(candidate.id), recommendationsLoading)))
   );
 
   const guided = el("div", { class: "mode-rows" });
@@ -53,6 +68,35 @@ export function renderTasks(ctx: Ctx): HTMLElement {
   }
   root.append(el("details", { class: "template-library" }, el("summary", null, "Use a general task template"), el("p", null, "These templates work even when no MyPCBench app is a close match."), guided));
   return root;
+}
+
+function recommendationsFor(ctx: Ctx): RecommendationCache {
+  const s = ctx.state;
+  const cached = recommendationCache.get(s);
+  if (cached && cached.records === s.records && cached.recordCount === s.records.size && cached.historyRevision === s.historyRevision) return cached;
+  cached?.controller?.abort();
+
+  const eligible = [...s.records.values()].filter((record) => ctx.actions.isIncluded(record));
+  const next: RecommendationCache = {
+    records: s.records,
+    recordCount: s.records.size,
+    historyRevision: s.historyRevision,
+    recommendations: eligible.length <= SYNC_RECOMMENDATION_LIMIT ? recommendApps(eligible, MYPCBENCH_APPS.length) : null,
+  };
+  recommendationCache.set(s, next);
+  if (next.recommendations !== null) return next;
+
+  next.controller = new AbortController();
+  void recommendAppsAsync(eligible, MYPCBENCH_APPS.length, 500, next.controller.signal).then((recommendations) => {
+    if (recommendationCache.get(s) !== next) return;
+    next.recommendations = recommendations;
+    if (s.screen === "tasks") ctx.rerender();
+  }).catch(() => {
+    if (recommendationCache.get(s) !== next) return;
+    next.recommendations = [];
+    if (s.screen === "tasks") ctx.rerender();
+  });
+  return next;
 }
 
 function recommendationCard(ctx: Ctx, recommendation: AppRecommendation, rank: number): HTMLElement {
@@ -70,9 +114,9 @@ function recommendationCard(ctx: Ctx, recommendation: AppRecommendation, rank: n
   );
 }
 
-function appLibraryRow(ctx: Ctx, candidate: MyPCBenchApp, recommendation?: AppRecommendation): HTMLElement {
+function appLibraryRow(ctx: Ctx, candidate: MyPCBenchApp, recommendation?: AppRecommendation, recommendationsLoading = false): HTMLElement {
   const draft: AppRecommendation = recommendation ?? { app: candidate, score: 0, recordIds: [], reason: `Open the ${candidate.analogue}-style clone and turn a real workflow into a task.` };
-  return el("article", { class: "app-library-row", "data-app-id": candidate.id }, el("div", { class: "app-library-copy" }, el("span", { class: "app-analogue mono" }, APP_CATEGORY_LABELS[candidate.category].toUpperCase()), el("strong", null, candidate.name), el("p", null, `${candidate.description} Use the ${candidate.analogue} analogue as the guideline.`), el("small", { class: "app-library-path mono" }, workflowPath(candidate))), el("span", { class: `app-history-count mono ${recommendation ? "matched" : ""}` }, recommendation ? `${recommendation.recordIds.length} matching record${recommendation.recordIds.length === 1 ? "" : "s"}` : "No matches yet"), el("div", { class: "app-library-actions" }, el("a", { class: "btn ghost small", href: candidate.url, target: "_blank", rel: "noreferrer" }, "Open app ↗"), el("button", { class: "btn small", type: "button", onclick: () => ctx.actions.startRecommendedTask(draft) }, "Use guide")));
+  return el("article", { class: "app-library-row", "data-app-id": candidate.id }, el("div", { class: "app-library-copy" }, el("span", { class: "app-analogue mono" }, APP_CATEGORY_LABELS[candidate.category].toUpperCase()), el("strong", null, candidate.name), el("p", null, `${candidate.description} Use the ${candidate.analogue} analogue as the guideline.`), el("small", { class: "app-library-path mono" }, workflowPath(candidate))), el("span", { class: `app-history-count mono ${recommendation ? "matched" : ""}` }, recommendation ? `${recommendation.recordIds.length} matching record${recommendation.recordIds.length === 1 ? "" : "s"}` : recommendationsLoading ? "Matching…" : "No matches yet"), el("div", { class: "app-library-actions" }, el("a", { class: "btn ghost small", href: candidate.url, target: "_blank", rel: "noreferrer" }, "Open app ↗"), el("button", { class: "btn small", type: "button", disabled: recommendationsLoading && !recommendation, onclick: () => ctx.actions.startRecommendedTask(draft) }, recommendationsLoading && !recommendation ? "Matching…" : "Use guide")));
 }
 
 function workflowPath(app: MyPCBenchApp): string {

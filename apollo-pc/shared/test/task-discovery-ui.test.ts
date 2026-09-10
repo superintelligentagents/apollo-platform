@@ -32,4 +32,33 @@ describe("task discovery UI", () => {
       recordIds: ["resume"],
     }));
   });
+
+  it("paints before a large history recommendation pass finishes", async () => {
+    const state = initialState();
+    state.screen = "tasks";
+    state.records = new Map(
+      Array.from({ length: 2_001 }, (_, index) => {
+        const record: EmailRecord = {
+          ...mail,
+          id: `mail-${index}`,
+          messageId: `mail-${index}`,
+          searchText: `delta flight ${index}`,
+        };
+        return [record.id, record] as const;
+      })
+    );
+    const rerender = vi.fn();
+    const ctx = { state, actions: { isIncluded: () => true, startRecommendedTask: vi.fn(), startTask: vi.fn(), goto: vi.fn(), editTask: vi.fn(), deleteTask: vi.fn() }, rerender } as unknown as Ctx;
+
+    const started = performance.now();
+    const loading = renderTasks(ctx);
+    expect(performance.now() - started).toBeLessThan(100);
+    expect(loading.textContent).toContain("Analyzing selected history");
+    expect(loading.querySelector<HTMLButtonElement>('.app-library button[disabled]')).not.toBeNull();
+
+    await vi.waitFor(() => expect(rerender).toHaveBeenCalled(), { timeout: 2_000 });
+    const ready = renderTasks(ctx);
+    expect(ready.textContent).not.toContain("Analyzing selected history");
+    expect(ready.textContent).toContain("workflows with supporting context");
+  });
 });
