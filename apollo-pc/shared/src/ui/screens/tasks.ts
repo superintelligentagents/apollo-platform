@@ -87,7 +87,7 @@ function recommendationsFor(ctx: Ctx): RecommendationCache {
   if (next.recommendations !== null) return next;
 
   next.controller = new AbortController();
-  void recommendAppsAsync(eligible, MYPCBENCH_APPS.length, 500, next.controller.signal).then((recommendations) => {
+  void recommendAppsAsync(eligible, MYPCBENCH_APPS.length, 2_000, next.controller.signal).then((recommendations) => {
     if (recommendationCache.get(s) !== next) return;
     next.recommendations = recommendations;
     if (s.screen === "tasks") ctx.rerender();
