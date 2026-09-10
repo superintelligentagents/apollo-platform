@@ -108,7 +108,9 @@ try {
     check(documentDetail.items[0].record.id === 'document-fixture', 'admin retrieves uploaded document text');
     cleanup.add(`pc-review/pc-edits/${b64(bundleId)}/documents/${b64('document-fixture')}.json`);
     const documentSave = await post('/review/pc-admin', { admin_email: admin, action: 'save', bundle_id: bundleId, kind: 'documents', item_id: 'document-fixture', final_record: { ...documents[0].record, title: 'Reviewed synthetic resume', text: 'Reviewed synthetic experience.', filename: 'must-not-change.txt' }, base_revision_count: 0 });
-    check(documentSave.final_record.title === 'Reviewed synthetic resume' && documentSave.final_record.filename === 'resume.txt', 'admin can edit document text while immutable metadata stays fixed');
+    check(documentSave.revision_count === 1, 'admin saves a document revision');
+    const editedDocument = await post('/review/pc-admin', { admin_email: admin, action: 'detail', bundle_id: bundleId, kind: 'documents' });
+    check(editedDocument.items[0].record.title === 'Reviewed synthetic resume' && editedDocument.items[0].record.filename === 'resume.txt', 'admin can edit document text while immutable metadata stays fixed');
     check((await read(documentKey)).records[0].record.title === 'Synthetic resume', 'document admin edits preserve original S3 upload');
     const taskDetail = await post('/review/admin', { admin_email: admin, action: 'detail', task_id: authoredTaskId });
     check(/^pc-[a-f0-9]{16}$/.test(taskDetail.item?.participant_id || ''), 'admin task detail uses a stable private annotator ID');

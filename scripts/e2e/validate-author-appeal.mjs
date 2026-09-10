@@ -11,12 +11,16 @@ const require = createRequire(new URL("../../backend/package.json", import.meta.
 const { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
 const { DeleteItemCommand, DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 
-const REVIEW_KEY = process.env.E2E_V2_REVIEW_KEY || process.env.E2E_REVIEW_KEY || "";
-if (!REVIEW_KEY) throw new Error("E2E_V2_REVIEW_KEY is required");
+const APP = String(process.env.E2E_APP || "v2").toLowerCase();
+if (!["v2", "pc"].includes(APP)) throw new Error("E2E_APP must be v2 or pc");
+const IS_PC = APP === "pc";
+const REVIEW_KEY = (IS_PC ? process.env.E2E_PC_REVIEW_KEY : process.env.E2E_V2_REVIEW_KEY) || process.env.E2E_REVIEW_KEY || "";
+if (!REVIEW_KEY) throw new Error(`${IS_PC ? "E2E_PC_REVIEW_KEY" : "E2E_V2_REVIEW_KEY"} is required`);
 const BUCKET = process.env.E2E_BUCKET || "journeys-prolific";
-const ENDPOINT = process.env.E2E_V2_REVIEW_ENDPOINT || "https://2fb2wkpayf.execute-api.us-east-1.amazonaws.com";
+const ENDPOINT = (IS_PC ? process.env.E2E_PC_REVIEW_ENDPOINT : process.env.E2E_V2_REVIEW_ENDPOINT)
+  || (IS_PC ? "https://t1ynh195m1.execute-api.us-east-1.amazonaws.com" : "https://2fb2wkpayf.execute-api.us-east-1.amazonaws.com");
 const TABLE = process.env.E2E_DASHBOARD_TABLE || "apollo-dashboard-index";
-const ROOT = "v2-review/";
+const ROOT = IS_PC ? "pc-review/" : "v2-review/";
 const region = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region });
 const dynamo = new DynamoDBClient({ region });
@@ -52,9 +56,11 @@ const stamp = `${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`.toLowerCa
 const authorPid = `e2e-appeal-author-${stamp}`.slice(0, 40).replace(/-$/, "0");
 const rejecterPid = `e2e-rejecter-${stamp}`.slice(0, 40).replace(/-$/, "0");
 const secondPid = `e2e-second-${stamp}`.slice(0, 40).replace(/-$/, "0");
-const rawTaskId = `v2/${authorPid}/internal/task-${stamp}`;
+const rawTaskId = IS_PC ? `pc_task-${stamp}` : `v2/${authorPid}/internal/task-${stamp}`;
 const safeTaskId = rawTaskId.replace(/[^A-Za-z0-9_-]/g, "_");
-const sourceKey = `prolific/journeys/${authorPid}/${rawTaskId}/${Date.now()}-${randomUUID().slice(0, 8)}_long_task.json`;
+const sourceKey = IS_PC
+  ? `prolific/journeys/${authorPid}/pc/${authorPid}/internal/bundle-${stamp}/${Date.now()}-${randomUUID().slice(0, 8)}_review_task_${stamp}.json`
+  : `prolific/journeys/${authorPid}/${rawTaskId}/${Date.now()}-${randomUUID().slice(0, 8)}_long_task.json`;
 const inboxKey = `${ROOT}inbox/${b64url(sourceKey)}`;
 const doneKey = `${ROOT}done/${b64url(sourceKey)}`;
 const rejectedKey = `${ROOT}rejected/${safeTaskId}_${createHash("sha256").update(sourceKey).digest("hex").slice(0, 16)}.json`;
@@ -195,8 +201,8 @@ try {
   for (const key of [...cleanup].reverse()) await remove(key);
   await dynamo.send(new DeleteItemCommand({
     TableName: TABLE,
-    Key: { scope: { S: "v2" }, entity_key: { S: `TASK#${rawTaskId}` } },
+    Key: { scope: { S: APP }, entity_key: { S: `TASK#${rawTaskId}` } },
   })).catch(() => {});
 }
 
-console.log("Author appeal validation complete; synthetic artifacts removed.");
+console.log(`${APP.toUpperCase()} author appeal validation complete; synthetic artifacts removed.`);

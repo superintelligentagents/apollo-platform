@@ -1,10 +1,15 @@
 # PC collector parity validation — 2026-09-10
 
-Candidate release: `2026-09-10.1`. Deployment and live-validation identifiers
-are recorded here after the production checks complete. The deploy updates only
-the isolated PC frontend and `journeys-pc-presign`; the primary v2 Lambda,
-roles, environment variables, API Gateway, S3 layout, and DynamoDB table remain
-unchanged.
+Deployed to https://apollo-pc-site.vercel.app on 2026-09-10.
+Release: `2026-09-10.1`. Production returned the expected release, 17-app,
+document-import, exact Dinoco/LockedIn route, and admin-workspace markers from
+the deployed JavaScript. The deploy updated only the isolated PC frontend and
+`journeys-pc-presign`; the primary v2 Lambda, roles, environment variables, API
+Gateway, S3 layout, and DynamoDB table remained unchanged.
+
+Deployment: https://apollo-pc-site-10jblwfji-lawrences-projects-aa5ba59b.vercel.app
+Vercel deployment ID: `dpl_F8yxEiwVWEqeqFd9JiLYzs3xGFvi`.
+PC Lambda code SHA-256: `GuXzERUGKcryZk29ibKyTRGDzbRY98KrrI+NlHDPF64=`.
 
 ## Capability coverage
 
@@ -69,6 +74,14 @@ prefix `pc-review/`, with the separate `journeys-pc-presign-role`.
    with S3 HEAD verification; fixture DynamoDB row deleted. Non-admin metrics
    request returned 403. Final production counts returned one task and zero
    author-approved showcase entries after cleanup.
+
+All five production scenarios passed on release `2026-09-10.1`. The integration
+scenario round-tripped both an email and an extracted document, verified their
+manifest counts, built exact task-matched private context from both records,
+and proved document admin edits could not change immutable filename metadata.
+The lifecycle harnesses now select the v2 or PC endpoint and queue from
+`E2E_APP`, so PC sign-off/amendment and one-appeal routing run against the PC
+service rather than relying on the sibling implementation.
 
 The live smoke tests use synthetic records, synthetic trajectory evidence, and
 synthetic completed-audit artifacts. They do not invoke a model or claim real
