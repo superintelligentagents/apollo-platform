@@ -15,9 +15,23 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
   const savedGuideId = draft.templateId.startsWith("mypcbench-") ? draft.templateId.slice("mypcbench-".length) : "";
   const guideId = s.pickerApp === "__all__" ? "" : s.pickerApp || savedGuideId;
   const guide = MYPCBENCH_APPS.find((app) => app.id === guideId) ?? null;
+  const guidePath = guide?.workflowAppIds
+    .map((id) => MYPCBENCH_APPS.find((candidate) => candidate.id === id)?.name ?? id)
+    .join(" → ") ?? "";
 
   root.append(el("p", { class: "step-kicker mono" }, "WRITE TASK"), el("h2", { class: "display" }, guide ? guide.task.title : template ? template.title : "Edit task"));
-  if (guide) root.append(el("p", { class: "screen-sub" }, `${guide.name} follows the ${guide.analogue} workflow. Use the guide, attached records, and live app to refine this task.`));
+  if (guide) root.append(
+    el("p", { class: "screen-sub" }, `${guide.name} follows the ${guide.analogue} workflow. Use the attached records as evidence, confirm current state in the live apps, and keep each phase dependent on what you found before it.`),
+    el(
+      "div",
+      { class: "task-horizon-summary", role: "status" },
+      el("strong", null, "LONG-HORIZON DRAFT"),
+      el("span", { class: "mono" }, `${draft.steps.length} dependent phases`),
+      el("span", { class: "mono" }, `${guide.workflowAppIds.length} connected apps`),
+      el("span", { class: "mono" }, `${draft.referencedRecordIds.length} attached record${draft.referencedRecordIds.length === 1 ? "" : "s"}`),
+      el("small", null, guidePath),
+    ),
+  );
   else if (template) root.append(el("p", { class: "screen-sub" }, template.tagline));
 
   const layout = el("div", { class: "task-edit-layout" });
@@ -36,9 +50,10 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
   request.value = draft.request;
   const updateRequestCounter = () => {
     const length = draft.request.trim().length;
-    requestCounter.textContent = length < 15 ? `${length} · ${15 - length} more needed` : `${length} · ready`;
-    requestCounter.classList.toggle("ok", length >= 15);
-    requestCounter.classList.toggle("warn", length > 0 && length < 15);
+    const minimum = guide ? 120 : 15;
+    requestCounter.textContent = length < minimum ? `${length} · ${minimum - length} more needed` : `${length} · ready`;
+    requestCounter.classList.toggle("ok", length >= minimum);
+    requestCounter.classList.toggle("warn", length > 0 && length < minimum);
   };
   request.addEventListener("input", () => {
     draft.request = request.value;
@@ -160,7 +175,9 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
         { class: "field-hint" },
         isFreeForm
           ? "Break the request into checkable steps. Open a step to add details."
-          : "Use one step for each meaningful phase. One complete step is enough."
+          : guide
+            ? "Keep at least four dependent phases: establish constraints, inspect current state, act across the connected apps, and verify the result."
+            : "Use one step for each meaningful phase. One complete step is enough."
       ),
       s.formErrors.steps ? el("p", { class: "field-error" }, s.formErrors.steps) : null,
       stepsWrap

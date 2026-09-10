@@ -1,8 +1,15 @@
 type Difficulty = "low" | "medium" | "high";
 
-// Real tasks from the Odysseys benchmark (data/odysseys.json) — shown to
-// annotators as the quality bar for each difficulty. Text verbatim.
+// Long-horizon tasks shown to annotators as the quality bar. The general web
+// examples come from the Odysseys benchmark; the resume example demonstrates
+// how PC records can ground work across logged-in MyPCBench apps.
 export type BenchmarkExample = { level: Difficulty; title: string; text: string };
+
+export const RESUME_LOCKEDIN_EXAMPLE: BenchmarkExample = {
+  level: "high",
+  title: "Bring my LockedIn profile and recruiting plan up to date",
+  text: "I’m getting ready to follow up on current job opportunities and want my professional information to agree everywhere. Use the resume I uploaded as the starting source, compare it with my current LockedIn profile, and make a list of every difference in headline, summary, employment, education, projects, and skills. Check related recruiting and employment messages in HooliMail for explicit evidence of anything newer than the resume, such as a confirmed role, promotion, certification, interview, or corrected date; treat vague marketing mail and automated recommendations as irrelevant. Resolve conflicts in favor of the most recent explicit evidence, and flag anything that cannot be resolved instead of guessing. Update the supported LockedIn fields while preserving accurate details that the resume does not supersede. Review HooliCalendar for interviews, recruiter calls, and application deadlines during the 30 days after the task starts, reconcile their company, role, time, time zone, attendees, and meeting link with the matching mail, and correct incomplete calendar entries when the evidence is clear. Prepare concise HooliMail follow-up drafts for conversations that have an unanswered request or a promised next step, but leave every message unsent for my review. Re-open the changed profile sections, calendar events, and mail drafts to verify them. Give me a final change log, the evidence used for each material update, a list of unresolved conflicts, and the next actions ordered by deadline.",
+};
 
 export const BENCHMARK_EXAMPLES: BenchmarkExample[] = [
   {
@@ -35,4 +42,5 @@ export const BENCHMARK_EXAMPLES: BenchmarkExample[] = [
     title: "A summer KBO stadium tour, fully bookable",
     text: "I’m daydreaming about doing a full summer KBO baseball trip through South Korea and I want to make it feel like a real, bookable plan instead of just a rough idea. Please start on koreabaseball.com and pull the current KBO schedule, then identify all 10 active KBO stadiums and choose one actual summer game at each stadium, ideally in a route that won’t make me zigzag all over the country. Once you have those 10 game dates and matchups, use Google Flights and Google Maps or Google Travel to figure out the cheapest practical way to move between each stop, whether that means flights, trains, buses, or driving, because I want the route to be efficient and budget-conscious. After that, go to Booking.com and find one solid place to stay near each stadium for the corresponding game night, aiming for convenient locations and reasonable prices rather than luxury. Then use Google Search to research what each city is especially known for eating, and use Yelp to turn that into a real food plan for every stop with specific restaurants, markets, or street-food areas I could actually visit around the game. As you do this, please open the actual hotel listings in their own tabs so I can compare photos and map locations, and for at least a couple of the food stops, open the real listing pages so I can visually verify they look active and worth visiting. When it all comes together, put everything into a CryptPad Document with the stadium, city, game date and matchup, travel leg, lodging, food plan, and estimated costs for each stop, and leave the finished doc open so I can review it.",
   },
+  RESUME_LOCKEDIN_EXAMPLE,
 ];

@@ -12,6 +12,7 @@ export type MyPCBenchApp = {
   description: string;
   keywords: string[];
   nativeSources?: SourceKind[];
+  workflowAppIds: string[];
   task: {
     category: PCTaskCategory;
     title: string;
@@ -60,13 +61,53 @@ const EMAIL_SERVICE_TO_APP: Record<string, string> = {
   polymarket: "oddsmarket",
 };
 
+const APP_WORKFLOW_PATHS: Record<string, string[]> = {
+  hoolimail: ["hoolimail", "hoolicalendar"],
+  hoolicalendar: ["hoolimail", "hoolicalendar"],
+  hoolichat: ["hoolichat", "hoolicalendar"],
+  hooliwork: ["hooliwork", "sprintboard", "hoolicalendar"],
+  sprintboard: ["hooliwork", "sprintboard", "hoolicalendar"],
+  lockedin: ["lockedin", "hoolimail", "hoolicalendar"],
+  gringotts: ["gringotts", "hoolimail"],
+  batbucks: ["batbucks", "hoolimail"],
+  speedtax: ["speedtax", "hoolimail"],
+  dinoco: ["dinoco", "hoolicalendar", "cheskepdia", "etaxi"],
+  cheskepdia: ["cheskepdia", "dinoco", "hoolicalendar", "etaxi"],
+  etaxi: ["etaxi", "dinoco", "cheskepdia", "hoolicalendar"],
+  hangrydash: ["hangrydash", "hoolicalendar", "hoolichat"],
+  tablefind: ["tablefind", "hoolicalendar", "hoolichat"],
+  hoolishop: ["hoolishop", "hoolimail", "hoolicalendar"],
+  "kwik-e-mart": ["kwik-e-mart", "hoolicalendar", "hoolichat"],
+  oddsmarket: ["oddsmarket", "hoolimail"],
+};
+
+const APP_WORKFLOW_LABELS: Record<string, string> = {
+  hoolimail: "HooliMail",
+  hoolicalendar: "HooliCalendar",
+  hoolichat: "HooliChat",
+  hooliwork: "HooliWork",
+  sprintboard: "SprintBoard",
+  lockedin: "LockedIn",
+  gringotts: "Gringotts",
+  batbucks: "BatBucks",
+  speedtax: "SpeedTax",
+  dinoco: "Dinoco Airlines",
+  cheskepdia: "Cheskepdia",
+  etaxi: "eTaxi",
+  hangrydash: "HangryDash",
+  tablefind: "TableFind",
+  hoolishop: "HooliShop",
+  "kwik-e-mart": "Kwik-E-Mart",
+  oddsmarket: "OddsMarket",
+};
+
 export const MYPCBENCH_APPS: MyPCBenchApp[] = [
   app("hoolimail", "HooliMail", "Gmail", "communication", "https://hoolimail.mypcbench.app/?_autologin=1", "Search, organize, and act on mail.", ["gmail", "email", "mailbox", "inbox", "newsletter", "follow up", "reply"], ["email"], "personal_lookup", "Handle an email follow-up", "Use HooliMail to find the relevant conversation in my attached mail history, identify the latest open request, and prepare the appropriate reply or mailbox action. Report what you found and what you changed.", [step("Find the conversation", "Search HooliMail for the conversation or sender represented by the attached records and open the latest relevant thread."), step("Resolve the request", "Determine the open request or next action from the thread, then complete the requested mail action."), step("Report the result", "Summarize the thread used, the action taken, and anything that still needs a decision.")], ["Uses the latest relevant HooliMail thread", "Completes or drafts the requested mail action", "Reports the result without exposing unrelated mail"], ["Conversation identified", "Mail action result", "Brief completion summary"], ["Telecommunications"]),
   app("hoolicalendar", "HooliCalendar", "Google Calendar", "productivity", "https://hoolicalendar.mypcbench.app/?_autologin=1", "Plan and update calendar events.", ["google calendar", "calendar", "meeting", "appointment", "schedule", "invite", "availability"], ["calendar"], "multi_step_orchestration", "Turn a plan into a calendar event", "Use HooliCalendar and the attached history to identify the relevant date, attendees, and constraints, then create or update the matching event. Avoid changing unrelated events and report the final event details.", [step("Read the constraints", "Use the attached mail and calendar context to identify the date, time, attendees, location, and any conflicts."), step("Update the calendar", "Create or edit the matching HooliCalendar event with the supported details and invitees."), step("Verify", "Confirm the final date, time, title, attendees, and location after the change.")], ["Uses the attached scheduling constraints", "Leaves unrelated events unchanged", "Verifies the final event"], ["Final event details", "Conflict or constraint notes"], ["Business Services"]),
   app("hoolichat", "HooliChat", "WhatsApp", "communication", "https://buzzchat.mypcbench.app/?_autologin=1", "Coordinate through personal chat.", ["whatsapp", "chat", "message", "group chat", "text message", "dm"], ["messages"], "multi_step_orchestration", "Send the right chat update", "Use HooliChat and the attached context to find the appropriate conversation, prepare the requested update, and send it to the correct person or group. Verify the sent message and avoid unrelated chats.", [step("Find the chat", "Locate the correct HooliChat conversation using the attached context."), step("Prepare the update", "Write a concise message that includes the required details and respects the conversation context."), step("Send and verify", "Send the message and verify that it appears in the intended conversation.")], ["Uses the correct conversation", "Includes the required details", "Verifies the sent message"], ["Recipient or group", "Sent message", "Verification"], ["Telecommunications"]),
   app("hooliwork", "HooliWork", "Slack", "communication", "https://workbuzz.mypcbench.app/?_autologin=1", "Coordinate work in channels and direct messages.", ["slack", "teams", "channel", "standup", "coworker", "work message"], undefined, "multi_step_orchestration", "Post a work update", "Use HooliWork and the attached history to find the relevant project channel or direct message, write a complete update, and post it in the right place. Include decisions, owners, and next steps when the source material supports them.", [step("Locate the work context", "Find the HooliWork channel or conversation that matches the attached project context."), step("Draft the update", "Write an accurate update with the current status, decisions, owners, and next steps supported by the records."), step("Post and verify", "Post it in the correct place and verify the message is visible.")], ["Uses the correct work conversation", "Preserves facts from the attached context", "Makes ownership and next steps clear"], ["Channel or recipient", "Posted update", "Next steps"], ["Business Services"]),
   app("sprintboard", "SprintBoard", "Jira / Asana", "productivity", "https://sprintboard.mypcbench.app/?_autologin=1", "Turn work history into trackable issues.", ["jira", "asana", "ticket", "issue", "sprint", "backlog", "project", "deadline", "bug"], undefined, "multi_step_orchestration", "Create or update a project issue", "Use SprintBoard and the attached work context to create or update the correct issue. Capture the goal, acceptance criteria, owner, priority, and due date when available, then verify the board state.", [step("Find the project", "Identify the SprintBoard project and check for an existing matching issue."), step("Write the issue", "Create or update the issue with a clear summary, description, acceptance criteria, owner, priority, and due date supported by the context."), step("Verify the board", "Confirm the issue appears in the intended project and status.")], ["Avoids creating a duplicate issue", "Captures the supported requirements", "Verifies the final board state"], ["Issue link or identifier", "Final issue fields", "Board status"], ["Business Services"]),
-  app("lockedin", "LockedIn", "LinkedIn", "career", "https://lockedin.mypcbench.app/profile?_autologin=1", "Keep a professional profile current.", ["linkedin", "resume", "résumé", "curriculum vitae", "cv", "job", "career", "employment", "experience", "skills"], ["documents"], "cross_source_reconciliation", "Update my LockedIn profile from my resume", "Using the attached resume or career records, update my LockedIn profile so the headline, experience, education, and skills reflect the source material. Preserve existing facts that are not superseded, avoid inventing details, and report each profile change.", [step("Compare the sources", "Open the LockedIn profile and compare its headline, experience, education, and skills with the attached resume or career records."), step("Update the profile", "Apply supported corrections and additions without inventing employers, dates, credentials, or skills."), step("Verify and report", "Re-open the updated sections and list every change plus any ambiguity left unresolved.")], ["Every change is supported by an attached source", "Existing accurate information remains intact", "The final profile is re-checked"], ["Changed profile sections", "Before-and-after summary", "Unresolved discrepancies"], ["Jobs and Employment"]),
+  app("lockedin", "LockedIn", "LinkedIn", "career", "https://lockedin.mypcbench.app/profile?_autologin=1", "Keep a professional profile current.", ["linkedin", "resume", "résumé", "curriculum vitae", "cv", "job", "career", "employment", "experience", "skills", "recruiter", "interview", "application", "hiring"], ["documents"], "cross_source_reconciliation", "Update my LockedIn profile from my resume", "Using the attached resume or career records, update my LockedIn profile so the headline, experience, education, and skills reflect the source material. Preserve existing facts that are not superseded, avoid inventing details, and report each profile change.", [step("Compare the sources", "Open the LockedIn profile and compare its headline, experience, education, and skills with the attached resume or career records."), step("Update the profile", "Apply supported corrections and additions without inventing employers, dates, credentials, or skills."), step("Verify and report", "Re-open the updated sections and list every change plus any ambiguity left unresolved.")], ["Every change is supported by an attached source", "Existing accurate information remains intact", "The final profile is re-checked"], ["Changed profile sections", "Before-and-after summary", "Unresolved discrepancies"], ["Jobs and Employment"]),
   app("gringotts", "Gringotts", "Chase", "finance", "https://vaultbank.mypcbench.app/?_autologin=1", "Review banking activity and payments.", ["chase", "bank", "checking", "savings", "credit card", "statement", "payment", "charge", "deposit"], ["transactions"], "cross_source_reconciliation", "Reconcile a banking item", "Use Gringotts and the attached records to locate the relevant account activity, reconcile the amount and date against the source evidence, and report whether they agree. Do not move money unless the request explicitly requires it.", [step("Find the activity", "Locate the relevant account, transaction, statement, or payment in Gringotts."), step("Reconcile", "Compare the amount, date, merchant, and status with the attached evidence."), step("Report", "State whether the records agree and identify any discrepancy that needs follow-up.")], ["Uses the correct account activity", "Compares the supported fields", "Clearly reports discrepancies"], ["Matched activity", "Reconciliation result", "Follow-up items"], ["Banking Credit and Lending"]),
   app("batbucks", "BatBucks", "Robinhood", "finance", "https://batbucks.mypcbench.app/?_autologin=1", "Inspect investments and trade decisions.", ["robinhood", "brokerage", "stock", "shares", "portfolio", "dividend", "investment", "trade", "ticker"], undefined, "aggregation_reporting", "Review an investment position", "Use BatBucks and the attached context to inspect the relevant position or watchlist item, calculate the requested portfolio facts, and report them with the exact values shown in the app. Only place a trade when the request explicitly calls for one.", [step("Locate the asset", "Find the relevant asset, position, or watchlist entry in BatBucks."), step("Analyze", "Collect the requested price, quantity, gain or loss, and account values shown in the app."), step("Report or act", "Provide the requested result and verify any explicitly requested portfolio change.")], ["Uses values shown in BatBucks", "Shows the requested calculation", "Verifies any change"], ["Position details", "Calculation", "Action status"], ["Finance - Other"]),
   app("speedtax", "SpeedTax", "TurboTax", "finance", "https://speedtax.mypcbench.app/?_autologin=1", "Reconcile tax forms and filing details.", ["turbotax", "irs", "tax", "w-2", "w2", "1099", "deduction", "filing", "refund"], ["documents"], "cross_source_reconciliation", "Reconcile a tax document", "Use SpeedTax and the attached tax document or records to verify the matching filing fields. Correct only values supported by the source, flag discrepancies, and report the final values without exposing unrelated sensitive information.", [step("Open the matching section", "Find the SpeedTax form or filing section represented by the attached source."), step("Compare fields", "Check names, employer or payer, income, withholding, and other requested fields against the source document."), step("Correct and verify", "Apply supported corrections, re-check the section, and report discrepancies that remain.")], ["Uses the matching source document", "Does not invent tax values", "Verifies corrected fields"], ["Compared fields", "Corrections made", "Remaining discrepancies"], ["Government"]),
@@ -75,7 +116,7 @@ export const MYPCBENCH_APPS: MyPCBenchApp[] = [
   app("etaxi", "eTaxi", "Uber", "travel", "https://etaxi.mypcbench.app/?_autologin=1", "Plan and manage rides.", ["uber", "lyft", "taxi", "ride", "pickup", "dropoff", "drop-off", "driver", "car service"], undefined, "multi_step_orchestration", "Plan a ride around my schedule", "Use eTaxi and the attached calendar or travel history to prepare a ride with the correct pickup, destination, timing, and ride type. Confirm the estimate and leave it ready for review unless the request explicitly asks to book.", [step("Read the ride constraints", "Identify pickup, destination, arrival time, passengers, and any luggage or accessibility needs."), step("Prepare the ride", "Enter the route and compare the supported eTaxi ride options and estimates."), step("Verify", "Report the chosen option, pickup time, arrival estimate, and price before any booking.")], ["Uses the correct route and timing", "Reports the estimate", "Avoids unintended booking"], ["Ride option", "Pickup and arrival estimate", "Price"], ["Ground Transportation"]),
   app("hangrydash", "HangryDash", "DoorDash", "food", "https://hangrydash.mypcbench.app/?_autologin=1", "Order meals and review delivery history.", ["doordash", "uber eats", "grubhub", "delivery", "takeout", "restaurant", "lunch", "dinner", "food order"], undefined, "multi_step_orchestration", "Prepare a meal order", "Use HangryDash and the attached context to choose a meal that fits the requested people, dietary constraints, timing, and budget. Build the order, verify fees and delivery details, and leave it ready for review without placing it.", [step("Read the meal constraints", "Identify the people, dietary needs, delivery location, timing, and budget from the attached context."), step("Build the order", "Choose a suitable restaurant and add items that satisfy the constraints."), step("Check the total", "Verify quantities, substitutions, fees, address, and estimated delivery time, then leave the cart ready for review.")], ["Satisfies stated dietary and quantity constraints", "Shows the full total and delivery estimate", "Does not place the order"], ["Cart contents", "Fees and total", "Delivery estimate"], ["Restaurants and Delivery"]),
   app("tablefind", "TableFind", "OpenTable", "food", "https://tablefind.mypcbench.app/?_autologin=1", "Find and manage restaurant reservations.", ["opentable", "resy", "reservation", "restaurant", "dinner", "lunch", "brunch", "party of", "table"], undefined, "multi_step_orchestration", "Find a restaurant reservation", "Use TableFind and the attached plans to find a reservation that fits the date, time, party size, location, cuisine, and accessibility constraints. Compare openings and leave the best one ready for review without booking.", [step("Read the dining plan", "Identify date, time, party size, location, cuisine, budget, and accessibility constraints."), step("Compare openings", "Search TableFind and compare available restaurants using the stated constraints."), step("Recommend", "Report the best available time and restaurant plus alternatives, without booking.")], ["Uses the attached dining constraints", "Checks live availability", "Does not book"], ["Available reservations", "Recommended table", "Constraint check"], ["Restaurants and Delivery"]),
-  app("hoolishop", "HooliShop", "Amazon", "shopping", "https://hoolishop.mypcbench.app/?_autologin=1", "Research products and manage orders.", ["amazon", "online order", "shipping", "delivery date", "return", "wishlist", "product", "purchase"], ["orders"], "multi_step_orchestration", "Research a product from my history", "Use HooliShop and the attached history to find products that satisfy the requested specifications, budget, and delivery date. Compare viable options and leave the best one ready for review without purchasing it.", [step("Read the requirements", "Identify the specifications, quantity, budget, and delivery deadline in the attached context."), step("Compare products", "Search HooliShop and compare viable items using price, rating, seller, and delivery date."), step("Prepare the result", "Report the best option and alternatives with totals, and leave the cart unchanged unless asked.")], ["Matches the stated specifications", "Compares viable products", "Does not purchase"], ["Compared products", "Recommended item", "Price and delivery date"], ["Ecommerce and Shopping - Other"]),
+  app("hoolishop", "HooliShop", "Amazon", "shopping", "https://hoolishop.mypcbench.app/?_autologin=1", "Research products and manage orders.", ["amazon", "online order", "shipping", "delivery date", "return", "wishlist", "product order", "product search", "purchase"], ["orders"], "multi_step_orchestration", "Research a product from my history", "Use HooliShop and the attached history to find products that satisfy the requested specifications, budget, and delivery date. Compare viable options and leave the best one ready for review without purchasing it.", [step("Read the requirements", "Identify the specifications, quantity, budget, and delivery deadline in the attached context."), step("Compare products", "Search HooliShop and compare viable items using price, rating, seller, and delivery date."), step("Prepare the result", "Report the best option and alternatives with totals, and leave the cart unchanged unless asked.")], ["Matches the stated specifications", "Compares viable products", "Does not purchase"], ["Compared products", "Recommended item", "Price and delivery date"], ["Ecommerce and Shopping - Other"]),
   app("kwik-e-mart", "Kwik-E-Mart", "Instacart", "shopping", "https://kwik-e-mart.mypcbench.app/?_autologin=1", "Build and manage grocery orders.", ["instacart", "grocery", "groceries", "supermarket", "pantry", "shopping list", "ingredients"], undefined, "multi_step_orchestration", "Build a grocery cart", "Use Kwik-E-Mart and the attached meal plan, list, or history to build a grocery cart with the correct quantities, substitutions, budget, and delivery timing. Verify the total and leave it ready for review without ordering.", [step("Read the list", "Extract the needed items, quantities, dietary constraints, budget, and delivery timing."), step("Build the cart", "Find suitable products in Kwik-E-Mart and choose supported substitutions when necessary."), step("Verify", "Check quantities, substitutions, fees, total, and delivery window, then leave the cart ready for review.")], ["Includes every required item or flags it unavailable", "Respects dietary and budget constraints", "Does not order"], ["Cart contents", "Substitutions", "Fees, total, and delivery window"], ["Ecommerce and Shopping - Other"]),
   app("oddsmarket", "OddsMarket", "Polymarket", "finance", "https://oddsmarket.mypcbench.app/?_autologin=1", "Inspect prediction markets and positions.", ["polymarket", "prediction market", "odds", "probability", "market outcome", "contract", "forecast"], undefined, "aggregation_reporting", "Research a prediction market", "Use OddsMarket and the attached context to locate the relevant market, compare the current probabilities and position details, and report the requested analysis. Only place or close a position when the request explicitly requires it.", [step("Find the market", "Locate the OddsMarket question or category that matches the attached context."), step("Analyze", "Collect the current probabilities, market status, and any relevant position details."), step("Report or act", "Provide the requested comparison and verify any explicitly requested change.")], ["Uses the correct live market", "Reports current values shown in the app", "Verifies any position change"], ["Market and status", "Probability comparison", "Position or action result"], ["Finance - Other"]),
 ];
@@ -97,7 +138,43 @@ function app(
   requiredOutputs: string[],
   subjects: string[]
 ): MyPCBenchApp {
-  return { id, name, analogue, category, url, description, keywords, nativeSources, task: { category: taskCategory, title, request, steps, successCriteria, requiredOutputs, subjects } };
+  const workflowAppIds = APP_WORKFLOW_PATHS[id] ?? [id];
+  const workflow = workflowAppIds.map((appId) => APP_WORKFLOW_LABELS[appId] ?? appId).join(", ");
+  return {
+    id,
+    name,
+    analogue,
+    category,
+    url,
+    description,
+    keywords,
+    nativeSources,
+    workflowAppIds,
+    task: {
+      category: taskCategory,
+      title,
+      request: `${request} Use the attached mail, calendar events, and documents to establish the real people, dates, amounts, and constraints, then confirm the current logged-in state in ${workflow} before relying on it. Reconcile any conflicts, carry the confirmed details through the connected apps, and re-open every affected item to verify the final state. Leave purchases, bookings, filings, trades, and outbound messages ready for review unless the request explicitly asks you to complete them.`,
+      steps: [
+        step("Establish the real constraints", `Review the attached mail, calendar events, and documents, identify the records that define the task, and list the people, dates, amounts, preferences, and unresolved conflicts that must control the work.`),
+        step("Confirm the live account state", `Open ${workflow} and check the current logged-in records before making a decision. Note anything that has changed since the attached history was created.`),
+        ...steps,
+        step("Reconcile the connected workflow", `Carry the confirmed details across ${workflow}. Resolve contradictions between apps and leave every related item consistent with the chosen result.`),
+        step("Verify and hand off", `Re-open every changed or prepared item, confirm the final values and status, and provide a concise change log with links or identifiers plus any remaining decision for the user.`),
+      ],
+      successCriteria: [
+        ...successCriteria,
+        "Uses attached personal context as evidence and confirms it against current logged-in app state",
+        "Keeps related records consistent across the connected workflow",
+        "Verifies every final change or prepared action before reporting completion",
+      ],
+      requiredOutputs: [
+        ...requiredOutputs,
+        "Cross-app change and verification log",
+        "Unresolved conflicts or user decisions",
+      ],
+      subjects,
+    },
+  };
 }
 
 function step(title: string, description: string): { title: string; description: string } {
@@ -111,7 +188,11 @@ export function recordAppScore(record: SourceRecord, candidate: MyPCBenchApp): n
 }
 
 function recordAppScoreFromSignal(record: SourceRecord, candidate: MyPCBenchApp, text: string, serviceId?: string): number {
-  let score = candidate.nativeSources?.includes(record.source) ? 2 : 0;
+  // A document's file type alone is not enough to distinguish a resume from a
+  // tax form. Require content signals for document recommendations; direct
+  // sources such as mail, calendar, orders, and transactions can still seed a
+  // useful app guide before their text contains a service keyword.
+  let score = candidate.nativeSources?.includes(record.source) && record.source !== "documents" ? 2 : 0;
   if (serviceId && EMAIL_SERVICE_TO_APP[serviceId] === candidate.id) score += 12;
   for (const keyword of candidate.keywords) {
     if (containsPhrase(text, keyword)) score += keyword.includes(" ") ? 5 : 3;
@@ -141,8 +222,8 @@ export function historyAppCounts(records: Iterable<SourceRecord>): Map<string, n
 
 export function recommendApps(records: Iterable<SourceRecord>, limit = 6): AppRecommendation[] {
   type Match = { record: SourceRecord; score: number };
-  type Summary = { app: MyPCBenchApp; score: number; top: Match[]; sourceCounts: Map<SourceKind, number> };
-  const summaries: Summary[] = MYPCBENCH_APPS.map((app) => ({ app, score: 0, top: [], sourceCounts: new Map() }));
+  type Summary = { app: MyPCBenchApp; score: number; topBySource: Map<SourceKind, Match[]>; sourceCounts: Map<SourceKind, number> };
+  const summaries: Summary[] = MYPCBENCH_APPS.map((app) => ({ app, score: 0, topBySource: new Map(), sourceCounts: new Map() }));
 
   for (const record of records) {
     const text = recordSignal(record);
@@ -152,7 +233,9 @@ export function recommendApps(records: Iterable<SourceRecord>, limit = 6): AppRe
       if (score <= 0) continue;
       summary.score += score;
       summary.sourceCounts.set(record.source, (summary.sourceCounts.get(record.source) ?? 0) + 1);
-      keepBestMatch(summary.top, { record, score });
+      const sourceMatches = summary.topBySource.get(record.source) ?? [];
+      keepBestMatch(sourceMatches, { record, score });
+      summary.topBySource.set(record.source, sourceMatches);
     }
   }
 
@@ -160,12 +243,28 @@ export function recommendApps(records: Iterable<SourceRecord>, limit = 6): AppRe
     .map((summary) => ({
       app: summary.app,
       score: summary.score,
-      recordIds: summary.top.sort(compareMatches).map((entry) => entry.record.id),
+      recordIds: diverseRecordIds(summary.topBySource),
       reason: recommendationReason(summary.app, summary.sourceCounts),
     }))
     .filter((recommendation) => recommendation.score > 0)
     .sort((a, b) => b.score - a.score || a.app.name.localeCompare(b.app.name))
     .slice(0, Math.max(0, limit));
+}
+
+function diverseRecordIds(topBySource: Map<SourceKind, Array<{ record: SourceRecord; score: number }>>): string[] {
+  const groups = [...topBySource.values()].map((matches) => matches.sort(compareMatches));
+  const selected: string[] = [];
+  const seen = new Set<string>();
+  for (let rank = 0; selected.length < 24 && groups.some((group) => rank < group.length); rank++) {
+    for (const group of groups) {
+      const match = group[rank];
+      if (!match || seen.has(match.record.id)) continue;
+      seen.add(match.record.id);
+      selected.push(match.record.id);
+      if (selected.length === 24) break;
+    }
+  }
+  return selected;
 }
 
 function keepBestMatch(matches: Array<{ record: SourceRecord; score: number }>, entry: { record: SourceRecord; score: number }): void {

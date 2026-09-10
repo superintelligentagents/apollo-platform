@@ -21,8 +21,8 @@ export function renderTasks(ctx: Ctx): HTMLElement {
   const root = el("section", { class: "screen discovery-screen" });
   root.append(
     el("p", { class: "step-kicker mono" }, "STEP 2 · WRITE TASKS"),
-    el("h2", { class: "display" }, "Write tasks with recommendations"),
-    el("p", { class: "screen-sub" }, "Each MyPCBench app is a task guide and a history filter. Apollo matches selected mail, calendar events, and documents to the closest real-world analogue, then gives you a complete draft to refine after trying the workflow yourself."),
+    el("h2", { class: "display" }, "Write long-horizon tasks from your history"),
+    el("p", { class: "screen-sub" }, "Each recommendation turns selected mail, calendar events, and documents into a connected MyPCBench workflow. The draft starts from real personal constraints, checks current logged-in app state, carries the result across related apps, and verifies the final state."),
     el("div", { class: "discovery-actions" }, el("button", { class: "btn primary", type: "button", onclick: () => ctx.actions.goto("items") }, "Upload or import data"), el("a", { class: "btn ghost", href: "https://mypcbench.com/apps", target: "_blank", rel: "noreferrer" }, "See all live apps ↗"))
   );
 
@@ -31,7 +31,7 @@ export function renderTasks(ctx: Ctx): HTMLElement {
 
   if (s.tasks.length) root.append(savedTasks(ctx));
 
-  root.append(el("div", { class: "discovery-section-head" }, el("div", null, el("p", { class: "section-label" }, "RECOMMENDED TASK GUIDES FROM YOUR HISTORY"), el("h3", null, recommendations.length ? `${recommendations.length} workflows with supporting context` : "Upload or import data to get recommendations")), el("span", { class: "privacy-local-badge mono" }, "ANALYZED LOCALLY")));
+  root.append(el("div", { class: "discovery-section-head" }, el("div", null, el("p", { class: "section-label" }, "RECOMMENDED TASK GUIDES FROM YOUR HISTORY"), el("h3", null, recommendations.length ? `${recommendations.length} workflow${recommendations.length === 1 ? "" : "s"} with supporting context` : "Upload or import data to get recommendations")), el("span", { class: "privacy-local-badge mono" }, "ANALYZED LOCALLY")));
   if (recommendations.length) {
     root.append(el("div", { class: "recommendation-grid" }, ...recommendations.map((recommendation, index) => recommendationCard(ctx, recommendation, index + 1))));
   } else {
@@ -64,6 +64,7 @@ function recommendationCard(ctx: Ctx, recommendation: AppRecommendation, rank: n
     el("div", { class: "recommendation-heading" }, el("div", null, el("span", { class: "app-analogue mono" }, `${app.name.toUpperCase()} · LIKE ${app.analogue.toUpperCase()}`), el("h3", null, app.task.title)), chip(APP_CATEGORY_LABELS[app.category])),
     el("p", { class: "recommendation-reason" }, recommendation.reason),
     el("p", { class: "recommendation-description" }, app.description),
+    el("p", { class: "recommendation-path mono" }, `SUGGESTED APP PATH · ${workflowPath(app)}`),
     el("div", { class: "recommendation-evidence" }, el("span", { class: "mono" }, `${recommendation.recordIds.length.toLocaleString()} relevant record${recommendation.recordIds.length === 1 ? "" : "s"} ready to attach`), el("button", { class: "text-button", type: "button", onclick: () => openMatchingHistory(ctx, recommendation) }, "Review matches")),
     el("div", { class: "recommendation-steps", "aria-label": "Workflow actions" }, el("a", { class: "btn", href: app.url, target: "_blank", rel: "noreferrer", "data-testid": `open-app-${app.id}` }, `1. Open ${app.name} ↗`), el("button", { class: "btn primary", type: "button", "data-testid": `write-task-${app.id}`, onclick: () => ctx.actions.startRecommendedTask(recommendation) }, "2. Write this task →"))
   );
@@ -71,7 +72,13 @@ function recommendationCard(ctx: Ctx, recommendation: AppRecommendation, rank: n
 
 function appLibraryRow(ctx: Ctx, candidate: MyPCBenchApp, recommendation?: AppRecommendation): HTMLElement {
   const draft: AppRecommendation = recommendation ?? { app: candidate, score: 0, recordIds: [], reason: `Open the ${candidate.analogue}-style clone and turn a real workflow into a task.` };
-  return el("article", { class: "app-library-row", "data-app-id": candidate.id }, el("div", { class: "app-library-copy" }, el("span", { class: "app-analogue mono" }, APP_CATEGORY_LABELS[candidate.category].toUpperCase()), el("strong", null, candidate.name), el("p", null, `${candidate.description} Use the ${candidate.analogue} analogue as the guideline.`)), el("span", { class: `app-history-count mono ${recommendation ? "matched" : ""}` }, recommendation ? `${recommendation.recordIds.length} matching records` : "No matches yet"), el("div", { class: "app-library-actions" }, el("a", { class: "btn ghost small", href: candidate.url, target: "_blank", rel: "noreferrer" }, "Open app ↗"), el("button", { class: "btn small", type: "button", onclick: () => ctx.actions.startRecommendedTask(draft) }, "Use guide")));
+  return el("article", { class: "app-library-row", "data-app-id": candidate.id }, el("div", { class: "app-library-copy" }, el("span", { class: "app-analogue mono" }, APP_CATEGORY_LABELS[candidate.category].toUpperCase()), el("strong", null, candidate.name), el("p", null, `${candidate.description} Use the ${candidate.analogue} analogue as the guideline.`), el("small", { class: "app-library-path mono" }, workflowPath(candidate))), el("span", { class: `app-history-count mono ${recommendation ? "matched" : ""}` }, recommendation ? `${recommendation.recordIds.length} matching record${recommendation.recordIds.length === 1 ? "" : "s"}` : "No matches yet"), el("div", { class: "app-library-actions" }, el("a", { class: "btn ghost small", href: candidate.url, target: "_blank", rel: "noreferrer" }, "Open app ↗"), el("button", { class: "btn small", type: "button", onclick: () => ctx.actions.startRecommendedTask(draft) }, "Use guide")));
+}
+
+function workflowPath(app: MyPCBenchApp): string {
+  return app.workflowAppIds
+    .map((id) => MYPCBENCH_APPS.find((candidate) => candidate.id === id)?.name ?? id)
+    .join(" → ");
 }
 
 function categoryButton(ctx: Ctx, category: AppCategory | "all", label: string, count: number): HTMLElement {

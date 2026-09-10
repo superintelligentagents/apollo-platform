@@ -19,12 +19,17 @@ describe("task discovery UI", () => {
     const startRecommendedTask = vi.fn();
     const ctx = { state, actions: { isIncluded: () => true, startRecommendedTask, startTask: vi.fn(), goto: vi.fn(), editTask: vi.fn(), deleteTask: vi.fn() }, rerender: vi.fn() } as unknown as Ctx;
     const root = renderTasks(ctx);
-    expect(root.textContent).toContain("Write tasks with recommendations");
+    expect(root.textContent).toContain("Write long-horizon tasks from your history");
     expect(root.textContent).toContain("ANALYZED LOCALLY");
     expect(root.textContent).toContain("ALL 17 LIVE APP GUIDES");
+    expect(root.textContent).toContain("SUGGESTED APP PATH");
+    expect(root.textContent).toContain("LockedIn → HooliMail → HooliCalendar");
     const dinoco = root.querySelector<HTMLAnchorElement>('[data-testid="open-app-dinoco"]')!;
     expect(dinoco.href).toBe("https://dinoco.mypcbench.app/book?_autologin=1");
     root.querySelector<HTMLButtonElement>('[data-testid="write-task-lockedin"]')!.click();
-    expect(startRecommendedTask).toHaveBeenCalledWith(expect.objectContaining({ app: expect.objectContaining({ id: "lockedin" }), recordIds: ["resume"] }));
+    expect(startRecommendedTask).toHaveBeenCalledWith(expect.objectContaining({
+      app: expect.objectContaining({ id: "lockedin", workflowAppIds: ["lockedin", "hoolimail", "hoolicalendar"], task: expect.objectContaining({ steps: expect.arrayContaining([expect.objectContaining({ title: "Verify and hand off" })]) }) }),
+      recordIds: ["resume"],
+    }));
   });
 });

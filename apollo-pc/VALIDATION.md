@@ -1,17 +1,20 @@
 # PC collector parity validation — 2026-09-10
 
 Deployed to https://apollo-pc-site.vercel.app on 2026-09-10.
-Frontend release: `2026-09-10.4`. Production returned the expected unified-data,
-Write-tasks, 17-app-guide, app-filter, and in-editor document-upload markers from
-the deployed route chunks. Computer-use passes covered the dashboard, unified data
+Frontend release: `2026-09-10.5`. Production returned the expected unified-data,
+long-horizon task, resume example, 17-app-guide, app-path, app-filter, and in-editor
+document-upload markers from the deployed route chunks. Computer-use passes covered the dashboard, unified data
 workspace, recommendations, exact app links, guided task editor, review/submit flow,
 metrics/admin workspace, and desktop and 390px navigation. A final production
 computer-use pass wrote a request and step, observed the saved status, reloaded the
 page, and verified the exact draft was restored. The post-deploy browser console was
-clear.
+clear. The `2026-09-10.5` pass additionally imported a synthetic resume locally,
+verified it was the sole relevant recommendation, opened the seven-phase LockedIn
+workflow with the resume attached, confirmed draft recovery after reload, and checked
+the deployed resume example and a live mail/calendar recommendation path.
 
-Deployment: https://apollo-pc-site-gnm5qeuin-lawrences-projects-aa5ba59b.vercel.app
-Vercel deployment ID: `dpl_B7XY4uYgqk4wiNjPFRy7d4a1WTvw`.
+Deployment: https://apollo-pc-site-pn6p1it4o-lawrences-projects-aa5ba59b.vercel.app
+Vercel deployment ID: `dpl_3HDcgpeSMPDfCer75YCimAEvu3Hq`.
 The isolated PC Lambda was deployed with code SHA-256
 `S28jDksNv9XpHtCw6Cfisul+ihAsMD5J2YKSbfKsVu4=`. Its function, role, scope,
 review prefix, API Gateway, S3 layout, and DynamoDB table are unchanged. The primary
@@ -28,7 +31,8 @@ skipped so unrelated PC pull requests do not fail on the absent showcase directo
 | --- | --- |
 | Mail/calendar/document import, receipt mining, source selection and filters | One data workspace now combines file import, parsed-record review, selection, app-guided filters, privacy controls, and the submit handoff. Browser-local PDF, DOCX, text, Markdown, CSV, JSON, and HTML extraction is supported. Original files never upload; document text passes through the existing editing, masking, aliasing, privacy audit, and bundle split. |
 | Field edits, replacement rules, entity aliases, privacy audit, bundle splitting | Existing PC privacy and upload tests pass. New author revisions and appeal prose are audited before outbound mutations. |
-| Task recommendations and authoring | **Write tasks** uses all 17 live MyPCBench apps as writing guidelines and record filters, with exact autologin links, real-world analogues, category partitions, deterministic local history ranking, and complete grounded drafts. The editor also imports documents in place and automatically attaches the imported records. |
+| Task recommendations and authoring | **Write tasks** uses all 17 live MyPCBench apps as writing guidelines and record filters, with exact autologin links, real-world analogues, category partitions, deterministic local history ranking, and complete grounded drafts. Each guide now proposes a connected two-to-four-app path and a seven-phase task that establishes evidence, confirms current logged-in state, performs app-specific work, reconciles related apps, and verifies the final state. Matching records are selected across mail, calendar, and documents instead of letting one high-volume source crowd out the others. The editor also imports documents in place and automatically attaches the imported records. |
+| Resume example | **Examples** leads with an actionable resume workflow: upload a resume, build a grounded LockedIn task, reconcile newer recruiting mail and the next 30 days of calendar events, prepare unsent follow-ups, and produce an evidence-backed change log. With a matching document already present, the action opens the prefilled task directly. |
 | Draft durability | Authoring data is stored in IndexedDB with a synchronous local-storage mirror for lifecycle flushes and migration from older browser-only drafts. The editor reports saving, saved, and failed states, writes on edits, and flushes when the page hides. IndexedDB quota failure and migration are covered by tests; production computer use verified save and reload recovery. |
 | My tasks | New list/detail screens, search/filter/sort, pagination, reviewer diffs, history, revisions, appeals, acceptance and amendments; ported author UI tests pass. Browser fixture verified desktop and 390px mobile layouts, navigation and editor controls. |
 | Review | Return-to-author, rubric insertion/removal/reordering, stable source mapping, sign-off callout and session skip hints added. Existing approval/rejection contracts and new ordering/API tests pass. |
@@ -44,14 +48,14 @@ skipped so unrelated PC pull requests do not fail on the absent showcase directo
 
 ## Automated checks
 
-- PC: 223 tests passed across 36 files.
+- PC: 226 tests passed across 37 files.
 - Shared backend: 116 tests passed.
 - Apollo v2 regression: 186 passed, 1 optional real-history test skipped.
 - OSWorld runner: 23 Python tests; PC context provisioner: 2 Node tests; trajectory packaging/judging: 37 Python tests.
 - PC TypeScript check and production Vite build passed.
 - Scoped diff whitespace check passed.
 
-These are 587 passing tests, plus the live integration scenarios below. Unit tests
+These are 590 passing tests, plus the live integration scenarios below. Unit tests
 and synthetic browser fixtures do not constitute a full production participant
 session or a newly executed model audit.
 

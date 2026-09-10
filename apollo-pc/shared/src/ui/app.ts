@@ -594,9 +594,12 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         const errors: Record<string, string> = {};
         const request = draft.request.trim();
         const steps = substantiveSteps(draft.steps);
+        const isAppGuided = draft.templateId.startsWith("mypcbench-");
         if (request.length < 15) errors.request = "Write the request out — a sentence or two.";
+        if (isAppGuided && request.length < 120) errors.request = "Keep the full goal, constraints, connected apps, and final deliverable in the request.";
         if (/\[[^\]]+\]/.test(request)) errors.request = "Replace the [bracketed] placeholders with your own details.";
         if (!steps.length) errors.steps = "Fill in at least one task step — a sentence is enough.";
+        if (isAppGuided && steps.length < 4) errors.steps = "Keep at least four dependent phases so this remains a long-horizon app workflow.";
         if (!draft.region) errors.region = "Choose the country or Global.";
         if (!draft.subjects.length) errors.subjects = "Choose at least one subject.";
         const template = state.activeTemplate;

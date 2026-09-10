@@ -1,6 +1,7 @@
 import type { Ctx } from "../context";
 import { reviewFinishedList } from "../../review-client";
-import { BENCHMARK_EXAMPLES } from "../../examples";
+import { MYPCBENCH_APPS, recommendApps } from "../../app-catalog";
+import { BENCHMARK_EXAMPLES, RESUME_LOCKEDIN_EXAMPLE } from "../../examples";
 import { el } from "../components/helpers";
 
 const SECTIONS = [
@@ -19,6 +20,8 @@ export function renderExamples(ctx: Ctx): HTMLElement {
       el("p", { class: "screen-sub" }, "These are long-horizon web requests: Easy usually fits an hour, Medium an afternoon, and Hard may span days. Notice how each gives an agent a real goal, constraints, sources to inspect, decisions to make, and a clear final result.")
     )
   );
+
+  root.append(resumeWorkflowExample(ctx));
 
   // Accepted tasks — the team's own finished set (internal + key only).
   if (ctx.state.identity?.kind === "internal" && ctx.state.reviewKey) {
@@ -77,7 +80,7 @@ export function renderExamples(ctx: Ctx): HTMLElement {
   }
 
   for (const section of SECTIONS) {
-    const examples = BENCHMARK_EXAMPLES.filter((e) => e.level === section.level);
+    const examples = BENCHMARK_EXAMPLES.filter((e) => e.level === section.level && e !== RESUME_LOCKEDIN_EXAMPLE);
     if (!examples.length) continue;
     root.append(
       el(
@@ -127,6 +130,47 @@ export function renderExamples(ctx: Ctx): HTMLElement {
     )
   );
   return root;
+}
+
+function resumeWorkflowExample(ctx: Ctx): HTMLElement {
+  const records = [...ctx.state.records.values()].filter((record) => ctx.actions.isIncluded(record));
+  const recommendation = recommendApps(records, MYPCBENCH_APPS.length).find((item) => item.app.id === "lockedin");
+  const hasResume = Boolean(recommendation?.recordIds.some((id) => ctx.state.records.get(id)?.source === "documents"));
+  const start = () => {
+    if (recommendation && hasResume) {
+      ctx.actions.startRecommendedTask(recommendation);
+      return;
+    }
+    ctx.state.filters.source = "documents";
+    ctx.state.filters.status = "all";
+    ctx.state.filters.page = 0;
+    ctx.actions.goto("items");
+  };
+  return el(
+    "section",
+    { class: "resume-workflow-example card", "data-testid": "resume-workflow-example" },
+    el(
+      "div",
+      { class: "resume-workflow-copy" },
+      el("p", { class: "section-label" }, "START WITH A DOCUMENT"),
+      el("h3", null, "Upload a resume and build a connected task"),
+      el("p", { class: "resume-workflow-path mono" }, "RESUME → LOCKEDIN → HOOLIMAIL → HOOLICALENDAR"),
+      el("p", { class: "example-text clamped" }, RESUME_LOCKEDIN_EXAMPLE.text),
+    ),
+    el(
+      "ol",
+      { class: "resume-workflow-steps" },
+      el("li", null, el("strong", null, "Upload"), el("span", null, "Apollo extracts the resume locally and lets you review the text.")),
+      el("li", null, el("strong", null, "Ground"), el("span", null, "The draft attaches matching career mail, calendar events, and the resume.")),
+      el("li", null, el("strong", null, "Run"), el("span", null, "Use current logged-in app state, make supported changes, and verify the result.")),
+    ),
+    el(
+      "div",
+      { class: "resume-workflow-actions" },
+      el("button", { class: "btn primary", type: "button", "data-testid": "resume-example-start", onclick: start }, hasResume ? "Build from my resume →" : "Upload a resume →"),
+      el("a", { class: "btn ghost", href: "https://lockedin.mypcbench.app/profile?_autologin=1", target: "_blank", rel: "noreferrer" }, "Open LockedIn ↗"),
+    ),
+  );
 }
 
 function difficultyLabel(level: string): string {
