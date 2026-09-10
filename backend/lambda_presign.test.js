@@ -56,6 +56,7 @@ import {
   buildDashboardConditionalPutRequest,
   mergeDashboardIndexRecord,
   indexedAuthorTaskStatus,
+  dashboardIndexRequiresS3Reconciliation,
   buildDashboardStatusUpdateRequest,
   dashboardRecordMatchesSource,
   dashboardSourceCondition,
@@ -348,6 +349,8 @@ test("author history distinguishes audit backlog from review backlog", () => {
     pre_qc_task_content_hash: "hash",
   }), "pending");
   assert.equal(indexedAuthorTaskStatus({ ...record, status: "approved" }), "approved");
+  assert.equal(dashboardIndexRequiresS3Reconciliation("pc"), false);
+  assert.equal(dashboardIndexRequiresS3Reconciliation("v2"), true);
 });
 
 test("keeps distribution metadata outside the task-content hash", () => {

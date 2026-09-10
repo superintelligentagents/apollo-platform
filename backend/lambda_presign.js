@@ -3486,6 +3486,10 @@ export async function reconcileDashboardIndex(records) {
 
 let dashboardIndexCache = { dashboard: null, checkedAt: 0, pending: null };
 
+export function dashboardIndexRequiresS3Reconciliation(scope = dashboardIndexScope()) {
+  return scope === "v2";
+}
+
 export async function indexedAdminDashboard() {
   if (!DASHBOARD_TABLE) return null;
   const now = Date.now();
@@ -3497,8 +3501,10 @@ export async function indexedAdminDashboard() {
       const meta = await dashboardIndexMetadata();
       if (!meta?.ready) return null;
       let records = await loadDashboardIndexRecords();
-      const reconciliation = await reconcileDashboardIndex(records);
-      if (reconciliation.indexed) records = await loadDashboardIndexRecords();
+      if (dashboardIndexRequiresS3Reconciliation()) {
+        const reconciliation = await reconcileDashboardIndex(records);
+        if (reconciliation.indexed) records = await loadDashboardIndexRecords();
+      }
       return dashboardFromIndexRecords(records);
     })();
   }
