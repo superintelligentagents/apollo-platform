@@ -17,6 +17,11 @@ The isolated PC Lambda was deployed with code SHA-256
 review prefix, API Gateway, S3 layout, and DynamoDB table are unchanged. The primary
 v2 Lambda was not deployed or modified.
 
+The separate `apollo-showcase` Vercel project tracks `apptainer-provider`, where
+its static site exists. Its project root now remains the repository root, its output
+continues to point at `scripts/showcase_site/site`, and non-showcase branches are
+skipped so unrelated PC pull requests do not fail on the absent showcase directory.
+
 ## Capability coverage
 
 | Area | Result and evidence |
