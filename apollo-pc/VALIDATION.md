@@ -15,10 +15,14 @@ the deployed resume example and a live mail/calendar recommendation path. The
 `2026-09-10.6` pass aligned rubric authoring and review with v2: a 15-character
 sentence floor, no silent loss of touched short steps, mandatory verification of
 every rubric plus the evergreen check, refresh-safe removal/undo, stable Codex
-verdict mapping after reorder/removal, and stable reviewer IDs on approvals.
+verdict mapping after reorder/removal, and stable reviewer IDs on approvals. The
+production smoke loaded the ranked recommendation rail and all 17 guides over the
+existing large local QA mailbox, opened the seven-phase LockedIn editor, and
+confirmed that Review remains gated by the device-local team key. It did not submit
+a task or any private record.
 
-Deployment: https://apollo-pc-site-pn6p1it4o-lawrences-projects-aa5ba59b.vercel.app
-Vercel deployment ID: `dpl_3HDcgpeSMPDfCer75YCimAEvu3Hq`.
+Deployment target: the `apollo-pc-site` production project and
+https://apollo-pc-site.vercel.app alias.
 The isolated PC Lambda was deployed with code SHA-256
 `S28jDksNv9XpHtCw6Cfisul+ihAsMD5J2YKSbfKsVu4=`. Its function, role, scope,
 review prefix, API Gateway, S3 layout, and DynamoDB table are unchanged. The primary
