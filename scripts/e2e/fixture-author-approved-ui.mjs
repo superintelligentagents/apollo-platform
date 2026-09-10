@@ -153,5 +153,9 @@ if (action === "setup") {
     TableName: TABLE,
     Key: { scope: { S: "v2" }, entity_key: { S: `TASK#${rawTaskId}` } },
   })).catch(() => {});
+  await dynamo.send(new DeleteItemCommand({
+    TableName: TABLE,
+    Key: { scope: { S: "v2" }, entity_key: { S: `AUTHOR#${participantId}#TASK#${b64url(rawTaskId)}` } },
+  })).catch(() => {});
   console.log(JSON.stringify({ cleaned: true, task_id: rawTaskId, objects_considered: keys.length }, null, 2));
 }

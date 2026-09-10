@@ -203,6 +203,10 @@ try {
     TableName: TABLE,
     Key: { scope: { S: APP }, entity_key: { S: `TASK#${rawTaskId}` } },
   })).catch(() => {});
+  await dynamo.send(new DeleteItemCommand({
+    TableName: TABLE,
+    Key: { scope: { S: APP }, entity_key: { S: `AUTHOR#${authorPid}#TASK#${b64url(rawTaskId)}` } },
+  })).catch(() => {});
 }
 
 console.log(`${APP.toUpperCase()} author appeal validation complete; synthetic artifacts removed.`);

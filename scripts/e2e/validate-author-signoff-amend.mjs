@@ -174,6 +174,13 @@ try {
       entity_key: { S: `TASK#${rawTaskId}` },
     },
   })).catch(() => {});
+  await dynamo.send(new DeleteItemCommand({
+    TableName: DASHBOARD_TABLE,
+    Key: {
+      scope: { S: APP },
+      entity_key: { S: `AUTHOR#${authorPid}#TASK#${b64url(rawTaskId)}` },
+    },
+  })).catch(() => {});
 }
 
 console.log(`${APP.toUpperCase()} author sign-off/amend validation complete; synthetic artifacts removed.`);

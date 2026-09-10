@@ -30,6 +30,22 @@ async function writeBatchFully(client, tableName, records) {
   }
 }
 
+async function deleteBatchFully(client, tableName, records) {
+  let pending = records.map((record) => ({ DeleteRequest: { Key: { scope: record.scope, entity_key: record.entity_key } } }));
+  let attempt = 0;
+  while (pending.length) {
+    const response = await client.send(new BatchWriteCommand({
+      RequestItems: { [tableName]: pending },
+    }));
+    pending = response.UnprocessedItems?.[tableName] || [];
+    if (pending.length) {
+      attempt += 1;
+      if (attempt > 8) throw new Error(`${pending.length} stale author index records remained unprocessed.`);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2_000, 100 * 2 ** attempt)));
+    }
+  }
+}
+
 async function queryRecords(client, tableName, scope, prefix) {
   const records = [];
   let ExclusiveStartKey;
@@ -99,6 +115,10 @@ if (!write) process.exit(0);
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({ region: process.env.AWS_REGION || "us-east-1" }), {
   marshallOptions: { removeUndefinedValues: true },
 });
+const existingAuthors = await queryRecords(client, tableName, scope, "AUTHOR#");
+const expectedAuthorKeys = new Set(authorRecords.map((record) => record.entity_key));
+const staleAuthors = existingAuthors.filter((record) => !expectedAuthorKeys.has(record.entity_key));
+for (const batch of chunks(staleAuthors, 25)) await deleteBatchFully(client, tableName, batch);
 for (const batch of chunks([...records, ...authorRecords], 25)) await writeBatchFully(client, tableName, batch);
 await client.send(new PutCommand({
   TableName: tableName,
@@ -156,6 +176,7 @@ console.log(JSON.stringify({
   scope,
   stored: stored.length,
   author_records: storedAuthors.length,
+  stale_author_records_removed: staleAuthors.length,
   mismatches: 0,
   meta_written_last: true,
   s3_writes: 0,

@@ -147,6 +147,7 @@ try {
   }
   try {
     await dynamo.send(new DeleteItemCommand({ TableName: dashboardTable, Key: { scope: { S: 'pc' }, entity_key: { S: `TASK#${authoredTaskId}` } } }));
+    await dynamo.send(new DeleteItemCommand({ TableName: dashboardTable, Key: { scope: { S: 'pc' }, entity_key: { S: `AUTHOR#${pid}#TASK#${b64(authoredTaskId)}` } } }));
   } catch {
     failures.push(`dynamodb:${authoredTaskId}`);
   }
