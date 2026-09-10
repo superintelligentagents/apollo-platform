@@ -3693,7 +3693,18 @@ async function reopenReviewOutcome(taskId, adminEmail, reason = "") {
   }
 }
 
-async function adminListDashboard() {
+async function adminListDashboard({ fresh = false } = {}) {
+  if (fresh && DASHBOARD_TABLE) {
+    const meta = await dashboardIndexMetadata();
+    if (meta?.ready) {
+      let records = await loadDashboardIndexRecords();
+      if (dashboardIndexRequiresS3Reconciliation()) {
+        const reconciliation = await reconcileDashboardIndex(records);
+        if (reconciliation.indexed) records = await loadDashboardIndexRecords();
+      }
+      return dashboardFromIndexRecords(records);
+    }
+  }
   try {
     const indexed = await indexedAdminDashboard();
     if (indexed) return indexed;
@@ -6165,7 +6176,7 @@ async function handleReview(path, body) {
       const onlyUnedited = body.only_unedited !== false;
       const outcome = body.outcome === "rejected" ? "rejected" : "approved";
       const limit = Math.max(1, Math.min(20, Math.floor(Number(body.limit) || 20)));
-      const dashboard = await adminListDashboard();
+      const dashboard = await adminListDashboard({ fresh: true });
       const matches = (dashboard.items ?? []).filter((item) =>
         item.status === outcome &&
         normalizeReviewerName(item.reviewer) === targetReviewer &&
