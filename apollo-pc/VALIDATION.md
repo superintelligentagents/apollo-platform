@@ -91,8 +91,14 @@ prefix `pc-review/`, with the separate `journeys-pc-presign-role`.
    request returned 403. Final production counts returned one task and zero
    author-approved showcase entries after cleanup.
 
-All five production scenarios passed against frontend release `2026-09-10.4` and
-the PC Lambda SHA recorded above. The integration
+6. `validate-pc-load.mjs`: 200 simultaneous, read-only author-history requests
+   against the author-scoped production endpoint returned 200 HTTP 200 responses,
+   with zero retries, 1.47-second p95 latency, 1.92-second maximum latency, and
+   1.95 seconds of total wall time. The probe creates no records and fails if any
+   request remains unsuccessful after one safe read retry or p95 exceeds 5 seconds.
+
+All five production lifecycle/integration scenarios and the load probe passed
+against frontend release `2026-09-10.4` and the PC Lambda SHA recorded above. The integration
 scenario round-tripped both an email and an extracted document, verified their
 manifest counts, built exact task-matched private context from both records,
 and proved document admin edits could not change immutable filename metadata.
@@ -129,6 +135,7 @@ E2E_APP=pc node scripts/e2e/validate-author-signoff-amend.mjs
 E2E_APP=pc node scripts/e2e/validate-author-appeal.mjs
 node scripts/e2e/validate-pc-integrations.mjs
 E2E_ADMIN_EMAIL=<allowed-admin-email> node scripts/e2e/validate-pc-admin-metrics.mjs
+node scripts/e2e/validate-pc-load.mjs
 ```
 
 Live scripts need `E2E_PC_REVIEW_KEY`, configured AWS credentials, and optionally
