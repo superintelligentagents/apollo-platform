@@ -1,14 +1,15 @@
 # PC collector parity validation — 2026-09-10
 
 Deployed to https://apollo-pc-site.vercel.app on 2026-09-10.
-Frontend release: `2026-09-10.2`. Production returned the expected unified-data,
+Frontend release: `2026-09-10.3`. Production returned the expected unified-data,
 Write-tasks, 17-app-guide, app-filter, and in-editor document-upload markers from
-the deployed JavaScript. A real browser pass covered the dashboard, unified data
-workspace, recommendations, exact app links, guided task editor, and switching an
-app-filtered draft back to all selected records.
+the deployed route chunks. Computer-use passes covered the dashboard, unified data
+workspace, recommendations, exact app links, guided task editor, review/submit flow,
+metrics/admin workspace, and desktop and 390px navigation. The post-deploy browser
+console was clear.
 
-Deployment: https://apollo-pc-site-a62b46vhe-lawrences-projects-aa5ba59b.vercel.app
-Vercel deployment ID: `dpl_93ceNUihRfpYTJc6dL7pJN4VXYfy`.
+Deployment: https://apollo-pc-site-80k7jdox7-lawrences-projects-aa5ba59b.vercel.app
+Vercel deployment ID: `dpl_AnmB5LxrtsBqd4HCGcn3JHfP1n9o`.
 This release changed only the isolated PC frontend. The last verified PC Lambda
 code SHA-256 remains `GuXzERUGKcryZk29ibKyTRGDzbRY98KrrI+NlHDPF64=`; the primary
 v2 Lambda, roles, environment variables, API Gateway, S3 layout, and DynamoDB
@@ -27,20 +28,21 @@ table remained unchanged.
 | Identity | Author lookup and reviewer/creator assignment use the same protected participant ID as PC uploads. Explicit study IDs remain unchanged. |
 | Runtime access | Team key is validated against PC before device-local storage. No build-time review key. Built JavaScript checked against the configured key without printing it. |
 | Admin records | Email, calendar, and extracted-document counts/details are available to the same admin allowlist as v2. Document admins may edit only title and extracted text; filename, type, size, page count, ID, and uploaded original remain immutable. |
+| Runtime performance | The initial production JavaScript fell from 348.57 KB (110.75 KB gzip) to 61.66 KB (21.76 KB gzip), an 82% raw and 80% gzip reduction. Larger workspaces and PDF extraction load on demand. App recommendations make one bounded pass over history, imported records persist in 2,000-record transactions, and entity indexing finishes after the import becomes usable. A 100,000-message recommendation/search regression stays under its 4-second/1.5-second limits. |
 
 | Admin / annotator metrics | Added contributions, queue activity, reviewer quality, author outcomes, QC/sign-off progress, distribution, search/filter/pagination, details, and re-queue controls. Same seven-email allowlist as v2. PC authors now have separate stable private IDs rather than one combined redacted row. |
 | Protected showcase | Current author-signed-off PC finals only; no raw context or participant fields. Revoked approvals excluded. Empty state verified. Metadata labels do not imply model classification. |
 
 ## Automated checks
 
-- PC: 219 tests passed across 34 files.
+- PC: 220 tests passed across 35 files.
 - Shared backend: 113 tests passed.
 - Apollo v2 regression: 186 passed, 1 optional real-history test skipped.
 - OSWorld runner: 23 Python tests; PC context provisioner: 2 Node tests; trajectory packaging/judging: 37 Python tests.
 - PC TypeScript check and production Vite build passed.
 - Scoped diff whitespace check passed.
 
-These are 580 passing tests, plus the live integration scenarios below. Unit tests
+These are 581 passing tests, plus the live integration scenarios below. Unit tests
 and synthetic browser fixtures do not constitute a full production participant
 session or a newly executed model audit.
 
@@ -120,7 +122,12 @@ it must not be published. It uses mocked API responses and synthetic identities.
 For metrics QA, use `fixture-pc-admin-ui.mjs` and `/pc-admin-qa.html` instead.
 Both generated fixture pages were removed before building. Desktop/mobile
 inspection covered the quality tabs, search results, task details and empty
-showcase; mobile headers were corrected to stack without page overflow.
+showcase; mobile headers were corrected to stack without page overflow. A second
+synthetic computer-use fixture exercised data filters, a grounded task, document
+attachment, privacy review, mocked submit, uploaded counts, annotator metrics, and
+the same-admin dashboard. Programmatic native file selection was unavailable in the
+Chrome extension and in-app browser; parser/import behavior remains covered by the
+automated file tests, and production exposed the expected chooser controls.
 Screenshots are in `../artifacts/pc-parity-2026-09-08/`.
 
 ## Scope
