@@ -1,19 +1,21 @@
 # PC collector parity validation — 2026-09-10
 
 Deployed to https://apollo-pc-site.vercel.app on 2026-09-10.
-Frontend release: `2026-09-10.3`. Production returned the expected unified-data,
+Frontend release: `2026-09-10.4`. Production returned the expected unified-data,
 Write-tasks, 17-app-guide, app-filter, and in-editor document-upload markers from
 the deployed route chunks. Computer-use passes covered the dashboard, unified data
 workspace, recommendations, exact app links, guided task editor, review/submit flow,
-metrics/admin workspace, and desktop and 390px navigation. The post-deploy browser
-console was clear.
+metrics/admin workspace, and desktop and 390px navigation. A final production
+computer-use pass wrote a request and step, observed the saved status, reloaded the
+page, and verified the exact draft was restored. The post-deploy browser console was
+clear.
 
-Deployment: https://apollo-pc-site-7e6ttzovj-lawrences-projects-aa5ba59b.vercel.app
-Vercel deployment ID: `dpl_4iTDm9UNPRDPgniaTq5eZUq4Fu5R`.
-This release changed only the isolated PC frontend. The last verified PC Lambda
-code SHA-256 remains `GuXzERUGKcryZk29ibKyTRGDzbRY98KrrI+NlHDPF64=`; the primary
-v2 Lambda, roles, environment variables, API Gateway, S3 layout, and DynamoDB
-table remained unchanged.
+Deployment: https://apollo-pc-site-lv8q7dacr-lawrences-projects-aa5ba59b.vercel.app
+Vercel deployment ID: `dpl_4nrcGbxaCY63xNALVWcS2UgHKGzw`.
+The isolated PC Lambda was deployed with code SHA-256
+`S28jDksNv9XpHtCw6Cfisul+ihAsMD5J2YKSbfKsVu4=`. Its function, role, scope,
+review prefix, API Gateway, S3 layout, and DynamoDB table are unchanged. The primary
+v2 Lambda was not deployed or modified.
 
 ## Capability coverage
 
@@ -22,27 +24,29 @@ table remained unchanged.
 | Mail/calendar/document import, receipt mining, source selection and filters | One data workspace now combines file import, parsed-record review, selection, app-guided filters, privacy controls, and the submit handoff. Browser-local PDF, DOCX, text, Markdown, CSV, JSON, and HTML extraction is supported. Original files never upload; document text passes through the existing editing, masking, aliasing, privacy audit, and bundle split. |
 | Field edits, replacement rules, entity aliases, privacy audit, bundle splitting | Existing PC privacy and upload tests pass. New author revisions and appeal prose are audited before outbound mutations. |
 | Task recommendations and authoring | **Write tasks** uses all 17 live MyPCBench apps as writing guidelines and record filters, with exact autologin links, real-world analogues, category partitions, deterministic local history ranking, and complete grounded drafts. The editor also imports documents in place and automatically attaches the imported records. |
+| Draft durability | Authoring data is stored in IndexedDB with a synchronous local-storage mirror for lifecycle flushes and migration from older browser-only drafts. The editor reports saving, saved, and failed states, writes on edits, and flushes when the page hides. IndexedDB quota failure and migration are covered by tests; production computer use verified save and reload recovery. |
 | My tasks | New list/detail screens, search/filter/sort, pagination, reviewer diffs, history, revisions, appeals, acceptance and amendments; ported author UI tests pass. Browser fixture verified desktop and 390px mobile layouts, navigation and editor controls. |
 | Review | Return-to-author, rubric insertion/removal/reordering, stable source mapping, sign-off callout and session skip hints added. Existing approval/rejection contracts and new ordering/API tests pass. |
 | Grade | Existing shortcuts and four outcome choices preserved. Added per-rubric lineage diffs and previous human grades; API carries both from AWS. |
 | Identity | Author lookup and reviewer/creator assignment use the same protected participant ID as PC uploads. Explicit study IDs remain unchanged. |
 | Runtime access | Team key is validated against PC before device-local storage. No build-time review key. Built JavaScript checked against the configured key without printing it. |
 | Admin records | Email, calendar, and extracted-document counts/details are available to the same admin allowlist as v2. Document admins may edit only title and extracted text; filename, type, size, page count, ID, and uploaded original remain immutable. |
-| Runtime performance | The initial production JavaScript fell from 348.57 KB (110.75 KB gzip) to 61.66 KB (21.76 KB gzip), an 82% raw and 80% gzip reduction. Larger workspaces and PDF extraction load on demand. App recommendations make one bounded pass over history, imported records persist in 2,000-record transactions, and entity indexing finishes after the import becomes usable. A 100,000-message recommendation/search regression stays under its 4-second/1.5-second limits. All 30 hash-named JavaScript assets returned 200 with `Cache-Control: public, max-age=31536000, immutable`; HTML continues to revalidate. |
+| Runtime performance | The initial production JavaScript fell from 348.57 KB (110.75 KB gzip) to 62.82 KB (22.15 KB gzip), an 82% raw and 80% gzip reduction. Larger workspaces and PDF extraction load on demand. App recommendations make one bounded pass over history, imported records persist in 2,000-record transactions, and entity indexing finishes after the import becomes usable. A 100,000-message recommendation/search regression stays under its 4-second/1.5-second limits. Hash-named JavaScript assets return `Cache-Control: public, max-age=31536000, immutable`; HTML continues to revalidate. |
+| Concurrent author history | Each global task row has an author-scoped DynamoDB mirror. `My tasks` queries that prefix and reads S3 only for the requested page, so hundreds of annotators do not force a table scan or full task hydration. Optimistic revisions protect overlapping registration, review, appeal, sign-off, amendment, and re-queue updates. A readiness marker keeps the legacy path available until a verified backfill completes. |
 
 | Admin / annotator metrics | Added contributions, queue activity, reviewer quality, author outcomes, QC/sign-off progress, distribution, search/filter/pagination, details, and re-queue controls. Same seven-email allowlist as v2. PC authors now have separate stable private IDs rather than one combined redacted row. |
 | Protected showcase | Current author-signed-off PC finals only; no raw context or participant fields. Revoked approvals excluded. Empty state verified. Metadata labels do not imply model classification. |
 
 ## Automated checks
 
-- PC: 220 tests passed across 35 files.
-- Shared backend: 113 tests passed.
+- PC: 223 tests passed across 36 files.
+- Shared backend: 116 tests passed.
 - Apollo v2 regression: 186 passed, 1 optional real-history test skipped.
 - OSWorld runner: 23 Python tests; PC context provisioner: 2 Node tests; trajectory packaging/judging: 37 Python tests.
 - PC TypeScript check and production Vite build passed.
 - Scoped diff whitespace check passed.
 
-These are 581 passing tests, plus the live integration scenarios below. Unit tests
+These are 587 passing tests, plus the live integration scenarios below. Unit tests
 and synthetic browser fixtures do not constitute a full production participant
 session or a newly executed model audit.
 
@@ -54,39 +58,50 @@ prefix `pc-review/`, with the separate `journeys-pc-presign-role`.
 
 1. `validate-cross-app-review.mjs`: real signed uploads, app-specific object paths,
    completed-audit queue eligibility, own-task exclusion and unchanged sibling
-   queue counts. Disposable source/marker/lock/audit objects removed.
+   queue counts. Disposable source/marker/lock/audit objects and both global and
+   author-scoped DynamoDB rows removed; a post-run scan found zero fixture rows.
 2. `E2E_APP=pc validate-author-signoff-amend.mjs`: author list, anonymous feedback,
    acceptance receipt, author-approved final, amendment, and immutable prior gold.
-   Synthetic task objects and index row cleaned up.
-3. `E2E_APP=pc validate-author-appeal.mjs`: rejection notes, anonymous history,
-   appeal rationale and lineage, rejection-reviewer exclusion and eligibility for
-   another reviewer. The existing fixture used retired v19/v10 audit metadata;
-   updated to the supported v22/v11 contract, then passed. Synthetic objects and
-   index row cleaned up.
+   Synthetic task objects and both index rows cleaned up.
+3. `E2E_APP=pc validate-author-appeal.mjs`: first rejection notes, anonymous
+   history, one appeal rationale and lineage, rejection-reviewer exclusion, a new
+   reviewer, terminal second rejection, final author visibility, and enforcement
+   of the one-appeal limit. Synthetic objects and both index rows cleaned up.
 4. `validate-pc-integrations.mjs`: invalid-key and cross-app upload rejection;
    signed email, document, and manifest uploads; exact record round-trip; admin
    manifest index, document counts/detail/restricted edits, revision and conflict;
+   completion tokens and indexed task registration; contribution metrics;
    task-matched email/document OSWorld context; assigned trajectory claim/release;
    invalid-lock and wrong-creator rejection; signed screenshot GET; model-judge
-   withholding; durable human judgment and idempotent retry. All 10 synthetic
+   withholding; durable human judgment and idempotent retry. All 14 synthetic
    objects deleted, with absence verified by S3 HEAD.
 
-5. `validate-pc-admin-metrics.mjs`: task sidecar contribution count; author sign-off
+5. `validate-pc-admin-metrics.mjs`: task sidecar contribution count; indexed
+   sign-off queue; author sign-off
    and amendment; authenticated showcase inclusion; admin detail and filtered
    list; single-task re-queue with archived decisions; pending dashboard status;
-   revoked showcase exclusion; empty bulk-requeue match for the exact synthetic
-   reviewer. Exact fixture objects (including re-queue archives/markers) removed
-   with S3 HEAD verification; fixture DynamoDB row deleted. Non-admin metrics
+   revoked showcase exclusion; fresh bulk re-queue after a lifecycle mutation.
+   Exact fixture objects (including re-queue archives/markers) removed
+   with S3 HEAD verification; both fixture DynamoDB rows deleted. Non-admin metrics
    request returned 403. Final production counts returned one task and zero
    author-approved showcase entries after cleanup.
 
-All five production scenarios passed on release `2026-09-10.1`. The integration
+All five production scenarios passed against frontend release `2026-09-10.4` and
+the PC Lambda SHA recorded above. The integration
 scenario round-tripped both an email and an extracted document, verified their
 manifest counts, built exact task-matched private context from both records,
 and proved document admin edits could not change immutable filename metadata.
 The lifecycle harnesses now select the v2 or PC endpoint and queue from
 `E2E_APP`, so PC sign-off/amendment and one-appeal routing run against the PC
 service rather than relying on the sibling implementation.
+
+The PC dashboard index backfill was run in write mode after the live scenarios. It
+converted the one current source task, wrote one matching author row, removed zero
+stale rows, and verified zero mismatches before writing the readiness marker. The PC
+admin endpoint serves verified DynamoDB records directly because the deliberately
+restricted PC role cannot list the shared S3 bucket. Bulk re-queue bypasses the
+short-lived dashboard cache so a just-completed lifecycle mutation is immediately
+visible to the operation.
 
 The live smoke tests use synthetic records, synthetic trajectory evidence, and
 synthetic completed-audit artifacts. They do not invoke a model or claim real
