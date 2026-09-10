@@ -1,15 +1,18 @@
 # PC collector parity validation — 2026-09-10
 
 Deployed to https://apollo-pc-site.vercel.app on 2026-09-10.
-Release: `2026-09-10.1`. Production returned the expected release, 17-app,
-document-import, exact Dinoco/LockedIn route, and admin-workspace markers from
-the deployed JavaScript. The deploy updated only the isolated PC frontend and
-`journeys-pc-presign`; the primary v2 Lambda, roles, environment variables, API
-Gateway, S3 layout, and DynamoDB table remained unchanged.
+Frontend release: `2026-09-10.2`. Production returned the expected unified-data,
+Write-tasks, 17-app-guide, app-filter, and in-editor document-upload markers from
+the deployed JavaScript. A real browser pass covered the dashboard, unified data
+workspace, recommendations, exact app links, guided task editor, and switching an
+app-filtered draft back to all selected records.
 
-Deployment: https://apollo-pc-site-10jblwfji-lawrences-projects-aa5ba59b.vercel.app
-Vercel deployment ID: `dpl_F8yxEiwVWEqeqFd9JiLYzs3xGFvi`.
-PC Lambda code SHA-256: `GuXzERUGKcryZk29ibKyTRGDzbRY98KrrI+NlHDPF64=`.
+Deployment: https://apollo-pc-site-a62b46vhe-lawrences-projects-aa5ba59b.vercel.app
+Vercel deployment ID: `dpl_93ceNUihRfpYTJc6dL7pJN4VXYfy`.
+This release changed only the isolated PC frontend. The last verified PC Lambda
+code SHA-256 remains `GuXzERUGKcryZk29ibKyTRGDzbRY98KrrI+NlHDPF64=`; the primary
+v2 Lambda, roles, environment variables, API Gateway, S3 layout, and DynamoDB
+table remained unchanged.
 
 ## Capability coverage
 
