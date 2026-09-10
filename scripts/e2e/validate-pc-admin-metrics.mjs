@@ -2,7 +2,7 @@
 // Creates one synthetic approved task, accepts it, amends it, verifies the
 // archive and receipt, then removes every exact object in `finally` cleanup.
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 
 const require = createRequire(new URL("../../backend/package.json", import.meta.url));
@@ -66,8 +66,8 @@ async function seedDashboardIndex(status, doneTarget = null) {
     source_key: sourceKey,
     review_unit: sourceKey,
     done_target: doneTarget,
-    participant_id: authorPid,
-    participant_name: "Synthetic Author",
+    participant_id: `pc-${createHash("sha256").update(authorPid).digest("hex").slice(0, 16)}`,
+    participant_name: `Annotator ${createHash("sha256").update(authorPid).digest("hex").slice(0, 8)}`,
     mode: "guided",
     submitted_at: source.created_at,
     status,
