@@ -89,7 +89,9 @@ Build locally (`npm run build:web`), then stage `web/dist` as a Vercel Build
 Output API v3 static output for the existing `apollo-pc-site` project. Deploy
 with `vercel deploy --prebuilt --prod --yes`. The remote project root is
 `apollo-pc`, so the clean staging directory must also contain
-`apollo-pc/.vercel/output` and the same `.vercel/project.json`. Keep source,
+`apollo-pc/.vercel/output` and the same `.vercel/project.json`. Preserve the
+`/assets/(.*)` one-year immutable cache header from `web/vercel.json` as a
+continuing route in each staged Build Output `config.json`. Keep source,
 `.env` files, review keys, and synthetic QA HTML out of the staging directory.
 
 Production PC traffic uses the isolated `journeys-pc-presign` Lambda at
