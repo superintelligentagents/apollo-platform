@@ -3248,37 +3248,6 @@ async function dashboardAuthorIndexReady() {
   return response.Item?.ready === true;
 }
 
-async function recoverMissingAuthorDashboardRecords(participantId) {
-  const objects = await listAllObjects(`${UPLOAD_PREFIX}${participantId}/`);
-  const newestByUnit = new Map();
-  for (const object of objects) {
-    const sourceKey = object.Key;
-    if (!isReviewSubmissionKey(sourceKey) || participantIdFromSubKey(sourceKey) !== participantId) continue;
-    const unit = reviewUnitForKey(sourceKey);
-    const current = newestByUnit.get(unit);
-    if (!current || sourceKey > current.sourceKey) {
-      newestByUnit.set(unit, { sourceKey, submittedAt: object.LastModified?.toISOString() || "" });
-    }
-  }
-  const units = [...newestByUnit.values()];
-  for (let offset = 0; offset < units.length; offset += 25) {
-    await Promise.all(units.slice(offset, offset + 25).map(async ({ sourceKey, submittedAt }) => {
-      const [source, done, lock] = await Promise.all([
-        readJson(sourceKey).then(({ json }) => json).catch(() => null),
-        readDoneRecord(sourceKey),
-        readJson(lockKeyFor(sourceKey)).then(({ json }) => json).catch(() => null),
-      ]);
-      if (!source) return;
-      const outcome = done?.target
-        ? await readJson(done.target).then(({ json }) => json).catch(() => null)
-        : null;
-      const item = buildAdminItemFromDocuments({ source, sourceKey, submittedAt, done, lock: done ? null : lock, outcome });
-      if (item) await putDashboardIndexItem(item, { refreshDurable: true });
-    }));
-  }
-  return units.length;
-}
-
 export function indexedAuthorTaskStatus(record, now = Date.now()) {
   const status = effectiveIndexedStatus(record, now);
   if (status !== "pending") return status;
@@ -3290,10 +3259,7 @@ export function indexedAuthorTaskStatus(record, now = Date.now()) {
 
 async function indexedMyTasksPage(participantId, body) {
   if (!(await dashboardAuthorIndexReady())) return null;
-  let records = await loadAuthorDashboardIndexRecords(participantId);
-  if (!records.length && await recoverMissingAuthorDashboardRecords(participantId)) {
-    records = await loadAuthorDashboardIndexRecords(participantId);
-  }
+  const records = await loadAuthorDashboardIndexRecords(participantId);
   records.sort((a, b) => String(b.submitted_at || "").localeCompare(String(a.submitted_at || ""))
     || String(b.source_key || "").localeCompare(String(a.source_key || "")));
   const offset = Math.max(0, Number(body.offset) || 0);

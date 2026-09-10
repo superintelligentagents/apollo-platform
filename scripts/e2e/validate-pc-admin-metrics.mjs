@@ -7,6 +7,7 @@ import { createRequire } from "node:module";
 
 const require = createRequire(new URL("../../backend/package.json", import.meta.url));
 const { DeleteItemCommand, DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+const { DynamoDBDocumentClient, PutCommand } = require("@aws-sdk/lib-dynamodb");
 const { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client, ListObjectsV2Command, HeadObjectCommand } = require("@aws-sdk/client-s3");
 
 const APP = "pc";
@@ -22,6 +23,7 @@ const ENDPOINT = APP === "pc" ? (process.env.E2E_PC_REVIEW_ENDPOINT || "https://
 const ROOT = `${APP}-review/`;
 const region = process.env.AWS_REGION || "us-east-1";
 const dynamo = new DynamoDBClient({ region });
+const dashboardDb = DynamoDBDocumentClient.from(dynamo);
 const s3 = new S3Client({ region });
 const b64url = (value) => Buffer.from(String(value), "utf8").toString("base64url");
 const check = (condition, message) => {
@@ -53,6 +55,39 @@ async function putJson(key, value) {
 async function readJson(key) {
   const response = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
   return JSON.parse(await response.Body.transformToString());
+}
+
+async function seedDashboardIndex(status, doneTarget = null) {
+  const indexedAt = new Date().toISOString();
+  const base = {
+    scope: APP,
+    entity_type: "TASK",
+    task_id: rawTaskId,
+    source_key: sourceKey,
+    review_unit: sourceKey,
+    done_target: doneTarget,
+    participant_id: authorPid,
+    participant_name: "Synthetic Author",
+    mode: "guided",
+    submitted_at: source.created_at,
+    status,
+    reviewer: finalGold.reviewed_by,
+    reviewed_at: finalGold.finished_at,
+    original_title: originalTask.task_title,
+    original_difficulty: originalTask.difficulty,
+    changed: false,
+    changed_in_qc: false,
+    indexed_at: indexedAt,
+  };
+  await Promise.all([
+    dashboardDb.send(new PutCommand({ TableName: DASHBOARD_TABLE, Item: { ...base, entity_key: `TASK#${rawTaskId}` } })),
+    dashboardDb.send(new PutCommand({ TableName: DASHBOARD_TABLE, Item: {
+      ...base,
+      entity_key: `AUTHOR#${authorPid}#TASK#${b64url(rawTaskId)}`,
+      entity_type: "AUTHOR_TASK",
+      author_participant_id: authorPid,
+    } })),
+  ]);
 }
 
 async function remove(key) {
@@ -121,6 +156,7 @@ try {
     completed_at: finalGold.finished_at,
     content_hash: finalGold.review_content_hash,
   });
+  await seedDashboardIndex("approved", finishedKey);
 
   const contributions = await post('/review/contributions', {participantId:authorPid,reviewer:finalGold.reviewed_by});
   check(contributions.submitted===1, 'PC contribution count reads the exact task sidecar');

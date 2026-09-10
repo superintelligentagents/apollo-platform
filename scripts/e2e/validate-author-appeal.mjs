@@ -10,6 +10,7 @@ import { cleanRubrics, cleanTaskSnapshot, reportingTaskContentHash } from "../..
 const require = createRequire(new URL("../../backend/package.json", import.meta.url));
 const { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
 const { DeleteItemCommand, DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+const { DynamoDBDocumentClient, PutCommand } = require("@aws-sdk/lib-dynamodb");
 
 const APP = String(process.env.E2E_APP || "v2").toLowerCase();
 if (!["v2", "pc"].includes(APP)) throw new Error("E2E_APP must be v2 or pc");
@@ -24,6 +25,7 @@ const ROOT = IS_PC ? "pc-review/" : "v2-review/";
 const region = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region });
 const dynamo = new DynamoDBClient({ region });
+const dashboardDb = DynamoDBDocumentClient.from(dynamo);
 const b64url = (value) => Buffer.from(String(value), "utf8").toString("base64url");
 const check = (condition, message) => {
   if (!condition) throw new Error(`FAIL: ${message}`);
@@ -92,6 +94,33 @@ const source = {
   provenance: { source_journeys: [], theme_suggestion: null, template: null, attached_urls: [] },
 };
 
+async function seedDashboardIndex() {
+  const base = {
+    scope: APP,
+    entity_type: "TASK",
+    task_id: rawTaskId,
+    source_key: sourceKey,
+    review_unit: sourceKey,
+    done_target: rejectedKey,
+    participant_id: authorPid,
+    participant_name: "Synthetic Appeal Author",
+    mode: "guided",
+    submitted_at: source.created_at,
+    status: "rejected",
+    reviewer: "Synthetic Rejecter",
+    reviewed_at: new Date().toISOString(),
+    rejection_reason: firstRejectionReason,
+    original_title: task.task_title,
+    original_difficulty: task.difficulty,
+    appeal_number: 0,
+    indexed_at: new Date().toISOString(),
+  };
+  await Promise.all([
+    dashboardDb.send(new PutCommand({ TableName: TABLE, Item: { ...base, entity_key: `TASK#${rawTaskId}` } })),
+    dashboardDb.send(new PutCommand({ TableName: TABLE, Item: { ...base, entity_key: `AUTHOR#${authorPid}#TASK#${b64url(rawTaskId)}`, entity_type: "AUTHOR_TASK", author_participant_id: authorPid } })),
+  ]);
+}
+
 try {
   await putJson(sourceKey, source);
   await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: inboxKey, Body: sourceKey, ContentType: "text/plain", IfNoneMatch: "*" }));
@@ -106,6 +135,7 @@ try {
     rejected_at: new Date().toISOString(),
   });
   await putJson(doneKey, { target: rejectedKey, outcome: "rejected", reviewer: "Synthetic Rejecter", reviewer_pid: rejecterPid, task_id: safeTaskId, completed_at: new Date().toISOString() });
+  await seedDashboardIndex();
 
   const list = await post("/review/my-tasks", { participant_id: authorPid, offset: 0, limit: 10 });
   check(list.items?.[0]?.can_appeal === true, "verified rejection offers one appeal");
