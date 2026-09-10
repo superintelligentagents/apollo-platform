@@ -1424,8 +1424,20 @@ body {
 
 @media (max-width: 720px) {
   .screen { padding: 30px 18px 44px; }
-  .topbar { padding-inline: 12px; gap: 10px; }
-  .topbar-left { gap: 8px; }
+  .topbar { display: block; padding: 9px 12px 0; }
+  .topbar-left { display: grid; grid-template-columns: minmax(0, 1fr); gap: 7px; width: 100%; }
+  .topbar-brand { width: max-content; }
+  .topbar-nav-links {
+    width: 100%;
+    margin-left: 0;
+    padding-bottom: 7px;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+  .topbar-nav-links::-webkit-scrollbar { display: none; }
+  .topnav-link { flex: 0 0 auto; }
   .topbar-brand .brand-sub, .participant-chip { display: none; }
   .mode-row { grid-template-columns: 1fr; padding: 22px; }
   .mode-row-cta { width: 100%; min-width: 0; }

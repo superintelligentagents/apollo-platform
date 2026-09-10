@@ -15,8 +15,9 @@ const CATEGORY_LABEL: Record<string, string> = {
 export function renderTasks(ctx: Ctx): HTMLElement {
   const s = ctx.state;
   const eligible = [...s.records.values()].filter((record) => ctx.actions.isIncluded(record));
-  const recommendations = recommendApps(eligible);
-  const recommendationByApp = new Map(recommendApps(eligible, MYPCBENCH_APPS.length).map((item) => [item.app.id, item]));
+  const allRecommendations = recommendApps(eligible, MYPCBENCH_APPS.length);
+  const recommendations = allRecommendations.slice(0, 6);
+  const recommendationByApp = new Map(allRecommendations.map((item) => [item.app.id, item]));
   const root = el("section", { class: "screen discovery-screen" });
   root.append(
     el("p", { class: "step-kicker mono" }, "STEP 2 · WRITE TASKS"),

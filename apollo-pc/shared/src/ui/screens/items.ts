@@ -220,7 +220,7 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar" | "documents")
       { class: "data-workspace-footer" },
       el("div", null, el("strong", null, `${selectedCount.toLocaleString()} selected for upload`), el("p", null, "Review privacy masks and the exact bundle before anything is sent.")),
       el("button", { class: "btn", type: "button", onclick: () => ctx.actions.goto("entities") }, "Privacy & aliases"),
-      el("button", { class: "btn primary", type: "button", disabled: selectedCount === 0, onclick: () => ctx.actions.goto("review") }, "Review & submit →")
+      el("button", { class: "btn primary", type: "button", disabled: selectedCount === 0 || s.entityIndexing, onclick: () => ctx.actions.goto("review") }, s.entityIndexing ? "Finishing privacy index…" : "Review & submit →")
     )
   );
   return root;

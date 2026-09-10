@@ -106,19 +106,29 @@ function step(title: string, description: string): { title: string; description:
 
 export function recordAppScore(record: SourceRecord, candidate: MyPCBenchApp): number {
   const text = recordSignal(record);
+  const serviceId = record.source === "email" ? emailService(record)?.id : undefined;
+  return recordAppScoreFromSignal(record, candidate, text, serviceId);
+}
+
+function recordAppScoreFromSignal(record: SourceRecord, candidate: MyPCBenchApp, text: string, serviceId?: string): number {
   let score = candidate.nativeSources?.includes(record.source) ? 2 : 0;
-  if (record.source === "email") {
-    const service = emailService(record);
-    if (service && EMAIL_SERVICE_TO_APP[service.id] === candidate.id) score += 12;
-  }
+  if (serviceId && EMAIL_SERVICE_TO_APP[serviceId] === candidate.id) score += 12;
   for (const keyword of candidate.keywords) {
     if (containsPhrase(text, keyword)) score += keyword.includes(" ") ? 5 : 3;
   }
   return score;
 }
 
+const appIdsCache = new WeakMap<SourceRecord, string[]>();
+
 export function appIdsForRecord(record: SourceRecord): string[] {
-  return MYPCBENCH_APPS.filter((candidate) => recordAppScore(record, candidate) > 0).map((candidate) => candidate.id);
+  const cached = appIdsCache.get(record);
+  if (cached) return cached;
+  const text = recordSignal(record);
+  const serviceId = record.source === "email" ? emailService(record)?.id : undefined;
+  const ids = MYPCBENCH_APPS.filter((candidate) => recordAppScoreFromSignal(record, candidate, text, serviceId) > 0).map((candidate) => candidate.id);
+  appIdsCache.set(record, ids);
+  return ids;
 }
 
 export function historyAppCounts(records: Iterable<SourceRecord>): Map<string, number> {
@@ -130,31 +140,55 @@ export function historyAppCounts(records: Iterable<SourceRecord>): Map<string, n
 }
 
 export function recommendApps(records: Iterable<SourceRecord>, limit = 6): AppRecommendation[] {
-  const rows = [...records];
-  return MYPCBENCH_APPS.map((candidate) => {
-    const matches = rows
-      .map((record) => ({ record, score: recordAppScore(record, candidate) }))
-      .filter((entry) => entry.score > 0)
-      .sort((a, b) => b.score - a.score || (b.record.timestamp || "").localeCompare(a.record.timestamp || ""));
-    const score = matches.reduce((sum, entry) => sum + entry.score, 0);
-    return {
-      app: candidate,
-      score,
-      recordIds: matches.slice(0, 24).map((entry) => entry.record.id),
-      reason: recommendationReason(candidate, matches.map((entry) => entry.record)),
-    };
-  })
+  type Match = { record: SourceRecord; score: number };
+  type Summary = { app: MyPCBenchApp; score: number; top: Match[]; sourceCounts: Map<SourceKind, number> };
+  const summaries: Summary[] = MYPCBENCH_APPS.map((app) => ({ app, score: 0, top: [], sourceCounts: new Map() }));
+
+  for (const record of records) {
+    const text = recordSignal(record);
+    const serviceId = record.source === "email" ? emailService(record)?.id : undefined;
+    for (const summary of summaries) {
+      const score = recordAppScoreFromSignal(record, summary.app, text, serviceId);
+      if (score <= 0) continue;
+      summary.score += score;
+      summary.sourceCounts.set(record.source, (summary.sourceCounts.get(record.source) ?? 0) + 1);
+      keepBestMatch(summary.top, { record, score });
+    }
+  }
+
+  return summaries
+    .map((summary) => ({
+      app: summary.app,
+      score: summary.score,
+      recordIds: summary.top.sort(compareMatches).map((entry) => entry.record.id),
+      reason: recommendationReason(summary.app, summary.sourceCounts),
+    }))
     .filter((recommendation) => recommendation.score > 0)
     .sort((a, b) => b.score - a.score || a.app.name.localeCompare(b.app.name))
     .slice(0, Math.max(0, limit));
 }
 
-function recommendationReason(candidate: MyPCBenchApp, records: SourceRecord[]): string {
-  const counts = new Map<SourceKind, number>();
-  for (const record of records) counts.set(record.source, (counts.get(record.source) ?? 0) + 1);
+function keepBestMatch(matches: Array<{ record: SourceRecord; score: number }>, entry: { record: SourceRecord; score: number }): void {
+  if (matches.length < 24) {
+    matches.push(entry);
+    return;
+  }
+  let worst = 0;
+  for (let index = 1; index < matches.length; index++) {
+    if (compareMatches(matches[index], matches[worst]) > 0) worst = index;
+  }
+  if (compareMatches(entry, matches[worst]) < 0) matches[worst] = entry;
+}
+
+function compareMatches(a: { record: SourceRecord; score: number }, b: { record: SourceRecord; score: number }): number {
+  return b.score - a.score || (b.record.timestamp || "").localeCompare(a.record.timestamp || "");
+}
+
+function recommendationReason(candidate: MyPCBenchApp, counts: Map<SourceKind, number>): string {
   const parts = [...counts].map(([kind, count]) => `${count.toLocaleString()} ${sourceLabel(kind, count)}`);
+  const recordCount = [...counts.values()].reduce((sum, count) => sum + count, 0);
   return parts.length
-    ? `${parts.join(" and ")} ${records.length === 1 ? "suggests" : "suggest"} a ${candidate.analogue}-style workflow.`
+    ? `${parts.join(" and ")} ${recordCount === 1 ? "suggests" : "suggest"} a ${candidate.analogue}-style workflow.`
     : `A ${candidate.analogue}-style workflow fits this history.`;
 }
 

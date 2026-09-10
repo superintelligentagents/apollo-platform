@@ -1,14 +1,11 @@
 import { buildLookup, createAliasPool, detectEntities, normalizeName, normalizePhoneKey } from "../alias";
 import type { AppRecommendation } from "../app-catalog";
-import { assembleBundle } from "../bundle";
 import { MANIFEST_FILENAME, MAX_BODY_CHARS, MAX_DOCUMENT_CHARS } from "../config";
+import { shortId } from "../ids";
 import { appendUploadLog, loadUploadLog, STORAGE_KEYS, type PlatformAdapter } from "../platform";
-import { buildReviewTaskSidecar, reviewTaskFilename } from "../review-task";
-import { clearClaimSnapshot, clearTrajectoryClaimSnapshot, saveClaimSnapshot, saveTrajectoryClaimSnapshot, seedTrajectoryJudgment, type ReviewClaim, type TrajectoryClaim } from "../review-client";
+import type { ReviewClaim, TrajectoryClaim } from "../review-client";
 import { buildBundleId, participantId as schemaParticipantId, participantUploadIdentity, validateBundle } from "../schema";
 import { META_KEYS, openStore, type RecordStore } from "../store";
-import { cardFor } from "../sources/registry";
-import { isReceiptCandidate, mineReceipt } from "../sources/receipts";
 import { seedCriteriaFromSteps, substantiveSteps, type PCTemplate } from "../templates";
 import type {
   Entity,
@@ -22,22 +19,8 @@ import { applyDecisions, clearDecisions, loadDecisions, saveDecisions } from "./
 import { el } from "./components/helpers";
 import { initialState, type AppState, type Ctx, type Screen } from "./context";
 import { participantKey } from "./identity";
-import { renderEntities } from "./screens/entities";
 import { renderHome } from "./screens/home";
-import { renderDocumentItems, renderEmailItems, renderItems, renderCalendarItems } from "./screens/items";
 import { renderLogin } from "./screens/login";
-import { renderMetrics } from "./screens/metrics";
-import { renderExamples } from "./screens/examples";
-import { renderProgress } from "./screens/progress";
-import { renderReview } from "./screens/review";
-import { renderCalendarImport, renderDocumentImport, renderMailImport } from "./screens/sources";
-import { renderTaskEdit } from "./screens/task-edit";
-import { renderMyTask, renderMyTasks, resetMyTasksViewState } from "./screens/my-tasks";
-import { renderTasks } from "./screens/tasks";
-import { renderTaskReviewQueue } from "./screens/task-review-queue";
-import { renderTaskReviewEdit } from "./screens/task-review-edit";
-import { renderTrajectoryQueue } from "./screens/trajectory-queue";
-import { renderTrajectoryEdit } from "./screens/trajectory-edit";
 
 const SCREEN_PATH: Record<Screen, string> = {
   login: "/",
@@ -66,6 +49,32 @@ const SCREEN_PATH: Record<Screen, string> = {
 };
 const ENTITY_CLASSIFICATION_VERSION = "sender-privacy-v3";
 
+type ScreenRenderer = (ctx: Ctx) => HTMLElement;
+
+const SCREEN_LOADERS: Partial<Record<Screen, () => Promise<ScreenRenderer>>> = {
+  sources: () => import("./screens/items").then((module) => module.renderItems),
+  "import-mail": () => import("./screens/sources").then((module) => module.renderMailImport),
+  "import-calendar": () => import("./screens/sources").then((module) => module.renderCalendarImport),
+  "import-documents": () => import("./screens/sources").then((module) => module.renderDocumentImport),
+  items: () => import("./screens/items").then((module) => module.renderItems),
+  "upload-email": () => import("./screens/items").then((module) => module.renderEmailItems),
+  "upload-calendar": () => import("./screens/items").then((module) => module.renderCalendarItems),
+  "upload-documents": () => import("./screens/items").then((module) => module.renderDocumentItems),
+  entities: () => import("./screens/entities").then((module) => module.renderEntities),
+  "my-tasks": () => import("./screens/my-tasks").then((module) => module.renderMyTasks),
+  "my-task": () => import("./screens/my-tasks").then((module) => module.renderMyTask),
+  tasks: () => import("./screens/tasks").then((module) => module.renderTasks),
+  "task-edit": () => import("./screens/task-edit").then((module) => module.renderTaskEdit),
+  review: () => import("./screens/review").then((module) => module.renderReview),
+  progress: () => import("./screens/progress").then((module) => module.renderProgress),
+  metrics: () => import("./screens/metrics").then((module) => module.renderMetrics),
+  examples: () => import("./screens/examples").then((module) => module.renderExamples),
+  "task-review-queue": () => import("./screens/task-review-queue").then((module) => module.renderTaskReviewQueue),
+  "task-review-edit": () => import("./screens/task-review-edit").then((module) => module.renderTaskReviewEdit),
+  "trajectory-queue": () => import("./screens/trajectory-queue").then((module) => module.renderTrajectoryQueue),
+  "trajectory-edit": () => import("./screens/trajectory-edit").then((module) => module.renderTrajectoryEdit),
+};
+
 export function screenFromHash(hash: string): Screen | null {
   const path = hash.replace(/^#/, "") || "/";
   const match = (Object.entries(SCREEN_PATH) as [Screen, string][]).find(([, screenPath]) => screenPath === path);
@@ -76,6 +85,9 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
   const state: AppState = initialState();
   const store: RecordStore = await openStore();
   const aliasPool = createAliasPool();
+  const screenRenderers: Partial<Record<Screen, ScreenRenderer>> = { login: renderLogin, home: renderHome };
+  const screenLoads = new Map<Screen, Promise<void>>();
+  const screenLoadErrors = new Map<Screen, string>();
   let requestedScreenOnLogin = typeof window === "undefined" ? null : screenFromHash(window.location.hash);
 
   let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
@@ -131,9 +143,13 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
     const records = [...state.records.values()];
     const existing = state.entities;
     const identity = state.identity ?? undefined;
-    entityRefreshPromise = new Promise<Entity[]>((resolve) => {
+    entityRefreshPromise = new Promise<Entity[]>((resolve, reject) => {
       if (typeof Worker === "undefined") {
-        resolve(detectEntities(records, existing, aliasPool, identity));
+        try {
+          resolve(detectEntities(records, existing, aliasPool, identity));
+        } catch (error) {
+          reject(error);
+        }
         return;
       }
       const worker = new Worker(new URL("../entity-worker.ts", import.meta.url), { type: "module" });
@@ -143,7 +159,11 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       };
       worker.onerror = () => {
         worker.terminate();
-        resolve(detectEntities(records, existing, aliasPool, identity));
+        try {
+          resolve(detectEntities(records, existing, aliasPool, identity));
+        } catch (error) {
+          reject(error);
+        }
       };
       worker.postMessage({ records, existing, identity });
     }).then((entities) => {
@@ -161,6 +181,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
   }
 
   async function mineReceipts(): Promise<number> {
+    const { isReceiptCandidate, mineReceipt } = await import("../sources/receipts");
     const candidates = [...state.records.values()].filter(
       (r): r is Extract<SourceRecord, { source: "email" }> => r.source === "email" && isReceiptCandidate(r)
     );
@@ -281,6 +302,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       },
 
       async importFiles(kind: SourceKind, files: File[]) {
+        const { cardFor } = await import("../sources/registry");
         const card = cardFor(kind);
         if (!card.parser || !files.length) return;
         const floor =
@@ -319,8 +341,15 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
           state.imports[kind] = { stats: result.stats, issues: result.issues, importedAt: new Date().toISOString() };
           let mined = 0;
           if (kind === "email") mined = await mineReceipts();
-          await refreshEntities();
           invalidatePrivacyAudit();
+          void refreshEntities()
+            .then(() => {
+              invalidatePrivacyAudit();
+            })
+            .catch((error) => {
+              notify(`Couldn't refresh privacy classifications: ${message(error)}`, "err");
+            })
+            .finally(render);
           notify(
             `Imported ${fresh.length.toLocaleString()} ${kind} record${fresh.length === 1 ? "" : "s"}` +
               (mined ? ` · mined ${mined} orders from receipts` : "") +
@@ -453,7 +482,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         state.taskDraft = {
           region: "",
           subjects: [],
-          taskId: `task-${crypto.randomUUID().slice(0, 8)}`,
+          taskId: `task-${shortId(8)}`,
           templateId: template.id,
           category: template.category,
           title: "",
@@ -477,7 +506,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         state.taskDraft = {
           region: "GLOBAL",
           subjects: [...source.subjects],
-          taskId: `task-${crypto.randomUUID().slice(0, 8)}`,
+          taskId: `task-${shortId(8)}`,
           templateId: `mypcbench-${recommendation.app.id}`,
           category: source.category,
           title: source.title,
@@ -624,6 +653,8 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
           // produces a claimable task. Assembly is shared with the review
           // screen's download-preview, so what you previewed is exactly what
           // ships.
+          const { assembleBundle } = await import("../bundle");
+          const { buildReviewTaskSidecar, reviewTaskFilename } = await import("../review-task");
           const { uploads, manifestBody, privacyAudit, sanitizedTasks } = await assembleBundle(
             state,
             store,
@@ -707,6 +738,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       },
 
       async eraseAll() {
+        const { resetMyTasksViewState } = await import("./screens/my-tasks");
         resetMyTasksViewState();
         await adapter.storage.set(STORAGE_KEYS.reviewKey, "");
         state.myTaskSelection = null;
@@ -744,28 +776,30 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         state.reviewClaim = claim;
         state.reviewRubrics = null;
         state.reviewEdits = null;
-        void saveClaimSnapshot(adapter.storage, { claim, rubrics: null, edits: null });
+        void import("../review-client").then(({ saveClaimSnapshot }) => saveClaimSnapshot(adapter.storage, { claim, rubrics: null, edits: null }));
         goto("task-review-edit");
       },
       endReview(message: string) {
         state.reviewClaim = null;
         state.reviewRubrics = null;
         state.reviewEdits = null;
-        void clearClaimSnapshot(adapter.storage);
+        void import("../review-client").then(({ clearClaimSnapshot }) => clearClaimSnapshot(adapter.storage));
         notify(message, "ok");
         goto("task-review-queue");
       },
       startTrajectoryReview(claim: TrajectoryClaim) {
-        const judgment = seedTrajectoryJudgment(claim.run);
-        state.trajectoryClaim = claim;
-        state.trajectoryJudgment = judgment;
-        void saveTrajectoryClaimSnapshot(adapter.storage, { claim, judgment });
-        goto("trajectory-edit");
+        void import("../review-client").then(({ saveTrajectoryClaimSnapshot, seedTrajectoryJudgment }) => {
+          const judgment = seedTrajectoryJudgment(claim.run);
+          state.trajectoryClaim = claim;
+          state.trajectoryJudgment = judgment;
+          void saveTrajectoryClaimSnapshot(adapter.storage, { claim, judgment });
+          goto("trajectory-edit");
+        });
       },
       endTrajectoryReview(message: string) {
         state.trajectoryClaim = null;
         state.trajectoryJudgment = null;
-        void clearTrajectoryClaimSnapshot(adapter.storage);
+        void import("../review-client").then(({ clearTrajectoryClaimSnapshot }) => clearTrajectoryClaimSnapshot(adapter.storage));
         notify(message, "ok");
         goto("trajectory-queue");
       },
@@ -872,6 +906,11 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       )
     );
     bar.append(el("div", { class: "topbar-left" }, navGroup, brand, navLinks));
+    const activeNav = navLinks.querySelector<HTMLElement>(".topnav-link.active");
+    requestAnimationFrame(() => {
+      if (!activeNav || navLinks.scrollWidth <= navLinks.clientWidth) return;
+      navLinks.scrollLeft = Math.max(0, activeNav.offsetLeft - (navLinks.clientWidth - activeNav.clientWidth) / 2);
+    });
     if (state.identity) {
       bar.append(
         el(
@@ -890,31 +929,6 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
   }
 
   function render() {
-    const screens: Record<Screen, (c: Ctx) => HTMLElement> = {
-      login: renderLogin,
-      home: renderHome,
-      sources: renderItems,
-      "import-mail": renderMailImport,
-      "import-calendar": renderCalendarImport,
-      "import-documents": renderDocumentImport,
-      items: renderItems,
-      "upload-email": renderEmailItems,
-      "upload-calendar": renderCalendarItems,
-      "upload-documents": renderDocumentItems,
-      entities: renderEntities,
-      "my-tasks": renderMyTasks,
-      "my-task": renderMyTask,
-      tasks: renderTasks,
-      "task-edit": renderTaskEdit,
-      review: renderReview,
-      progress: renderProgress,
-      metrics: renderMetrics,
-      examples: renderExamples,
-      "task-review-queue": renderTaskReviewQueue,
-      "task-review-edit": renderTaskReviewEdit,
-      "trajectory-queue": renderTrajectoryQueue,
-      "trajectory-edit": renderTrajectoryEdit,
-    };
     const children: HTMLElement[] = [];
     if (state.screen !== "login") children.push(topBar());
     if (state.notice) {
@@ -939,11 +953,56 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         )
       );
     }
-    children.push(screens[state.screen](ctx));
+    const renderer = screenRenderers[state.screen];
+    if (renderer) children.push(renderer(ctx));
+    else {
+      if (!screenLoadErrors.has(state.screen)) void loadScreen(state.screen);
+      children.push(renderScreenLoading(state.screen));
+    }
     root.replaceChildren(...children);
   }
 
+  function loadScreen(screen: Screen): Promise<void> {
+    if (screenRenderers[screen] || screenLoads.has(screen)) return screenLoads.get(screen) ?? Promise.resolve();
+    const loader = SCREEN_LOADERS[screen];
+    if (!loader) return Promise.reject(new Error(`No renderer for ${screen}`));
+    screenLoadErrors.delete(screen);
+    const pending = loader()
+      .then((renderer) => {
+        screenRenderers[screen] = renderer;
+      })
+      .catch((error) => {
+        screenLoadErrors.set(screen, message(error));
+      })
+      .finally(() => {
+        screenLoads.delete(screen);
+        if (state.screen === screen) render();
+      });
+    screenLoads.set(screen, pending);
+    return pending;
+  }
+
+  function renderScreenLoading(screen: Screen): HTMLElement {
+    const error = screenLoadErrors.get(screen);
+    return el(
+      "section",
+      { class: "screen narrow screen-loading", role: "status", "aria-live": "polite" },
+      el("p", { class: "step-kicker mono" }, error ? "LOAD ERROR" : "LOADING"),
+      el("h2", { class: "display" }, error ? "This screen couldn't load" : "Opening workspace…"),
+      error ? el("p", { class: "screen-sub" }, error) : el("p", { class: "screen-sub" }, "Apollo is loading only the tools needed for this step."),
+      error ? el("button", { class: "btn primary", type: "button", onclick: () => { screenLoadErrors.delete(screen); void loadScreen(screen); render(); } }, "Try again") : null
+    );
+  }
+
   render();
+
+  const preloadCoreScreens = () => {
+    void loadScreen("items");
+    void loadScreen("tasks");
+    void loadScreen("task-edit");
+  };
+  if (typeof requestIdleCallback === "function") requestIdleCallback(preloadCoreScreens, { timeout: 2_000 });
+  else setTimeout(preloadCoreScreens, 750);
 
   if (typeof history !== "undefined" && typeof window !== "undefined") {
     setUrl(state.screen, true);

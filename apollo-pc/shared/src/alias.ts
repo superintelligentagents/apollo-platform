@@ -11,6 +11,7 @@
 
 import { merchantForSender } from "./sources/receipts";
 import { emailSenderIdentity } from "./email-services";
+import { randomUuid } from "./ids";
 import type { Address, Entity, ParticipantIdentity, SourceKind, SourceRecord } from "./types";
 
 const FIRST_NAMES = [
@@ -256,7 +257,7 @@ export function detectEntities(
     const fresh = pool.next();
     const category = isMerchant ? "merchant" : isOrganization ? "org" : "person";
     out.push({
-      entityId: crypto.randomUUID(),
+      entityId: randomUuid(),
       category,
       realNames: [...names.values()],
       realEmails: [...emails],
@@ -293,7 +294,7 @@ function attachParticipantIdentity(entities: Entity[], identity: ParticipantIden
   if (!entity) {
     const fresh = pool.next();
     entity = {
-      entityId: crypto.randomUUID(),
+      entityId: randomUuid(),
       category: "self",
       realNames: [],
       realEmails: [],

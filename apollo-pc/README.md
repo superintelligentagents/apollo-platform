@@ -24,6 +24,10 @@ and `pc-review/` queue. The workspace is standalone and does not import `@odysse
    (default 12 months) drops older records *at parse time*. Email bodies are truncated
    (5 KB head+tail), extracted document text is capped at 200 KB, attachments are reduced to
    metadata, and selected records are stored in IndexedDB.
+   The production client loads the dashboard shell first and fetches each larger workspace only
+   when it is opened. Import persistence uses larger IndexedDB transactions, privacy entity
+   indexing continues in a worker after the records are saved, and app recommendations scan the
+   selected history once while retaining only the strongest grounded matches.
 2. **Review & redact** — all imported email is selected by default; per-item and filtered
    bulk controls can keep anything private. Field editing, entity aliases, replacement rules,
    and the direct-identifier/credential mask layer apply only to the upload copy.

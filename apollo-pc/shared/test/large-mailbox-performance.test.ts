@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { recommendApps } from "../src/app-catalog";
 import type { EmailRecord } from "../src/types";
 import { applyDecisions, serializeDecisions } from "../src/ui/autosave";
 import { initialState, type Ctx } from "../src/ui/context";
@@ -70,6 +71,13 @@ describe("100k-message mailbox performance", () => {
 
     expect(matches.map((record) => record.id)).toEqual([`mail-${MAILBOX_SIZE - 1}`]);
     expect(searchMs).toBeLessThan(1_500);
+
+    const recommendationsStarted = performance.now();
+    const recommendations = recommendApps(records.values(), 17);
+    const recommendationsMs = performance.now() - recommendationsStarted;
+    expect(recommendations[0].app.id).toBe("hoolimail");
+    expect(recommendations[0].recordIds).toHaveLength(24);
+    expect(recommendationsMs).toBeLessThan(4_000);
   });
 
   it("persists a source-wide private choice without 100k decision objects", () => {

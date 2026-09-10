@@ -1,5 +1,5 @@
 export const APP_NAME = "apollo-pc";
-export const APP_VERSION = "0.5.1";
+export const APP_VERSION = "0.5.2";
 export const CONSENT_VERSION = "2026-08-12";
 
 export const DEFAULT_PRESIGN_ENDPOINT = "https://t1ynh195m1.execute-api.us-east-1.amazonaws.com/presign";
