@@ -283,7 +283,7 @@ export function recommendApps(records: Iterable<SourceRecord>, limit = 6): AppRe
   return finishRecommendations(summaries, limit);
 }
 
-export async function recommendAppsAsync(records: Iterable<SourceRecord>, limit = 6, chunkSize = 2_000, signal?: AbortSignal): Promise<AppRecommendation[]> {
+export async function recommendAppsAsync(records: Iterable<SourceRecord>, limit = 6, chunkSize = 500, signal?: AbortSignal): Promise<AppRecommendation[]> {
   const summaries = recommendationSummaries();
   let processed = 0;
   for (const record of records) {
