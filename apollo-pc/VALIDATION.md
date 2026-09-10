@@ -8,8 +8,8 @@ workspace, recommendations, exact app links, guided task editor, review/submit f
 metrics/admin workspace, and desktop and 390px navigation. The post-deploy browser
 console was clear.
 
-Deployment: https://apollo-pc-site-80k7jdox7-lawrences-projects-aa5ba59b.vercel.app
-Vercel deployment ID: `dpl_AnmB5LxrtsBqd4HCGcn3JHfP1n9o`.
+Deployment: https://apollo-pc-site-7e6ttzovj-lawrences-projects-aa5ba59b.vercel.app
+Vercel deployment ID: `dpl_4iTDm9UNPRDPgniaTq5eZUq4Fu5R`.
 This release changed only the isolated PC frontend. The last verified PC Lambda
 code SHA-256 remains `GuXzERUGKcryZk29ibKyTRGDzbRY98KrrI+NlHDPF64=`; the primary
 v2 Lambda, roles, environment variables, API Gateway, S3 layout, and DynamoDB
@@ -28,7 +28,7 @@ table remained unchanged.
 | Identity | Author lookup and reviewer/creator assignment use the same protected participant ID as PC uploads. Explicit study IDs remain unchanged. |
 | Runtime access | Team key is validated against PC before device-local storage. No build-time review key. Built JavaScript checked against the configured key without printing it. |
 | Admin records | Email, calendar, and extracted-document counts/details are available to the same admin allowlist as v2. Document admins may edit only title and extracted text; filename, type, size, page count, ID, and uploaded original remain immutable. |
-| Runtime performance | The initial production JavaScript fell from 348.57 KB (110.75 KB gzip) to 61.66 KB (21.76 KB gzip), an 82% raw and 80% gzip reduction. Larger workspaces and PDF extraction load on demand. App recommendations make one bounded pass over history, imported records persist in 2,000-record transactions, and entity indexing finishes after the import becomes usable. A 100,000-message recommendation/search regression stays under its 4-second/1.5-second limits. |
+| Runtime performance | The initial production JavaScript fell from 348.57 KB (110.75 KB gzip) to 61.66 KB (21.76 KB gzip), an 82% raw and 80% gzip reduction. Larger workspaces and PDF extraction load on demand. App recommendations make one bounded pass over history, imported records persist in 2,000-record transactions, and entity indexing finishes after the import becomes usable. A 100,000-message recommendation/search regression stays under its 4-second/1.5-second limits. All 30 hash-named JavaScript assets returned 200 with `Cache-Control: public, max-age=31536000, immutable`; HTML continues to revalidate. |
 
 | Admin / annotator metrics | Added contributions, queue activity, reviewer quality, author outcomes, QC/sign-off progress, distribution, search/filter/pagination, details, and re-queue controls. Same seven-email allowlist as v2. PC authors now have separate stable private IDs rather than one combined redacted row. |
 | Protected showcase | Current author-signed-off PC finals only; no raw context or participant fields. Revoked approvals excluded. Empty state verified. Metadata labels do not imply model classification. |
