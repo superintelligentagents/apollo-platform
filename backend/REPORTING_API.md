@@ -108,6 +108,7 @@ Every row (any view) carries this metadata. None of it is authored task text.
 |---|---|
 | `task_id`, `mode`, `status`, `qc_completed` | workflow identity/state; `status` ∈ pending / in_review / approved / rejected |
 | `participant_id` | the account that submitted |
+| `creator_pid` | protected upload owner used only to route a trajectory back to its PC author for grading; for V2 it matches `participant_id` |
 | `canonical_participant_id` | `participant_id` after the admin alias map (`{review-root}config/participant_aliases.json`, `{alias: canonical}`), so duplicate accounts roll up to one trainer |
 | `participant_name` | one stable display name per account — the most frequent spelling across that account's rows (capitalized spelling wins ties); `participant_name_raw` is the spelling on this submission |
 | `participant_email` | as entered on the submission |
@@ -302,7 +303,7 @@ The Codex pipeline writes one immutable, manager-reviewed artifact per task stat
 
 Versioned, content-addressed names keep old reviews immutable while allowing a changed final-gold task or a newer pipeline version to be reviewed again. The API prefers a current-content-hash artifact even when a newer stale artifact exists, then chooses the highest numeric pipeline version and newest timestamp. If no current-hash artifact exists, it returns the best historical artifact and marks it stale.
 
-The API never exposes source browsing journeys, private Apollo PC mail/calendar records, attachments, consent records, cookies, expected answers, or Codex event logs.
+The API never exposes source browsing journeys, private Apollo PC email/calendar/document records, attachments, consent records, cookies, expected answers, or Codex event logs.
 
 ### LLM task-quality fields
 
@@ -328,6 +329,7 @@ Trajectory manifests expose each rubric's advisory `llm_status` as `SUCCESS`, `F
 Query parameters:
 
 - `status=pending|in_review|reviewed`
+- `subset=<name>` restricts the response to a published named set of task IDs (see below)
 - `task_id=<exact task id>`
 - `limit=<n>` and `offset=<n>`
 - `include=full` (or `include=content`) to include the complete normalized run package and human judgment; content pages are capped at 50. `manifest.rubrics[]` carries the per-rubric verdicts (`rubric_id`, `requirement`, `llm_status`, `llm_score`, `llm_reasoning`) — use it, not `osworld_task.apollo.rubrics[]`, which is the criteria export and holds no verdicts.
@@ -336,6 +338,23 @@ Query parameters:
 - `format=osworld` to receive the whole set as the OSWorld export bundle instead of rows (see below). Accepts the same `status`/`task_id`/`limit`/`offset` filters plus `grade=any` and `snapshot=<name>` (default `chrome`).
 
 `llm_average_rubric_score` is the mean over rubrics the judge actually scored: an `ERROR` rubric is dropped from that denominator, so a run with 4 errors and 1 pass reports `1.0`. `llm_perfect` is stricter — it requires every rubric to have been scored *and* passed — so the two are not interchangeable, and `llm_perfect` is the safer pass signal. Every row therefore also carries `llm_judge_errors`, `llm_rubrics_total`, and `llm_rubrics_scored`; treat an average whose `llm_rubrics_scored < llm_rubrics_total` as partial coverage rather than a clean score.
+
+A run's package is immutable once published, so a later judging pass cannot
+correct the scores inside it. When one has run, its verdicts are written to
+`rejudgment.json` beside the manifest and **the API reports those** — the
+`llm_*` fields above then describe the re-judgment, and `llm_judge_source` says
+so (`canonical_full_trajectory` vs `packaged`), with `llm_judge` giving the
+judge's repo, commit, SHA-256, model, and how many screenshots it saw. Nothing
+is lost: the package's original judgment stays on every row as
+`llm_original_average_rubric_score` and `llm_original_perfect`. Under
+`include=content`, `manifest.rubrics[]` carries the re-judged verdicts and
+reasoning so per-rubric review matches the headline number. A re-judgment whose
+rubric IDs do not match the package's exactly is ignored and the packaged
+judgment stands, so a sidecar left behind by an amended task cannot swap in
+verdicts for a different rubric set.
+
+The 1,589 `gpt-5.6-luna` trajectories were re-judged this way in September 2026,
+on the canonical judge with every screenshot rather than a 12-frame sample.
 
 The default response contains run identity, queue status, runner/model/run label, reviewer/timestamp, LLM aggregate score with the coverage counts above, and `human_final_grade`. New final grades are `YES`, `NO`, `EDIT_NEEDED`, or `NEEDS_RERUN`. The immutable `apollo-human-trajectory-judgment-v3` document stores that value as `trajectory.overall_outcome`; it also retains the older three-way `trajectory.task_satisfied` alias. The existing API field `human_outcome` remains unchanged for compatibility, while `human_final_grade` gives both old and new records the normalized four-way value. `EDIT_NEEDED` and `NEEDS_RERUN` require at least 10 characters in `trajectory.notes` explaining the edit or rerun.
 
@@ -346,6 +365,32 @@ used to infer it; legacy external IDs require `prepare.py --creator-map`). An
 Review pipeline after Codex live audit; it does not overwrite the source task,
 accepted gold, run, or judgment. `NEEDS_RERUN` waits for a new immutable run
 package.
+
+### Named task subsets
+
+`subset=<name>` narrows either endpoint to a curated list of task IDs published
+at `v2-review/subsets/<name>.json`. The response then carries a `subset` object
+naming the set and its size, so an empty page is distinguishable from a filter
+that matched nothing; an unknown name is a 404 rather than a silent full
+listing. Names are lowercase `[a-z0-9._-]` and address nothing outside that
+prefix.
+
+Published sets:
+
+| Name | Tasks | What it is |
+|---|---:|---|
+| `hard-100-v1` | 100 | Tasks where `gpt-5.6-luna` scored below 0.35, screened for fairness (not merely difficulty) and stratified across the SimilarWeb taxonomy. Built to compare stronger browser agents against a weak baseline. |
+
+```bash
+curl -s -H "Authorization: Bearer $APOLLO_REPORTING_TOKEN" \
+  "$API/reporting/tasks?subset=hard-100-v1&include=content&limit=100" | jq '.subset, (.tasks|length)'
+
+curl -s -H "Authorization: Bearer $APOLLO_REPORTING_TOKEN" \
+  "$API/reporting/trajectories?subset=hard-100-v1" | jq '.subset'
+```
+
+A subset filters membership only; `status`, `include`, `limit`/`offset` and the
+OSWorld export format all still apply on top of it.
 
 ### OSWorld-style task view
 

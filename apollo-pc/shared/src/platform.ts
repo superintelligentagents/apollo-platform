@@ -34,7 +34,7 @@ export interface UploadLogEntry {
   bundle_id: string;
   sources: string[];
   record_count: number;
-  source_counts?: Partial<Record<"email" | "calendar", number>>;
+  source_counts?: Partial<Record<"email" | "calendar" | "documents", number>>;
   task_count: number;
   at: string;
 }

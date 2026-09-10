@@ -1,6 +1,7 @@
 import type { PlatformAdapter } from "../platform";
 import type { RecordStore } from "../store";
 import type { PCTemplate } from "../templates";
+import type { AppCategory, AppRecommendation } from "../app-catalog";
 import type {
   Entity,
   ItemDecision,
@@ -19,14 +20,20 @@ export type Screen =
   | "sources"
   | "import-mail"
   | "import-calendar"
+  | "import-documents"
   | "items"
   | "upload-email"
   | "upload-calendar"
+  | "upload-documents"
   | "entities"
+  | "my-tasks"
+  | "my-task"
   | "tasks"
   | "task-edit"
   | "review"
   | "progress"
+  | "metrics"
+  | "examples"
   | "task-review-queue"
   | "task-review-edit"
   | "trajectory-queue"
@@ -42,6 +49,7 @@ export type ItemFilters = {
   queryScope: "all" | "email" | "sender" | "subject";
   status: "all" | "included" | "excluded" | "edited";
   category: string;
+  app: string;
   direction: "all" | "received" | "sent";
   correspondent: string;
   service: string;
@@ -59,13 +67,17 @@ export type SourceImportInfo = {
 };
 
 export type TaskDraft = {
+  region: string;
+  subjects: string[];
   taskId: string; // stable across edits
   templateId: string;
   category: PCTask["category"];
   title: string;
   request: string;
+  difficulty: "low" | "medium" | "high";
   steps: { order: number; title: string; description: string }[];
   successCriteria: string[];
+  requiredOutputs: string[];
   referencedRecordIds: string[];
   expectedAnswer: string;
   notes: string;
@@ -76,7 +88,7 @@ export type AppState = {
   identity: ParticipantIdentity | null;
   lastIdentity: ParticipantIdentity | null;
   uploadedCount: number;
-  uploadedBySource: { email: number; calendar: number; knownBundles: number; legacyRecords: number };
+  uploadedBySource: { email: number; calendar: number; documents: number; knownBundles: number; legacyRecords: number };
 
   // Header-level records in memory; email bodies live in IndexedDB.
   records: Map<string, SourceRecord>;
@@ -96,15 +108,17 @@ export type AppState = {
   rules: ReplacementRule[];
   imports: Partial<Record<SourceKind, SourceImportInfo>>;
 
+  myTaskSelection: import("../review-client").MyTaskItem | null;
   tasks: PCTask[];
   taskDraft: TaskDraft | null;
   activeTemplate: PCTemplate | null;
   // Record-picker search inside task-edit.
   pickerQuery: string;
-  pickerSource: "all" | "email" | "calendar" | "selected";
+  pickerSource: "all" | "email" | "calendar" | "documents" | "selected";
   pickerPage: number;
   pickerOpenId: string | null;
   pickerOpenBody: string | null;
+  discoveryCategory: AppCategory | "all";
 
   filters: ItemFilters;
   openItemId: string | null;
@@ -142,6 +156,7 @@ export type Ctx = {
   actions: {
     login(identity: ParticipantIdentity): Promise<void>;
     goto(screen: Screen): void;
+    setReviewKey(key: string | null): void;
     importFiles(kind: SourceKind, files: File[]): Promise<void>;
     defaultIncluded(record: SourceRecord): boolean;
     isIncluded(record: SourceRecord): boolean;
@@ -157,6 +172,7 @@ export type Ctx = {
     addRule(rule: ReplacementRule): void;
     removeRule(index: number): void;
     startTask(template: PCTemplate): void;
+    startRecommendedTask(recommendation: AppRecommendation): void;
     editTask(taskId: string): void;
     saveTaskDraft(): boolean;
     deleteTask(taskId: string): void;
@@ -175,7 +191,7 @@ export type Ctx = {
 };
 
 export function emptyFilters(): ItemFilters {
-  return { source: "all", from: "", to: "", query: "", queryScope: "all", status: "all", category: "all", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 };
+  return { source: "all", from: "", to: "", query: "", queryScope: "all", status: "all", category: "all", app: "", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 };
 }
 
 export function initialState(): AppState {
@@ -184,7 +200,7 @@ export function initialState(): AppState {
     identity: null,
     lastIdentity: null,
     uploadedCount: 0,
-    uploadedBySource: { email: 0, calendar: 0, knownBundles: 0, legacyRecords: 0 },
+    uploadedBySource: { email: 0, calendar: 0, documents: 0, knownBundles: 0, legacyRecords: 0 },
     records: new Map(),
     decisions: new Map(),
     sourceInclusionDefaults: {},
@@ -196,6 +212,7 @@ export function initialState(): AppState {
     entityIndexing: false,
     rules: [],
     imports: {},
+    myTaskSelection: null,
     tasks: [],
     taskDraft: null,
     activeTemplate: null,
@@ -204,6 +221,7 @@ export function initialState(): AppState {
     pickerPage: 0,
     pickerOpenId: null,
     pickerOpenBody: null,
+    discoveryCategory: "all",
     filters: emptyFilters(),
     openItemId: null,
     openItemBody: null,

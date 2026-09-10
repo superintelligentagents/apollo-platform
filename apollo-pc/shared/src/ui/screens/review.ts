@@ -33,7 +33,7 @@ export function renderReview(ctx: Ctx): HTMLElement {
 
   // Per-source table
   const table = el("div", { class: "review-table card" });
-  const kinds: SourceKind[] = ["email", "calendar", "contacts", "messages", "orders", "transactions"];
+  const kinds: SourceKind[] = ["email", "calendar", "documents", "contacts", "messages", "orders", "transactions"];
   for (const kind of kinds) {
     const total = [...s.records.values()].filter((r) => r.source === kind).length;
     if (!total) continue;

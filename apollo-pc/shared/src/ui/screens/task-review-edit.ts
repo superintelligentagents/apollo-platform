@@ -1,4 +1,4 @@
-import { reviewLlmFeedback, reviewReject, reviewRelease, reviewSubmit, saveClaimSnapshot, seedRubrics, upgradeRubrics, type LlmReviewForHuman, type RubricRow } from "../../review-client";
+import { rememberReviewSkip, reviewReturn, reviewLlmFeedback, reviewReject, reviewRelease, reviewSubmit, saveClaimSnapshot, seedRubrics, upgradeRubrics, type LlmReviewForHuman, type RubricRow } from "../../review-client";
 import { el } from "../components/helpers";
 import type { Ctx } from "../context";
 
@@ -87,12 +87,12 @@ export function renderTaskReviewEdit(ctx: Ctx): HTMLElement {
   const drawRubrics = () => {
     rubricList.replaceChildren();
     rubrics.forEach((rubric, index) => {
-      const number = (rubric.sourceIndex ?? index) + 1;
+      const number = index + 1;
       const checked = el("input", { type: "checkbox", class: "pc-rubric-check", checked: rubric.checked, "aria-label": `Step ${number} verified`, onchange: (event: Event) => { rubric.checked = (event.target as HTMLInputElement).checked; persist(); syncApprove(); } });
       const editor = el("textarea", { class: "pc-rubric-text", rows: "4", "aria-label": `Step ${number} text` }) as HTMLTextAreaElement;
       editor.value = rubric.text;
       editor.oninput = () => { rubric.text = editor.value; rubric.checked = false; (checked as HTMLInputElement).checked = false; preview.textContent = rubric.text; persist(); syncApprove(); };
-      const check = llm?.rubrics.find((item) => item.rubric_id === `rubric-${index + 1}`) ?? null;
+      const check = llm?.rubrics.find((item) => rubric.sourceIndex !== null && item.rubric_id === `rubric-${rubric.sourceIndex + 1}`) ?? null;
       const attention = Boolean(check && (check.verdict !== "POSSIBLE" || (check.quality_verdict && check.quality_verdict !== "PASS")));
       const aligned = !check?.quality_verdict || check.quality_verdict === "PASS";
       const feasible = check?.verdict === "POSSIBLE";
@@ -118,6 +118,12 @@ export function renderTaskReviewEdit(ctx: Ctx): HTMLElement {
           check.repair?.suggested_rubric_text && check.repair.verified_possible ? el("div", { class: "pc-codex-suggestion" }, el("p", null, check.repair.suggested_rubric_text), el("button", { class: "btn ghost small", type: "button", onclick: () => { rubric.text = check.repair!.suggested_rubric_text!; editor.value = rubric.text; preview.textContent = rubric.text; rubric.checked = false; persist(); syncApprove(); } }, "Use suggestion")) : null,
           (check.evidence ?? []).length ? el("details", { class: "pc-codex-evidence" }, el("summary", null, `Pages checked (${check.evidence.length})`), el("div", null, ...check.evidence.map((source) => el("a", { href: source.url, target: "_blank", rel: "noreferrer" }, source.title || source.url)))) : null
         ) : null,
+        el("div", { class: "form-actions" },
+          el("button", { class: "btn ghost small", type: "button", disabled: index === 0, onclick: () => { [rubrics[index - 1], rubrics[index]] = [rubrics[index], rubrics[index - 1]]; persist(); drawRubrics(); } }, "Move up"),
+          el("button", { class: "btn ghost small", type: "button", disabled: index === rubrics.length - 1, onclick: () => { [rubrics[index + 1], rubrics[index]] = [rubrics[index], rubrics[index + 1]]; persist(); drawRubrics(); } }, "Move down"),
+          el("button", { class: "btn ghost small", type: "button", onclick: () => { rubrics.splice(index + 1, 0, { text: "", original: null, checked: false, kind: rubric.kind, sourceIndex: null, title: "Added step", seedVersion: 3 }); persist(); drawRubrics(); } }, "Insert after"),
+          el("button", { class: "btn ghost small", type: "button", onclick: () => { rubrics.splice(index, 1); persist(); drawRubrics(); } }, "Remove step")
+        ),
         rubric.original ? el("details", { class: "pc-rubric-original" }, el("summary", null, "Show original"), el("p", null, rubric.original)) : null
       );
       summary.onclick = () => { const open = details.hidden; details.hidden = !open; summary.setAttribute("aria-expanded", String(open)); if (open) editor.focus(); };
@@ -180,10 +186,30 @@ export function renderTaskReviewEdit(ctx: Ctx): HTMLElement {
   };
   const release = el("button", { class: "btn ghost", type: "button", onclick: async () => {
     (release as HTMLButtonElement).disabled = true;
-    await reviewRelease(state.reviewKey!, claim).catch(() => {});
+    try {
+      await reviewRelease(state.reviewKey!, claim);
+      rememberReviewSkip(claim.subKey);
+    } catch (error) {
+      (release as HTMLButtonElement).disabled = false;
+      ctx.actions.notifyError(error instanceof Error ? error.message : String(error));
+      return;
+    }
     ctx.actions.endReview("Task released back to the queue.");
   } }, "Skip & release");
-  root.append(el("div", { class: "pc-review-actions" }, rejectReason, reject, release, approve));
+  const returnReason = el("textarea", { class: "field-input", hidden: true, "aria-label": "Reason for returning task", placeholder: "Explain what the author should change (at least 40 characters)." }) as HTMLTextAreaElement;
+  const returnButton = el("button", { class: "btn ghost", type: "button", onclick: async () => {
+    if (returnReason.hidden) { returnReason.hidden = false; returnButton.textContent = "Confirm return"; returnReason.focus(); return; }
+    if (returnReason.value.trim().length < 40) { ctx.actions.notifyError("Explain what to change in at least 40 characters."); return; }
+    (returnButton as HTMLButtonElement).disabled = true;
+    try {
+      await reviewReturn(state.reviewKey!, ctx.actions.reviewerName(), claim, returnReason.value.trim(), ctx.actions.reviewerPid());
+      ctx.actions.endReview("Task returned to its author for revision.");
+    } catch (error) {
+      (returnButton as HTMLButtonElement).disabled = false;
+      ctx.actions.notifyError(error instanceof Error ? error.message : String(error));
+    }
+  } }, "Return to author");
+  root.append(el("div", { class: "pc-review-actions" }, rejectReason, reject, returnReason, returnButton, release, approve));
 
   if (state.reviewKey) void reviewLlmFeedback(state.reviewKey, claim).then((result) => {
     llm = result.review;

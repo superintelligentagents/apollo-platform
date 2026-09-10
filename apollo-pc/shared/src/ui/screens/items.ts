@@ -1,4 +1,5 @@
 import { scrubText, type ScrubMatch } from "../../scrub";
+import { appIdsForRecord, historyAppCounts, MYPCBENCH_APPS } from "../../app-catalog";
 import { CALENDAR_CATEGORIES, EMAIL_CATEGORIES, linkEmailAndCalendar } from "../../organize";
 import { emailMatchesActivity, type EmailActivityStat, type EmailActivitySummary, type EmailDirection } from "../../email-activity";
 import type { EmailServiceOption } from "../../email-services";
@@ -9,7 +10,7 @@ import { mailboxIndexFor, type DomainCount, type MailboxIndex } from "../mailbox
 
 const PAGE_SIZE = 100;
 const FILTER_TYPING_DELAY_MS = 180;
-const SOURCE_TABS: (SourceKind | "all")[] = ["all", "email", "calendar"];
+const SOURCE_TABS: (SourceKind | "all")[] = ["all", "email", "calendar", "documents"];
 
 type EditControl = "input" | "textarea" | "boolean" | "json";
 export type EditableField = { field: string; label: string; value: string; control?: EditControl; rows?: number; hint?: string };
@@ -20,8 +21,9 @@ export function renderItems(ctx: Ctx): HTMLElement {
   const index = mailboxIndexFor(ctx.state.records, ctx.state.identity?.email ?? "");
   const email = index.emailData;
   const calendar = index.calendars;
+  const documents = index.bySource.get("documents") ?? [];
   const selected = (items: SourceRecord[]) => items.filter((record) => ctx.actions.isIncluded(record)).length;
-  const selectedTotal = selected(email) + selected(calendar);
+  const selectedTotal = selected(email) + selected(calendar) + selected(documents);
   return el(
     "section",
     { class: "screen narrow workflow-hub" },
@@ -30,6 +32,7 @@ export function renderItems(ctx: Ctx): HTMLElement {
     el("p", { class: "screen-sub" }, "Choose the records you want to share."),
     uploadHubLink("Mail", `${selected(email).toLocaleString()} selected`, () => ctx.actions.goto("upload-email")),
     uploadHubLink("Calendar", `${selected(calendar).toLocaleString()} selected`, () => ctx.actions.goto("upload-calendar")),
+    uploadHubLink("Documents", `${selected(documents).toLocaleString()} selected`, () => ctx.actions.goto("upload-documents")),
     el(
       "div",
       { class: "workflow-hub-footer" },
@@ -51,7 +54,11 @@ export function renderCalendarItems(ctx: Ctx): HTMLElement {
   return renderUpload(ctx, "calendar");
 }
 
-function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar"): HTMLElement {
+export function renderDocumentItems(ctx: Ctx): HTMLElement {
+  return renderUpload(ctx, "documents");
+}
+
+function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar" | "documents"): HTMLElement {
   const s = ctx.state;
   const f = s.filters;
   const index = mailboxIndexFor(s.records, s.identity?.email ?? "");
@@ -70,11 +77,13 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar"): HTMLElement 
   const page = Math.min(f.page, pages - 1);
   const shown = filtered.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
 
-  const allRecords = onlySource === "email" ? index.emailData : onlySource === "calendar" ? index.calendars : index.orderedRecords;
+  const allRecords = onlySource === "email" ? index.emailData : onlySource === "calendar" ? index.calendars : onlySource === "documents" ? index.bySource.get("documents") ?? [] : index.orderedRecords;
   const selectionSources = onlySource === "email"
     ? (["email", "orders"] as SourceKind[])
     : onlySource === "calendar"
       ? (["calendar"] as SourceKind[])
+      : onlySource === "documents"
+        ? (["documents"] as SourceKind[])
       : [...index.counts.keys()];
   const selectedCount = allRecords.filter((r) => ctx.actions.isIncluded(r)).length;
   const rerenderWith = (patch: Partial<typeof f>) => {
@@ -93,11 +102,11 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar"): HTMLElement 
 
   const root = el("section", { class: "screen wide" });
   root.append(
-    el("h2", { class: "display" }, onlySource === "email" ? "Upload email data" : onlySource === "calendar" ? "Upload calendar data" : "Upload data"),
+    el("h2", { class: "display" }, onlySource === "email" ? "Upload email data" : onlySource === "calendar" ? "Upload calendar data" : onlySource === "documents" ? "Upload document text" : "Upload data"),
     el(
       "p",
       { class: "screen-sub" },
-      onlySource === "email" ? "Choose the mail you want to share." : onlySource === "calendar" ? "Choose the events you want to share." : "Choose what you want to share."
+      onlySource === "email" ? "Choose the mail you want to share." : onlySource === "calendar" ? "Choose the events you want to share." : onlySource === "documents" ? "Review extracted text, edit it if needed, and choose the documents you want to share." : "Choose what you want to share."
     )
   );
   if (allRecords.length) {
@@ -118,14 +127,15 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar"): HTMLElement 
   }
 
   if (onlySource && !allRecords.length) {
-    root.append(el("section", { class: "simple-empty" }, el("h3", null, onlySource === "email" ? "Import mail first" : "Import a calendar first"), el("p", null, onlySource === "email" ? "After import, this page will show email search, categories, parsed purchases, and editing controls." : "After import, this page will show event search, categories, repeating-event controls, and editing controls."), el("button", { class: "btn primary", type: "button", onclick: () => ctx.actions.goto(onlySource === "email" ? "import-mail" : "import-calendar") }, onlySource === "email" ? "Go to Import mail" : "Go to Import calendar")));
+    root.append(el("section", { class: "simple-empty" }, el("h3", null, onlySource === "email" ? "Import mail first" : onlySource === "calendar" ? "Import a calendar first" : "Import a document first"), el("p", null, onlySource === "email" ? "After import, this page will show email search, categories, parsed purchases, and editing controls." : onlySource === "calendar" ? "After import, this page will show event search, categories, repeating-event controls, and editing controls." : "After import, this page will show the locally extracted text and privacy editing controls."), el("button", { class: "btn primary", type: "button", onclick: () => ctx.actions.goto(onlySource === "email" ? "import-mail" : onlySource === "calendar" ? "import-calendar" : "import-documents") }, onlySource === "email" ? "Go to Import mail" : onlySource === "calendar" ? "Go to Import calendar" : "Go to Import documents")));
     return root;
   }
 
   if (!onlySource) root.append(
     el("section", { class: "upload-workflows", "aria-label": "Choose an upload workflow" },
       uploadWorkflowCard(ctx, "email", "Upload email data", "Search every message by text, date, or sender. Use persona categories aligned to shopping, food, travel, finance, work, and other MyPCBench domains.", index.emailData.length),
-      uploadWorkflowCard(ctx, "calendar", "Upload calendar data", "Search every event, choose repeating events, use automatic categories, or select events linked to email.", index.calendars.length)
+      uploadWorkflowCard(ctx, "calendar", "Upload calendar data", "Search every event, choose repeating events, use automatic categories, or select events linked to email.", index.calendars.length),
+      uploadWorkflowCard(ctx, "documents", "Upload document text", "Inspect text extracted locally from resumes, tax forms, notes, and other documents before sharing it.", index.counts.get("documents") ?? 0)
     )
   );
 
@@ -137,7 +147,7 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar"): HTMLElement 
       !onlySource ? el(
         "div",
         { class: "selection-tools-head" },
-        el("div", null, el("p", { class: "step-kicker mono" }, "FILTER LOCALLY"), el("h3", null, f.source === "email" ? "Choose email data" : f.source === "calendar" ? "Choose calendar data" : "Choose a data type")),
+        el("div", null, el("p", { class: "step-kicker mono" }, "FILTER LOCALLY"), el("h3", null, f.source === "email" ? "Choose email data" : f.source === "calendar" ? "Choose calendar data" : f.source === "documents" ? "Choose document text" : "Choose a data type")),
         el("p", null, "Filters change what you see. They never upload or deselect records by themselves.")
       ) : null,
       !onlySource ? el(
@@ -146,13 +156,14 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar"): HTMLElement 
         ...SOURCE_TABS.filter((tab) => tab === "all" || (tab === "email" ? index.emailData.length : index.counts.get(tab) ?? 0) > 0).map((tab) =>
           el(
             "button",
-            { class: `seg ${f.source === tab ? "active" : ""}`, type: "button", onclick: () => rerenderWith({ source: tab, category: "all", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all" }) },
+            { class: `seg ${f.source === tab ? "active" : ""}`, type: "button", onclick: () => rerenderWith({ source: tab, category: "all", app: "", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all" }) },
             tab === "all" ? `All (${s.records.size.toLocaleString()})` : `${sourceLabel(tab)} (${(tab === "email" ? index.emailData.length : index.counts.get(tab) ?? 0).toLocaleString()})`
           )
         )
       ) : null,
       f.source === "email" ? categoryFilters(ctx, EMAIL_CATEGORIES, index.emailData.length, index.emailCategoryCounts, rerenderWith) : null,
       f.source === "calendar" ? categoryFilters(ctx, CALENDAR_CATEGORIES, index.calendars.length, index.calendarCategoryCounts, rerenderWith) : null,
+      f.source === "email" || f.source === "calendar" || f.source === "documents" || f.source === "all" ? historyAppFilter(index, f.source, f.app, rerenderWith) : null,
       f.source === "email" ? inlinePrivacyPanel(ctx) : null,
       f.source === "email" ? emailActivityFilter(index.activity, f.direction, f.correspondent, rerenderWith) : null,
       f.source === "email" ? serviceFilter(index.serviceOptions, f.service, rerenderWith) : null,
@@ -161,7 +172,7 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar"): HTMLElement 
         "div",
         { class: "primary-search-row" },
         el("label", { class: "field filter-search primary-search" }, el("span", { class: "field-label" }, "Search"), el("input", {
-          type: "search", class: "field-input", "data-testid": "record-search-filter", placeholder: f.source === "calendar" ? "Summary or description…" : "Enter an email, sender, subject, or service…", value: f.query,
+          type: "search", class: "field-input", "data-testid": "record-search-filter", placeholder: f.source === "calendar" ? "Summary or description…" : f.source === "documents" ? "Filename, title, or extracted text…" : "Enter an email, sender, subject, or service…", value: f.query,
           oninput: (e: Event) => rerenderAfterTyping({ query: (e.target as HTMLInputElement).value }),
         })),
         f.source === "email" ? el("label", { class: "field search-scope" }, el("span", { class: "field-label" }, "Search in"), el("select", { class: "field-input", "data-testid": "record-search-scope", onchange: (event: Event) => rerenderWith({ queryScope: (event.target as HTMLSelectElement).value as typeof f.queryScope }) }, ...([ ["all", "Everything"], ["email", "Email addresses"], ["sender", "Sender"], ["subject", "Subject"] ] as const).map(([value, label]) => el("option", { value, selected: f.queryScope === value }, label)))) : null
@@ -231,7 +242,7 @@ function calculateLinks(records: Map<string, SourceRecord>): ReturnType<typeof l
 }
 
 function sourceLabel(kind: SourceKind): string {
-  return kind === "email" ? "email data" : kind === "orders" ? "parsed purchases" : kind;
+  return kind === "email" ? "email data" : kind === "orders" ? "parsed purchases" : kind === "documents" ? "documents" : kind;
 }
 
 export function filterRecords(ctx: Ctx, index: MailboxIndex, linkedIds: Set<string>): SourceRecord[] {
@@ -243,6 +254,7 @@ export function filterRecords(ctx: Ctx, index: MailboxIndex, linkedIds: Set<stri
   for (const r of index.orderedRecords) {
     if (f.source !== "all" && r.source !== f.source && !(f.source === "email" && r.source === "orders")) continue;
     if (f.category !== "all" && index.categoryById.get(r.id) !== f.category) continue;
+    if (f.app && !appIdsForRecord(r).includes(f.app)) continue;
     if ((f.direction !== "all" || f.correspondent) && (r.source !== "email" || !emailMatchesActivity(r, s.identity?.email ?? "", f.direction, f.correspondent))) continue;
     if (f.service && (r.source !== "email" || index.serviceById.get(r.id) !== f.service)) continue;
     if (f.domain && (r.source !== "email" || index.domainById.get(r.id) !== f.domain)) continue;
@@ -285,8 +297,26 @@ function matchesSearch(record: SourceRecord, scope: Ctx["state"]["filters"]["que
     return false;
   }
   if (record.source === "calendar") return record.searchText.includes(query) || record.description.toLowerCase().includes(query);
+  if (record.source === "documents") return record.searchText.includes(query) || record.text.toLowerCase().includes(query);
   if (record.source === "orders") return record.searchText.includes(query) || record.items.some((item) => item.title.toLowerCase().includes(query));
   return record.searchText.includes(query);
+}
+
+function historyAppFilter(index: MailboxIndex, source: SourceKind | "all", selected: string, rerenderWith: (patch: { app: string }) => void): HTMLElement {
+  const records = source === "email" ? index.emailData : source === "all" ? index.orderedRecords : index.bySource.get(source) ?? [];
+  const counts = historyAppCounts(records);
+  const options = MYPCBENCH_APPS.filter((candidate) => (counts.get(candidate.id) ?? 0) > 0);
+  return el(
+    "div",
+    { class: "domain-filter app-analogue-filter" },
+    el("div", { class: "domain-filter-head" }, el("strong", null, "Related app"), el("span", null, "Partition history by the real-world service and its MyPCBench clone.")),
+    el(
+      "select",
+      { class: "field-input", "data-testid": "history-app-filter", "aria-label": "Filter by related MyPCBench app", onchange: (event: Event) => rerenderWith({ app: (event.target as HTMLSelectElement).value }) },
+      el("option", { value: "", selected: !selected }, "All related apps"),
+      ...options.map((candidate) => el("option", { value: candidate.id, selected: selected === candidate.id }, `${candidate.name} · like ${candidate.analogue} · ${(counts.get(candidate.id) ?? 0).toLocaleString()}`))
+    )
+  );
 }
 
 function inlinePrivacyPanel(ctx: Ctx): HTMLElement {
@@ -315,9 +345,9 @@ function inlinePrivacyPanel(ctx: Ctx): HTMLElement {
   );
 }
 
-function uploadWorkflowCard(ctx: Ctx, source: "email" | "calendar", title: string, detail: string, count: number): HTMLElement {
+function uploadWorkflowCard(ctx: Ctx, source: "email" | "calendar" | "documents", title: string, detail: string, count: number): HTMLElement {
   const active = ctx.state.filters.source === source;
-  return el("button", { class: `upload-workflow-card ${active ? "active" : ""}`, type: "button", disabled: !count, onclick: () => { Object.assign(ctx.state.filters, { source, category: "all", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", status: "all", page: 0 }); ctx.rerender(); } }, el("span", { class: "upload-workflow-number mono" }, source === "email" ? "01" : "02"), el("span", { class: "upload-workflow-copy" }, el("strong", null, title), el("span", null, detail)), el("span", { class: "upload-workflow-count mono" }, count ? `${count.toLocaleString()} imported →` : "Import first"));
+  return el("button", { class: `upload-workflow-card ${active ? "active" : ""}`, type: "button", disabled: !count, onclick: () => { Object.assign(ctx.state.filters, { source, category: "all", app: "", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", status: "all", page: 0 }); ctx.rerender(); } }, el("span", { class: "upload-workflow-number mono" }, source === "email" ? "01" : source === "calendar" ? "02" : "03"), el("span", { class: "upload-workflow-copy" }, el("strong", null, title), el("span", null, detail)), el("span", { class: "upload-workflow-count mono" }, count ? `${count.toLocaleString()} imported →` : "Import first"));
 }
 
 function emailActivityFilter(summary: EmailActivitySummary, selectedDirection: EmailDirection | "all", selectedCorrespondent: string, rerenderWith: (patch: Partial<Ctx["state"]["filters"]>) => void): HTMLElement {
@@ -423,6 +453,8 @@ function rowTitle(r: SourceRecord): string {
       return r.subject || "(no subject)";
     case "calendar":
       return r.summary || "(untitled event)";
+    case "documents":
+      return r.title || r.filename;
     case "contacts":
       return r.fullName || r.emails[0] || "(contact)";
     case "messages":
@@ -440,6 +472,8 @@ function rowDetail(r: SourceRecord): string {
       return r.snippet || "No email content preview";
     case "calendar":
       return r.description || "No description";
+    case "documents":
+      return `${r.filename} · ${r.pageCount ? `${r.pageCount} page${r.pageCount === 1 ? "" : "s"} · ` : ""}${r.text.slice(0, 120)}`;
     case "contacts":
       return [r.emails[0], r.phones[0], r.org].filter(Boolean).join(" · ");
     case "messages":
@@ -470,7 +504,7 @@ function itemRow(ctx: Ctx, r: SourceRecord): HTMLElement {
   return el(
     "div",
     {
-      class: `item-row ${r.source === "email" || r.source === "calendar" ? "simple-record" : ""} ${included ? "" : "excluded"} ${s.openItemId === r.id ? "open" : ""}`,
+      class: `item-row ${r.source === "email" || r.source === "calendar" || r.source === "documents" ? "simple-record" : ""} ${included ? "" : "excluded"} ${s.openItemId === r.id ? "open" : ""}`,
       onclick: () => ctx.actions.openItem(s.openItemId === r.id ? null : r.id),
     },
     el("label", { class: "item-check", title: included ? "Selected to upload" : "Kept private", onclick: (e: Event) => e.stopPropagation() }, checkbox),
@@ -545,6 +579,8 @@ function detailDrawer(ctx: Ctx, r: SourceRecord): HTMLElement {
         ? "You can change the subject and email content. Your imported copy stays unchanged."
         : r.source === "calendar"
           ? "You can change the summary and description. Your imported copy stays unchanged."
+          : r.source === "documents"
+            ? "You can change the title or extracted text. The original document stays on this device."
           : "Change only what you want to share. Your imported copy stays unchanged."
     )
   );
@@ -610,6 +646,11 @@ export function editableFields(r: SourceRecord): EditableField[] {
       return [
         { field: "summary", label: "Summary", value: r.summary },
         { field: "description", label: "Description", value: r.description, control: "textarea", rows: 6 },
+      ];
+    case "documents":
+      return [
+        { field: "title", label: "Title", value: r.title },
+        { field: "text", label: "Extracted text", value: r.text, control: "textarea", rows: 18, hint: "This redacted text, not the original file, is included in the bundle." },
       ];
     case "contacts":
       return [...common,

@@ -2,7 +2,7 @@ import { loadUploadLog, type UploadLogEntry } from "../../platform";
 import { el, fmtDayYear } from "../components/helpers";
 import { participantKey } from "../identity";
 import type { Ctx } from "../context";
-import { defaultReviewKey } from "../../config";
+import { renderReviewAccess } from "../components/review-access";
 import { isAdminEmail } from "../../admin-access";
 import {
   loadPCAdminDetail,
@@ -36,12 +36,13 @@ function detailTitle(kind: PCAdminKind, item: Record<string, unknown>, index: nu
   const record = (item.record && typeof item.record === "object" ? item.record : item) as Record<string, unknown>;
   if (kind === "email") return String(record.subject || record.snippet || `Email ${index + 1}`);
   if (kind === "calendar") return String(record.summary || record.description || `Calendar event ${index + 1}`);
+  if (kind === "documents") return String(record.title || record.filename || `Document ${index + 1}`);
   return String(record.task_title || record.agent_request || `Task ${index + 1}`);
 }
 
 function detailSubtitle(kind: PCAdminKind, item: Record<string, unknown>): string {
   const record = (item.record && typeof item.record === "object" ? item.record : item) as Record<string, unknown>;
-  if (kind === "email" || kind === "calendar") return "";
+  if (kind === "email" || kind === "calendar" || kind === "documents") return "";
   return [record.category, Array.isArray(record.required_sources) ? record.required_sources.join(", ") : ""].filter(Boolean).join(" · ");
 }
 
@@ -120,6 +121,7 @@ function recordEditor(
   const record = item.record ?? {};
   if (kind === "email") return emailRecordEditor(record, onSave, onCancel);
   if (kind === "calendar") return calendarRecordEditor(record, onSave, onCancel);
+  if (kind === "documents") return documentRecordEditor(record, onSave, onCancel);
   const controls = new Map<string, { node: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement; original: unknown }>();
   const fields = el("div", { class: "pc-admin-edit-fields" });
   for (const [field, value] of Object.entries(record)) {
@@ -220,6 +222,18 @@ function calendarRecordEditor(
   );
 }
 
+function documentRecordEditor(
+  record: Record<string, unknown>,
+  onSave: (record: Record<string, unknown>, status: HTMLElement, saveButton: HTMLButtonElement) => Promise<void>,
+  onCancel: () => void
+): HTMLElement {
+  const title = el("input", { class: "field-input", type: "text", value: String(record.title || ""), "aria-label": "Document title" });
+  const text = el("textarea", { class: "field-input pc-admin-email-content-input", rows: 16, "aria-label": "Extracted document text" }, String(record.text || ""));
+  const status = el("p", { class: "pc-admin-edit-status", role: "status" });
+  const saveButton = el("button", { class: "btn primary small", type: "button", onclick: async () => onSave({ ...record, title: title.value, text: text.value }, status, saveButton) }, "Save changes");
+  return el("div", { class: "pc-admin-editor" }, el("div", { class: "pc-admin-edit-note" }, el("strong", null, "Title and extracted text only"), el("span", null, "The participant's original file and submitted copy stay unchanged.")), el("div", { class: "pc-admin-edit-fields pc-admin-email-edit-fields" }, labeledEmailField("Title", title), labeledEmailField("Extracted text", text)), status, el("div", { class: "pc-admin-edit-actions" }, saveButton, el("button", { class: "btn ghost small", type: "button", onclick: onCancel }, "Cancel")));
+}
+
 function emailPreview(record: Record<string, unknown>, privacyReview?: EmailPrivacyReview): HTMLElement {
   const privacy = privacyReview
     ? el(
@@ -259,9 +273,14 @@ function calendarPreview(record: Record<string, unknown>): HTMLElement {
   );
 }
 
+function documentPreview(record: Record<string, unknown>): HTMLElement {
+  return el("div", { class: "pc-admin-email-preview" }, el("dl", { class: "pc-admin-email-meta" }, el("div", null, el("dt", null, "Document"), el("dd", null, String(record.title || record.filename || "—")))), el("div", { class: "pc-admin-email-content" }, el("strong", null, "Extracted text"), el("p", null, String(record.text || "No extracted text."))));
+}
+
 function recordReadout(kind: PCAdminKind, record: Record<string, unknown>, _protectedEmails: string[], privacyReview?: EmailPrivacyReview): HTMLElement {
   if (kind === "email") return emailPreview(record, privacyReview);
   if (kind === "calendar") return calendarPreview(record);
+  if (kind === "documents") return documentPreview(record);
   return el("pre", { class: "pc-admin-json" }, JSON.stringify(record, null, 2));
 }
 
@@ -327,7 +346,7 @@ function adminViewer(reviewKey: string, adminEmail: string): HTMLElement {
       "div",
       { class: "pc-admin-head" },
       el("div", null, el("p", { class: "step-kicker mono" }, "ALLOWLISTED ADMIN"), el("h3", { id: "pc-admin-heading" }, "Uploaded data viewer")),
-      el("p", null, "Review submitted mail, calendar events, and tasks by participant.")
+      el("p", null, "Review submitted mail, calendar events, document text, and tasks by participant.")
     ),
     el("p", { class: "empty-note pc-admin-loading" }, "Loading completed bundles…")
   );
@@ -345,6 +364,7 @@ function hydrateAdmin(panel: HTMLElement, summary: PCAdminSummary, reviewKey: st
     countTile(summary.totals.bundles, "bundles"),
     countTile(summary.totals.email, "emails"),
     countTile(summary.totals.calendar, "calendar events"),
+    countTile(summary.totals.documents ?? 0, "documents"),
     countTile(summary.totals.tasks, "tasks")
   );
   const users = el("div", { class: "pc-admin-users" });
@@ -355,7 +375,7 @@ function hydrateAdmin(panel: HTMLElement, summary: PCAdminSummary, reviewKey: st
         { class: "pc-admin-user", type: "button", dataset: { participantId: user.participant_id } },
         el("strong", null, user.name),
         el("small", null, user.email || user.participant_id),
-        el("span", { class: "mono" }, `${user.email_count} mail · ${user.calendar_count} calendar · ${user.task_count} tasks`)
+        el("span", { class: "mono" }, `${user.email_count} mail · ${user.calendar_count} calendar · ${user.document_count ?? 0} documents · ${user.task_count} tasks`)
       )
     );
   }
@@ -373,7 +393,7 @@ function hydrateAdmin(panel: HTMLElement, summary: PCAdminSummary, reviewKey: st
     viewer.replaceChildren(el("p", { class: "empty-note" }, `Loading ${kind}…`));
     try {
       const detail = await loadPCAdminDetail(reviewKey, adminEmail, bundle.bundle_id, kind, page, query);
-      const kindLabel = kind === "email" ? "emails" : kind === "calendar" ? "calendar events" : "tasks";
+      const kindLabel = kind === "email" ? "emails" : kind === "calendar" ? "calendar events" : kind === "documents" ? "documents" : "tasks";
       const queryInput = el("input", { class: "field-input", type: "search", value: query, placeholder: `Search this bundle's ${kindLabel}…`, "aria-label": `Search ${kindLabel}` });
       const searchButton = el("button", { class: "btn small", type: "button", onclick: () => void openDetail(bundle, kind, 0, queryInput.value) }, "Search");
       const closeButton = el("button", { class: "btn ghost small", type: "button", onclick: () => { viewer.hidden = true; viewer.replaceChildren(); active = null; } }, "Close viewer");
@@ -427,10 +447,11 @@ function hydrateAdmin(panel: HTMLElement, summary: PCAdminSummary, reviewKey: st
         "article",
         { class: "pc-admin-bundle" },
         el("div", { class: "pc-admin-bundle-main" }, el("strong", null, bundle.participant_name), el("small", null, bundle.participant_email || bundle.participant_id), el("span", { class: "mono" }, fmtDayYear(bundle.created_at))),
-        el("div", { class: "pc-admin-bundle-counts mono" }, el("span", null, `${bundle.email_count} mail`), el("span", null, `${bundle.calendar_count} calendar`), el("span", null, `${bundle.task_count} tasks`)),
+        el("div", { class: "pc-admin-bundle-counts mono" }, el("span", null, `${bundle.email_count} mail`), el("span", null, `${bundle.calendar_count} calendar`), el("span", null, `${bundle.document_count ?? 0} documents`), el("span", null, `${bundle.task_count} tasks`)),
         el("div", { class: "pc-admin-bundle-actions" },
           el("button", { class: "btn ghost small", type: "button", disabled: !bundle.email_count, onclick: () => void openDetail(bundle, "email") }, "View mail"),
           el("button", { class: "btn ghost small", type: "button", disabled: !bundle.calendar_count, onclick: () => void openDetail(bundle, "calendar") }, "View calendar"),
+          el("button", { class: "btn ghost small", type: "button", disabled: !(bundle.document_count ?? 0), onclick: () => void openDetail(bundle, "documents") }, "View documents"),
           el("button", { class: "btn ghost small", type: "button", disabled: !bundle.task_count, onclick: () => void openDetail(bundle, "tasks") }, "View tasks")
         )
       )
@@ -452,7 +473,7 @@ function hydrateAdmin(panel: HTMLElement, summary: PCAdminSummary, reviewKey: st
 
 export function renderProgress(ctx: Ctx): HTMLElement {
   const s = ctx.state;
-  const admin = Boolean(s.identity && isAdminEmail(s.identity.email) && defaultReviewKey());
+  const admin = Boolean(s.identity && isAdminEmail(s.identity.email) && s.reviewKey);
   const root = el("section", { class: `screen ${admin ? "wide pc-admin-screen" : "narrow"}` });
   root.append(
     el("h2", { class: "display" }, "Your submissions"),
@@ -488,7 +509,8 @@ export function renderProgress(ctx: Ctx): HTMLElement {
     }
   }
 
-  const reviewKey = defaultReviewKey();
+  if (s.identity && isAdminEmail(s.identity.email) && !s.reviewKey) root.append(renderReviewAccess(ctx));
+  const reviewKey = s.reviewKey;
   if (s.identity && isAdminEmail(s.identity.email) && reviewKey) root.append(adminViewer(reviewKey, s.identity.email));
 
   root.append(

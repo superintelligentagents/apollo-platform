@@ -1,4 +1,5 @@
-import { normalizeTrajectoryJudgment, saveTrajectoryClaimSnapshot, seedTrajectoryJudgment, setTrajectoryOverallOutcome, trajectoryRelease, trajectorySubmit, type HumanRubricVerdict, type TrajectoryOverallOutcome } from "../../review-client";
+import { inlineDiff, lineageRubricFor, priorRubricFor, priorRubricBlock, rubricLineageBlock } from "../components/trajectory-history";
+import { rememberTrajectorySkip, normalizeTrajectoryJudgment, saveTrajectoryClaimSnapshot, seedTrajectoryJudgment, setTrajectoryOverallOutcome, trajectoryRelease, trajectorySubmit, type HumanRubricVerdict, type TrajectoryOverallOutcome } from "../../review-client";
 import { el } from "../components/helpers";
 import type { Ctx } from "../context";
 
@@ -40,7 +41,10 @@ export function renderTrajectoryEdit(ctx: Ctx): HTMLElement {
   const drawRubric = () => {
     const rubric = run.rubrics[rubricIndex];
     const human = judgment.rubrics[rubricIndex];
-    rubricJudge.replaceChildren(el("div", { class: "pc-judge-head" }, el("h3", null, rubric.rubric_id), el("span", { class: "muted small" }, "Recorded run only")), el("p", { class: "pc-rubric-requirement" }, rubric.requirement), ...(rubric.verification ? [el("details", { class: "pc-rubric-verification" }, el("summary", null, "How to verify"), el("p", null, rubric.verification))] : []), el("span", { class: "field-label" }, "Was this rubric satisfied?"), choices(() => human.human_verdict, (value) => { human.human_verdict = value; }), notes(human.notes, (value) => { human.notes = value; }));
+    const lineage = lineageRubricFor(claim.taskLineage, rubric, rubricIndex, run.rubrics.length);
+    const prior = claim.priorGrades?.[0];
+    const priorRubric = prior ? priorRubricFor(prior, rubric, rubricIndex, run.rubrics.length) : null;
+    rubricJudge.replaceChildren(el("div", { class: "pc-judge-head" }, el("h3", null, rubric.rubric_id), el("span", { class: "muted small" }, "Recorded run only")), el("p", { class: "pc-rubric-requirement" }, rubric.requirement), ...(rubric.verification ? [el("details", { class: "pc-rubric-verification" }, el("summary", null, "How to verify"), el("p", null, rubric.verification))] : []), ...(lineage?.changed ? [rubricLineageBlock(lineage, rubric)] : []), ...(prior && priorRubric ? [priorRubricBlock(prior, priorRubric, rubric)] : []), el("span", { class: "field-label" }, "Was this rubric satisfied?"), choices(() => human.human_verdict, (value) => { human.human_verdict = value; }), notes(human.notes, (value) => { human.notes = value; }));
   };
   const drawOverall = () => {
     const outcomeChoices: readonly [Exclude<TrajectoryOverallOutcome, "">, string, string][] = [
@@ -85,7 +89,7 @@ export function renderTrajectoryEdit(ctx: Ctx): HTMLElement {
 
   rail.append(el("div", { class: "pc-rubric-cycle" }, el("button", { class: "icon-btn", type: "button", title: "Previous rubric (W)", onclick: () => moveRubric(-1) }, "↑"), rubricPosition, el("button", { class: "icon-btn", type: "button", title: "Next rubric (S)", onclick: () => moveRubric(1) }, "↓")), rubricTrack);
   const evidence = el("main", { class: "pc-trajectory-evidence" }, el("div", { class: "pc-pane-head" }, el("strong", null, "Recorded browser path"), el("span", { class: "pc-step-controls" }, el("button", { class: "icon-btn", type: "button", onclick: () => moveStep(-1) }, "←"), stepLabel, el("button", { class: "icon-btn", type: "button", onclick: () => moveStep(1) }, "→"))), el("div", { class: "pc-trajectory-shot-stage" }, image, noImage), el("details", { class: "pc-step-detail" }, el("summary", null, "Action and agent response"), el("span", { class: "field-label" }, "Action"), action, el("span", { class: "field-label" }, "Response"), response), stepTrack);
-  const skip = el("button", { class: "btn ghost", type: "button", onclick: async () => { (skip as HTMLButtonElement).disabled = true; await trajectoryRelease(state.reviewKey!, claim).catch(() => {}); ctx.actions.endTrajectoryReview("Run released back to the queue."); } }, "Skip & release") as HTMLButtonElement;
+  const skip = el("button", { class: "btn ghost", type: "button", onclick: async () => { (skip as HTMLButtonElement).disabled = true; try { await trajectoryRelease(state.reviewKey!, claim); rememberTrajectorySkip(claim.manifestKey); } catch (error) { skip.disabled = false; ctx.actions.notifyError(error instanceof Error ? error.message : String(error)); return; } ctx.actions.endTrajectoryReview("Run released back to the queue."); } }, "Skip & release") as HTMLButtonElement;
   const judge = el("aside", { class: "pc-trajectory-judge" }, el("div", { class: "pc-pane-head" }, el("strong", null, "Your grade"), el("span", { class: "muted small" }, "Independent review")), rubricJudge, overallJudge, el("div", { class: "pc-trajectory-actions" }, skip, submit));
   submit.onclick = async () => {
     if (!complete()) return;
@@ -121,7 +125,7 @@ export function renderTrajectoryEdit(ctx: Ctx): HTMLElement {
     event.preventDefault();
   };
   drawStep(); drawAll();
-  root.append(el("header", { class: "pc-trajectory-head" }, el("div", null, el("p", { class: "eyebrow mono" }, "HUMAN TRAJECTORY GRADE"), el("h2", { class: "display" }, "Grade agent trajectory"), el("p", { class: "muted small mono" }, run.task_id)), el("div", { class: "pc-trajectory-meta" }, run.source.agent ? el("span", { class: "badge" }, run.source.agent) : null, run.source.model ? el("span", { class: "badge" }, run.source.model) : null, el("span", { class: "badge" }, `${run.steps.length} steps`))), el("div", { class: "pc-shortcuts" }, shortcut("← / →", "steps"), shortcut("W / S", "rubrics"), shortcut("P / O", "pass / fail"), shortcut("U", "unclear"), shortcut("⇧ Enter", "submit")), el("details", { class: "pc-task-reference" }, el("summary", null, el("strong", null, "Task prompt"), el("span", { class: "muted small" }, "Reference only — do not grade the prompt")), el("p", null, run.task_prompt)), rail, el("div", { class: "pc-trajectory-workbench" }, evidence, judge));
+  root.append(el("header", { class: "pc-trajectory-head" }, el("div", null, el("p", { class: "eyebrow mono" }, "HUMAN TRAJECTORY GRADE"), el("h2", { class: "display" }, "Grade agent trajectory"), el("p", { class: "muted small mono" }, run.task_id)), el("div", { class: "pc-trajectory-meta" }, run.source.agent ? el("span", { class: "badge" }, run.source.agent) : null, run.source.model ? el("span", { class: "badge" }, run.source.model) : null, el("span", { class: "badge" }, `${run.steps.length} steps`))), el("div", { class: "pc-shortcuts" }, shortcut("← / →", "steps"), shortcut("W / S", "rubrics"), shortcut("P / O", "pass / fail"), shortcut("U", "unclear"), shortcut("⇧ Enter", "submit")), el("details", { class: "pc-task-reference" }, el("summary", null, el("strong", null, "Task prompt"), el("span", { class: "muted small" }, "Reference only — do not grade the prompt")), el("p", null, run.task_prompt), ...(claim.taskLineage?.request.changed ? [el("details", null, el("summary", null, "Changes since the original request"), el("p", null, inlineDiff(claim.taskLineage.request.original, run.task_prompt)))] : [])), rail, el("div", { class: "pc-trajectory-workbench" }, evidence, judge));
   requestAnimationFrame(() => root.focus({ preventScroll: true }));
   return root;
 }

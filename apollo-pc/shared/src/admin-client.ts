@@ -1,7 +1,7 @@
 import { presignEndpoint } from "./config";
 import type { EmailPrivacyReview } from "./types";
 
-export type PCAdminKind = "email" | "calendar" | "tasks";
+export type PCAdminKind = "email" | "calendar" | "documents" | "tasks";
 
 export interface PCAdminBundle {
   bundle_id: string;
@@ -11,6 +11,7 @@ export interface PCAdminBundle {
   participant_email: string;
   email_count: number;
   calendar_count: number;
+  document_count?: number;
   task_count: number;
   edited_count: number;
   masked_count: number;
@@ -23,11 +24,12 @@ export interface PCAdminUser {
   bundles: number;
   email_count: number;
   calendar_count: number;
+  document_count?: number;
   task_count: number;
 }
 
 export interface PCAdminSummary {
-  totals: { bundles: number; email: number; calendar: number; tasks: number };
+  totals: { bundles: number; email: number; calendar: number; documents?: number; tasks: number };
   users: PCAdminUser[];
   bundles: PCAdminBundle[];
 }
@@ -96,7 +98,7 @@ export async function savePCAdminRecord(
   reviewKey: string,
   adminEmail: string,
   bundleId: string,
-  kind: "email" | "calendar",
+  kind: "email" | "calendar" | "documents",
   itemId: string,
   finalRecord: Record<string, unknown>,
   baseRevisionCount: number

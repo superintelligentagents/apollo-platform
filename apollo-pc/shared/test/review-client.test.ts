@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildReviewedTask, rejectionReviewBlock, reviewReject, seedRubrics, upgradeRubrics } from "../src/review-client";
+import { authorEdit, authorAmend, authorSignoff, myTaskPage, reviewReturn, reviewClaim, trajectoryClaim, sessionSkips, rememberReviewSkip, rememberTrajectorySkip, buildReviewedTask, rejectionReviewBlock, reviewReject, seedRubrics, upgradeRubrics } from "../src/review-client";
 import type { ReviewLongTask } from "../src/types";
 
 const task = {
@@ -70,5 +70,48 @@ describe("PC review result", () => {
     expect(body.reviewer_pid).toBe("dana");
     expect(body.review).toEqual(rejectionReviewBlock(rubrics));
     expect(body.review.rubrics[0]).not.toHaveProperty("reviewer");
+  });
+});
+
+
+describe("PC parity contracts", () => {
+  afterEach(() => { vi.unstubAllGlobals(); sessionSkips.review.length = 0; sessionSkips.trajectory.length = 0; });
+  it("preserves rubric order and insertion while keeping source provenance", () => {
+    const rows = seedRubrics(task);
+    const added = { ...rows[0], sourceIndex: null, title: "First", text: "Inserted before the source step", original: null };
+    const result = buildReviewedTask(task, { title: "T", request: "R", difficulty: "high", rubrics: [added, rows[0]] }) as any;
+    expect(result.task.steps.map((s: any) => s.description)).toEqual([added.text, rows[0].text]);
+    expect(result.task.steps.map((s: any) => s.order)).toEqual([0, 1]);
+    expect(result.review.rubrics[1].source_index).toBe(0);
+    expect(task.task.steps).toHaveLength(1);
+  });
+  it("routes every author mutation and return to the PC API", async () => {
+    const fetcher = vi.fn(async () => ({ ok: true, json: async () => ({ ok: true, items: [], source_total: 250, offset: 200, limit: 50 }) }));
+    vi.stubGlobal("fetch", fetcher);
+    const page = await myTaskPage("key", "author", 200, 50);
+    expect(page.source_total).toBe(250);
+    const payload = { task_title: "T", agent_request: "R", difficulty: "high", success_criteria: [], steps: [], must_visit_or_reach: [], required_outputs: [], notes: null };
+    await authorEdit("key", "author", "source", payload, "opened", "appeal reason");
+    await authorAmend("key", "author", "source", payload, "opened");
+    await authorSignoff("key", "author", "source", "opened");
+    await reviewReturn("key", "Reviewer", { subKey: "source", token: "lock", task, claimedAtMs: 0, lockTtlMs: 1 }, "Return reason", "reviewer");
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(calls.map(([url]) => new URL(url).hostname)).toEqual(Array(5).fill("t1ynh195m1.execute-api.us-east-1.amazonaws.com"));
+    expect(JSON.parse(String(calls[1][1].body))).toMatchObject({ participant_id: "author", appeal_reason: "appeal reason", edit_started_at: "opened" });
+    expect(JSON.parse(String(calls[4][1].body))).toMatchObject({ token: "lock", reviewer_pid: "reviewer" });
+  });
+  it("keeps skips bounded and carries grading history from AWS", async () => {
+    for (let i = 0; i < 60; i++) rememberReviewSkip(`task-${i}`);
+    rememberTrajectorySkip("manifest-old");
+    const fetcher = vi.fn(async (url: string) => ({ ok: true, json: async () => url.endsWith("/trajectory/claim") ? { manifest_key: "manifest", token: "lock", run: {}, task_lineage: { changed: true }, prior_grades: [{ run_id: "previous" }] } : {} }));
+    vi.stubGlobal("fetch", fetcher);
+    await reviewClaim("key", "Reviewer", "pid");
+    const claim = await trajectoryClaim("key", "Reviewer", "pid");
+    expect(sessionSkips.review).toHaveLength(50);
+    expect(claim?.taskLineage).toEqual({ changed: true });
+    expect(claim?.priorGrades?.[0].run_id).toBe("previous");
+    const calls = fetcher.mock.calls as unknown as [string, RequestInit][];
+    expect(JSON.parse(String(calls[0][1].body)).skip_keys).toEqual(sessionSkips.review);
+    expect(JSON.parse(String(calls[1][1].body)).skip_keys).toEqual(["manifest-old"]);
   });
 });

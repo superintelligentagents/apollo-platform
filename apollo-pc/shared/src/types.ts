@@ -5,7 +5,7 @@
 // (redact.ts) — the participant reads and edits their real data; only the
 // redacted shape ever leaves the browser.
 
-export type SourceKind = "email" | "calendar" | "contacts" | "orders" | "messages" | "transactions";
+export type SourceKind = "email" | "calendar" | "documents" | "contacts" | "orders" | "messages" | "transactions";
 
 export type Address = { name: string; email: string };
 
@@ -93,9 +93,21 @@ export type TransactionRecord = BaseRecord & {
   relatedRecordIds: string[];
 };
 
+export type DocumentRecord = BaseRecord & {
+  source: "documents";
+  filename: string;
+  title: string;
+  mimeType: string;
+  size: number;
+  text: string;
+  pageCount: number | null;
+  bodyTruncated: boolean;
+};
+
 export type SourceRecord =
   | EmailRecord
   | CalendarRecord
+  | DocumentRecord
   | ContactRecord
   | MessageRecord
   | OrderRecord
@@ -155,12 +167,15 @@ export type PCTaskCategory =
 export type PCTaskStep = { order: number; title: string; description: string };
 
 export type PCTask = {
+  metadata?: { region?: string; subjects?: string[] };
   task_id: string;
   category: PCTaskCategory;
   task_title: string;
   agent_request: string;
+  difficulty?: "low" | "medium" | "high";
   steps: PCTaskStep[];
   success_criteria: string[];
+  required_outputs?: string[];
   required_sources: SourceKind[];
   referenced_record_ids: string[]; // grounding — the record-picker output
   expected_answer: string | null; // participant-supplied ground truth

@@ -1,3 +1,4 @@
+import { metadataFields } from "../components/metadata";
 import { MIN_STEP_LENGTH, PC_TEMPLATES } from "../../templates";
 import type { SourceRecord } from "../../types";
 import { el } from "../components/helpers";
@@ -178,14 +179,40 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
     draft.notes = notes.value;
     ctx.autosave();
   });
+  const difficulty = el(
+    "select",
+    { class: "field-input", "aria-label": "Task difficulty" },
+    el("option", { value: "low" }, "Low"),
+    el("option", { value: "medium" }, "Medium"),
+    el("option", { value: "high" }, "High")
+  ) as HTMLSelectElement;
+  difficulty.value = draft.difficulty;
+  difficulty.addEventListener("change", () => {
+    draft.difficulty = difficulty.value as typeof draft.difficulty;
+    ctx.autosave();
+  });
+  const requiredOutputs = el("textarea", {
+    class: "field-input",
+    rows: "3",
+    placeholder: "One required result per line",
+    "aria-label": "Required outputs",
+  }) as HTMLTextAreaElement;
+  requiredOutputs.value = draft.requiredOutputs.join("\n");
+  requiredOutputs.addEventListener("input", () => {
+    draft.requiredOutputs = requiredOutputs.value.split("\n").map((value) => value.trim()).filter(Boolean);
+    ctx.autosave();
+  });
   form.append(
     el(
       "details",
       { class: "task-options", open: !!template?.requiresExpectedAnswer },
       el("summary", null, template?.requiresExpectedAnswer ? "Expected answer" : "More task details"),
       field("TASK TITLE (optional)", title),
+      field("DIFFICULTY", difficulty),
+      field("REQUIRED OUTPUTS (optional)", requiredOutputs),
       field(template?.requiresExpectedAnswer ? "EXPECTED ANSWER (required)" : "EXPECTED ANSWER (optional)", expected, s.formErrors.expected),
-      field("NOTES (optional)", notes)
+      field("NOTES (optional)", notes),
+      metadataFields(ctx, (key) => el("p", { class: "field-error" }, s.formErrors[key] || ""))
     )
   );
 
@@ -214,7 +241,7 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
     el("div", { class: "inspiration-head" },
       el("p", { class: "step-kicker mono" }, "YOUR DATA"),
       el("h3", null, "Find task inspiration"),
-      el("p", { class: "field-hint" }, "Browse selected mail and calendar. Check a record to attach it.")
+      el("p", { class: "field-hint" }, "Browse selected mail, calendar events, and document text. Check a record to attach it.")
     ),
     el(
       "div",
@@ -224,10 +251,11 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
   );
 
   const selectedRecords = [...s.records.values()].filter((r) =>
-    (r.source === "email" || r.source === "calendar") && ctx.actions.isIncluded(r)
+    (r.source === "email" || r.source === "calendar" || r.source === "documents") && ctx.actions.isIncluded(r)
   );
   const emailCount = selectedRecords.filter((r) => r.source === "email").length;
-  const calendarCount = selectedRecords.length - emailCount;
+  const calendarCount = selectedRecords.filter((r) => r.source === "calendar").length;
+  const documentCount = selectedRecords.filter((r) => r.source === "documents").length;
   const setPickerSource = (source: typeof s.pickerSource) => {
     s.pickerSource = source;
     s.pickerPage = 0;
@@ -239,6 +267,7 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
     pickerTab("All", selectedRecords.length, s.pickerSource === "all", () => setPickerSource("all")),
     pickerTab("Mail", emailCount, s.pickerSource === "email", () => setPickerSource("email")),
     pickerTab("Calendar", calendarCount, s.pickerSource === "calendar", () => setPickerSource("calendar")),
+    pickerTab("Documents", documentCount, s.pickerSource === "documents", () => setPickerSource("documents")),
     pickerTab("Selected", draft.referencedRecordIds.length, s.pickerSource === "selected", () => setPickerSource("selected"))
   ));
 
@@ -289,7 +318,7 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
       el("label", { class: "picker-attach", title: on ? "Attached to this task" : "Attach to this task" },
         el("input", { type: "checkbox", checked: on, "aria-label": `${on ? "Detach" : "Attach"} ${pickerTitle(r)}`, onchange: () => ctx.actions.toggleTaskRecord(r.id) })
       ),
-      el("span", { class: "item-kind mono" }, r.source === "email" ? "MAIL" : "CAL"),
+      el("span", { class: "item-kind mono" }, r.source === "email" ? "MAIL" : r.source === "calendar" ? "CAL" : "DOC"),
       el(
         "button",
         { class: "picker-open-button", type: "button", "aria-expanded": String(open), onclick: toggleOpen },
@@ -302,6 +331,8 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
       const content = el("div", { class: "picker-record-content" });
       if (r.source === "calendar") {
         content.append(el("p", null, r.description || "No description."));
+      } else if (r.source === "documents") {
+        content.append(el("p", null, r.text || "No extracted text."));
       } else if (s.pickerOpenBody !== null) {
         content.append(el("p", null, s.pickerOpenBody || "No email content."));
       } else {
@@ -323,7 +354,7 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
       row
     );
   }
-  if (!matches.length) list.append(el("p", { class: "empty-note" }, s.pickerSource === "selected" ? "No records attached to this task yet." : selectedRecords.length ? "No records match this filter." : "Select mail or calendar records for upload to see them here."));
+  if (!matches.length) list.append(el("p", { class: "empty-note" }, s.pickerSource === "selected" ? "No records attached to this task yet." : selectedRecords.length ? "No records match this filter." : "Select mail, calendar, or document records for upload to see them here."));
   picker.append(list);
   if (pickerPages > 1) picker.append(el("div", { class: "picker-pager" },
     el("button", { class: "btn ghost small", type: "button", disabled: pickerPage === 0, onclick: () => { s.pickerPage = pickerPage - 1; s.pickerOpenId = null; s.pickerOpenBody = null; ctx.rerender(); } }, "← Previous"),
@@ -343,12 +374,14 @@ function pickerTab(label: string, count: number, active: boolean, onclick: () =>
 function pickerSearchText(r: SourceRecord): string {
   if (r.source === "email") return `${r.subject} ${r.snippet}`.toLowerCase();
   if (r.source === "calendar") return `${r.summary} ${r.description}`.toLowerCase();
+  if (r.source === "documents") return `${r.filename} ${r.title} ${r.text}`.toLowerCase();
   return "";
 }
 
 function pickerPreview(r: SourceRecord): string {
   if (r.source === "email") return r.snippet || "No email content preview";
   if (r.source === "calendar") return r.description || "No description";
+  if (r.source === "documents") return r.text.slice(0, 180) || "No extracted text";
   return "";
 }
 
@@ -358,6 +391,8 @@ function pickerTitle(r: SourceRecord): string {
       return r.subject || "(no subject)";
     case "calendar":
       return r.summary || "(untitled event)";
+    case "documents":
+      return r.title || r.filename;
     case "contacts":
       return r.fullName || r.emails[0] || "(contact)";
     case "messages":

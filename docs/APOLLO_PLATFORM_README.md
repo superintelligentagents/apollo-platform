@@ -41,6 +41,9 @@ python3 -m unittest discover -s scripts/llm_feasibility -p 'test_*.py'
 python3 -m unittest discover -s scripts/trajectory_review -p 'test_*.py'
 ```
 
+Pull requests that touch Apollo PC, its shared backend, or its trajectory
+workers run the same checks in `.github/workflows/apollo-pc-ci.yml`.
+
 ## Local web development
 
 Start the local backend once:
@@ -97,6 +100,15 @@ python3 scripts/trajectory_review/run.py \
   --queue pc --num-workers 8 --prod
 ```
 
+Before recording an Apollo PC trajectory, the OSWorld bridge also requires one
+private, task-matched context setup file through `--pc-context-config-dir`.
+This prevents PC tasks from running in an empty browser without their redacted
+email/calendar/document context. `prepare_pc_context.mjs` verifies the uploaded part
+hashes and includes only records explicitly attached to the task. Run it with a
+short-lived role using `scripts/osworld_runner/aws/pc-context-reader-policy.json`.
+The publication role deliberately cannot read PC upload bundles.
+See [`../scripts/osworld_runner/README.md`](../scripts/osworld_runner/README.md).
+
 `--plan --prod` validates assignments and AWS access without model calls or writes. The publisher rejects cross-queue task IDs before upload.
 
 ## Deploy the backend
@@ -108,6 +120,12 @@ python3 scripts/trajectory_review/run.py \
 3. Replace only `lambda_presign.js` in that package and re-zip it.
 4. Update `journeys-presign`, wait for success, then update `journeys-pc-presign` with the identical zip.
 5. Verify both functions have the same `CodeSha256` but different roles, `APP_SCOPE`, and `REVIEW_PREFIX` values.
+
+`scripts/deploy_backend.sh` performs steps 2-5 and refuses to ship a package
+that lost files or its bundled dependencies; `--plan` reports the live state and
+the rebuilt package without deploying. It needs console credentials
+(`aws login --profile root`) -- the OSWorld runner user cannot call Lambda.
+Steps 6 and 7 stay manual.
 6. Verify `/presign` rejects a valid PC-shaped request on the V2 API and rejects a valid V2-shaped request on the PC API.
 7. Run `scripts/e2e/validate-cross-app-review.mjs`; it adds disposable audited tasks, proves only the intended queue changes, and removes every created object.
 
@@ -129,6 +147,13 @@ unclaimable. This optimization never writes task, final-gold, queue, or audit
 objects in S3.
 
 The local Express adapter in `backend/server.js` mirrors upload validation but is not the production review service.
+
+Apollo PC's `#/tasks` discovery screen ranks the complete MyPCBench app catalog
+from selected records entirely in the browser. Every recommendation links to an
+exact `_autologin=1` route and seeds a complete task draft with the matching
+record IDs. The catalog and deterministic matching rules live in
+`apollo-pc/shared/src/app-catalog.ts`; no email, calendar, or document content is
+sent to a recommendation service.
 
 ## Deploy a web client
 
@@ -170,7 +195,7 @@ V2 builds must use the V2 presign endpoint/review key. PC builds must use the PC
 
 ## Security and privacy
 
-The repository may contain source and synthetic fixtures only. It must not contain participant exports, email/calendar records, browsing history, model-run screenshots, browser logs, production API keys, reviewer/reporting tokens, model-provider keys, or extension signing keys.
+The repository may contain source and synthetic fixtures only. It must not contain participant exports, email/calendar/document records, browsing history, model-run screenshots, browser logs, production API keys, reviewer/reporting tokens, model-provider keys, or extension signing keys.
 
 PC uploads are privacy-audited client-side, but the server still treats them as sensitive. Review task sidecars contain authored task text only—no identity, raw records, aliases, referenced record IDs, or expected answers. Full PC bundles never enter the task-review queue.
 

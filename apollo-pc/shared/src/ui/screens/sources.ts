@@ -2,11 +2,13 @@ import { fmtBytes, fmtDayYear, el } from "../components/helpers";
 import { SOURCE_CARDS } from "../../sources/registry";
 import type { EmailRecord, SourceKind } from "../../types";
 import type { Ctx } from "../context";
+import type { Screen } from "../context";
 
 export function renderSources(ctx: Ctx): HTMLElement {
   const email = [...ctx.state.records.values()].filter((record) => record.source === "email" || record.source === "orders").length;
   const calendar = [...ctx.state.records.values()].filter((record) => record.source === "calendar").length;
-  return el("section", { class: "screen narrow workflow-hub" }, el("p", { class: "step-kicker mono" }, "STEP 1"), el("h2", { class: "display" }, "Import data"), el("p", { class: "screen-sub" }, "Choose a source. Import stays on this device."), hubLink("Mail", email ? `${email.toLocaleString()} records imported` : "Gmail Takeout or .eml", () => ctx.actions.goto("import-mail")), hubLink("Calendar", calendar ? `${calendar.toLocaleString()} events imported` : ".ics calendar file", () => ctx.actions.goto("import-calendar")));
+  const documents = [...ctx.state.records.values()].filter((record) => record.source === "documents").length;
+  return el("section", { class: "screen narrow workflow-hub" }, el("p", { class: "step-kicker mono" }, "STEP 1"), el("h2", { class: "display" }, "Import data"), el("p", { class: "screen-sub" }, "Choose a source. Import and recommendation analysis stay on this device."), hubLink("Mail", email ? `${email.toLocaleString()} records imported` : "Gmail Takeout or .eml", () => ctx.actions.goto("import-mail")), hubLink("Calendar", calendar ? `${calendar.toLocaleString()} events imported` : ".ics calendar file", () => ctx.actions.goto("import-calendar")), hubLink("Documents", documents ? `${documents.toLocaleString()} documents imported` : "PDF, Word, or text", () => ctx.actions.goto("import-documents")));
 }
 
 function hubLink(title: string, detail: string, onclick: () => void): HTMLElement {
@@ -21,7 +23,11 @@ export function renderCalendarImport(ctx: Ctx): HTMLElement {
   return renderImport(ctx, "calendar");
 }
 
-function renderImport(ctx: Ctx, onlyKind?: "email" | "calendar"): HTMLElement {
+export function renderDocumentImport(ctx: Ctx): HTMLElement {
+  return renderImport(ctx, "documents");
+}
+
+function renderImport(ctx: Ctx, onlyKind?: "email" | "calendar" | "documents"): HTMLElement {
   const s = ctx.state;
 
   const floorSelect = el(
@@ -48,13 +54,13 @@ function renderImport(ctx: Ctx, onlyKind?: "email" | "calendar"): HTMLElement {
   return el(
     "section",
     { class: "screen" },
-    el("h2", { class: "display" }, onlyKind === "email" ? "Import mail" : onlyKind === "calendar" ? "Import calendar" : "Import data"),
+    el("h2", { class: "display" }, onlyKind === "email" ? "Import mail" : onlyKind === "calendar" ? "Import calendar" : onlyKind === "documents" ? "Import documents" : "Import data"),
     el(
       "p",
       { class: "screen-sub" },
-      onlyKind === "email" ? "Choose a Gmail Takeout .mbox or individual .eml files. Parsing stays in this browser." : onlyKind === "calendar" ? "Choose one or more .ics calendar exports. Parsing stays in this browser." : "Import Mail and Calendar exports here. They are parsed locally in this browser."
+      onlyKind === "email" ? "Choose a Gmail Takeout .mbox or individual .eml files. Parsing stays in this browser." : onlyKind === "calendar" ? "Choose one or more .ics calendar exports. Parsing stays in this browser." : onlyKind === "documents" ? "Choose PDF, Word, or text files. Apollo extracts text locally; the original file never leaves this browser." : "Import Mail, Calendar, and documents here. They are parsed locally in this browser."
     ),
-    el("div", { class: "filter-bar" }, el("span", { class: "field-label" }, "Date window"), floorSelect),
+    onlyKind === "documents" ? null : el("div", { class: "filter-bar" }, el("span", { class: "field-label" }, "Date window"), floorSelect),
     el(
       "div",
       { class: "source-cards" },
@@ -68,12 +74,12 @@ function renderImport(ctx: Ctx, onlyKind?: "email" | "calendar"): HTMLElement {
             "div",
             null,
             el("p", { class: "upload-band-title" }, `${imported.toLocaleString()} records imported · ${selected.toLocaleString()} currently selected`),
-            el("p", { class: "upload-band-sub" }, "Next: go through them and choose exactly what uploads.")
+            el("p", { class: "upload-band-sub" }, onlyKind === "documents" ? "Next: inspect extracted text and choose exactly what uploads." : "Next: go through them and choose exactly what uploads.")
           ),
           el(
             "div",
             { class: "upload-band-actions" },
-            el("button", { class: "btn primary large", type: "button", onclick: () => ctx.actions.goto(onlyKind === "calendar" ? "upload-calendar" : onlyKind === "email" ? "upload-email" : "items") }, onlyKind === "calendar" ? "Choose calendar events →" : onlyKind === "email" ? "Choose email data →" : "Choose what to upload →")
+            el("button", { class: "btn primary large", type: "button", onclick: () => ctx.actions.goto(uploadScreen(onlyKind)) }, onlyKind === "calendar" ? "Choose calendar events →" : onlyKind === "email" ? "Choose email data →" : onlyKind === "documents" ? "Review document text →" : "Choose what to upload →")
           )
         )
       : null
@@ -136,7 +142,7 @@ function sourceCard(ctx: Ctx, kind: SourceKind): HTMLElement {
                 s.filters.source = kind;
                 s.filters.status = "all";
                 s.filters.page = 0;
-                ctx.actions.goto(kind === "calendar" ? "upload-calendar" : "upload-email");
+                ctx.actions.goto(uploadScreen(kind));
               },
             },
             `Choose from these ${records.length.toLocaleString()} →`
@@ -197,7 +203,7 @@ function sourceCard(ctx: Ctx, kind: SourceKind): HTMLElement {
       el(
         "button",
         { class: `btn ${records.length ? "" : "primary"}`, type: "button", disabled: !!s.importing, onclick: () => input.click() },
-        records.length ? "Import more files" : `Import ${meta.parser!.accept.join(" / ")}`
+        records.length ? "Import more files" : kind === "documents" ? "Import document files" : `Import ${meta.parser!.accept.join(" / ")}`
       ),
       records.length
         ? el(
@@ -209,7 +215,7 @@ function sourceCard(ctx: Ctx, kind: SourceKind): HTMLElement {
                 s.filters.source = kind;
                 s.filters.status = "all";
                 s.filters.page = 0;
-                ctx.actions.goto(kind === "calendar" ? "upload-calendar" : "upload-email");
+                ctx.actions.goto(uploadScreen(kind));
               },
             },
             `Choose from these ${records.length.toLocaleString()} →`
@@ -221,7 +227,7 @@ function sourceCard(ctx: Ctx, kind: SourceKind): HTMLElement {
   if (card) {
     const bits: string[] = [];
     if (card.stats.dateRange) bits.push(`${fmtDayYear(card.stats.dateRange.min)} – ${fmtDayYear(card.stats.dateRange.max)}`);
-    if (card.stats.itemsSkipped) bits.push(`${card.stats.itemsSkipped.toLocaleString()} outside window`);
+    if (card.stats.itemsSkipped) bits.push(`${card.stats.itemsSkipped.toLocaleString()} ${kind === "documents" ? "skipped" : "outside window"}`);
     if (card.stats.attachmentsStripped) bits.push(`${card.stats.attachmentsStripped.toLocaleString()} attachments stripped (metadata kept)`);
     if (bits.length) body.append(el("p", { class: "mono source-range" }, bits.join(" · ")));
     for (const issue of card.issues.slice(0, 3)) {
@@ -229,6 +235,13 @@ function sourceCard(ctx: Ctx, kind: SourceKind): HTMLElement {
     }
   }
   return body;
+}
+
+function uploadScreen(kind?: SourceKind): Screen {
+  if (kind === "calendar") return "upload-calendar";
+  if (kind === "documents") return "upload-documents";
+  if (kind === "email" || kind === "orders") return "upload-email";
+  return "items";
 }
 
 export function emailBreakdown(records: EmailRecord[]): {

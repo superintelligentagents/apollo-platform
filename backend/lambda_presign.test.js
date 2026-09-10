@@ -88,6 +88,12 @@ import {
   buildApprovedFinalGoldDocument,
   textContentHash,
   uploadObjectKey,
+  uploadCompletionSignature,
+  uploadCompletionTokenMatches,
+  pcUploadCompletionKind,
+  validatePCUploadCompletionSource,
+  pcTaskContributionCount,
+  buildPCApprovedShowcase,
   buildReportingReport,
   llmReviewKeyFor,
   taskIdFromLlmReviewKey,
@@ -126,6 +132,13 @@ import {
   llmReviewForHuman,
   buildTrajectoryReportingReport,
   safeTrajectoryAssetPath,
+  cleanTrajectoryRejudgment,
+  selectReportingPage,
+  cleanSubsetName,
+  cleanSubsetDocument,
+  subsetKeyFor,
+  trajectoryJudgmentView,
+  trajectoryRejudgmentKeyFor,
   buildOsworldExportReport,
   osworldTaskForItem,
   osworldTaskIdFor,
@@ -702,6 +715,129 @@ test("trajectory reporting separates metadata from opt-in full content", () => {
   assert.equal(full.schema_version, "apollo-trajectory-reporting-v2");
 });
 
+test("a named subset filters both reporting endpoints", () => {
+  const items = [
+    { task_id: "t1", status: "pending", manifest_key: "k1", run_id: "r1", llm_average_rubric_score: 1 },
+    { task_id: "t2", status: "pending", manifest_key: "k2", run_id: "r2", llm_average_rubric_score: 0 },
+  ];
+  const subsetIds = new Set(["t2"]);
+  const report = buildTrajectoryReportingReport(items, undefined, { subsetIds });
+  assert.equal(report.trajectories.length, 1);
+  assert.equal(report.trajectories[0].task_id, "t2");
+  assert.equal(report.totals.submitted, 1);
+
+  // The tasks endpoint narrows the same way.
+  const dashboard = { items: [{ task_id: "t1", status: "approved" }, { task_id: "t2", status: "approved" }] };
+  assert.deepEqual(
+    selectReportingPage(dashboard, { subsetIds }).filteredItems.map((i) => i.task_id),
+    ["t2"],
+  );
+  // No subset means no narrowing.
+  assert.equal(buildTrajectoryReportingReport(items).trajectories.length, 2);
+});
+
+test("a subset name cannot address anything outside its own prefix", () => {
+  assert.equal(cleanSubsetName("hard-100-v1"), "hard-100-v1");
+  assert.equal(cleanSubsetName("Hard-100-V1"), "hard-100-v1");
+  // A traversal or absolute path must not become a key.
+  assert.equal(cleanSubsetName("../../secrets"), "");
+  assert.equal(cleanSubsetName("a/b"), "");
+  assert.equal(cleanSubsetName(""), "");
+  assert.equal(subsetKeyFor("hard-100-v1"), "v2-review/subsets/hard-100-v1.json");
+});
+
+test("a subset document must actually carry task ids", () => {
+  const clean = cleanSubsetDocument({
+    name: "hard-100-v1", description: "showcase", task_ids: ["v2/a/internal/task-1", "", "v2/b/internal/task-2"],
+  });
+  assert.deepEqual(clean.task_ids, ["v2/a/internal/task-1", "v2/b/internal/task-2"]);
+  assert.equal(cleanSubsetDocument({ task_ids: [] }), null);
+  assert.equal(cleanSubsetDocument({ task_ids: [""] }), null);
+  assert.equal(cleanSubsetDocument(null), null);
+  assert.equal(cleanSubsetDocument({ task_ids: new Array(20_001).fill("v2/a/internal/task-1") }), null);
+});
+
+test("a re-judgment replaces the packaged verdicts it supersedes", () => {
+  const manifest = {
+    metrics: { average_rubric_score: 1, perfect: true, judge_errors: 0 },
+    rubrics: [
+      { rubric_id: "R1", requirement: "a", llm_status: "SUCCESS", llm_score: 1, llm_reasoning: "old" },
+      { rubric_id: "R2", requirement: "b", llm_status: "SUCCESS", llm_score: 1, llm_reasoning: "old" },
+    ],
+  };
+  const rejudgment = cleanTrajectoryRejudgment({
+    schema_version: "apollo-trajectory-rejudgment-v1",
+    judge: { repo: "ljang0/Odysseys", commit: "abc", sha256: "def", model: "gpt-5.6-luna", screenshots: "all" },
+    metrics: { average_rubric_score: 0.5, perfect: false, judge_errors: 0 },
+    rubrics: [
+      { rubric_id: "R1", requirement: "a", llm_status: "SUCCESS", llm_score: 1, llm_reasoning: "new" },
+      { rubric_id: "R2", requirement: "b", llm_status: "FAILURE", llm_score: 0, llm_reasoning: "never navigated" },
+    ],
+  });
+  assert.equal(rejudgment.judge.model, "gpt-5.6-luna");
+  const view = trajectoryJudgmentView(manifest, rejudgment);
+  assert.equal(view.metrics.average_rubric_score, 0.5);
+  assert.equal(view.metrics.perfect, false);
+  assert.equal(view.manifest.rubrics[1].llm_status, "FAILURE");
+  assert.equal(view.manifest.rubrics[1].llm_reasoning, "never navigated");
+  assert.equal(view.manifest.rejudgment.judge.commit, "abc");
+});
+
+test("the reporting row keeps the re-judgment's provenance", () => {
+  // The row builder whitelists fields, so a corrected score can reach the API
+  // with nothing saying it was corrected. Assert the provenance survives.
+  const row = buildTrajectoryReportingReport([{
+    manifest_key: "v2-review/trajectory-runs/a/b/manifest.json",
+    task_id: "t1", run_id: "r1", status: "pending",
+    llm_average_rubric_score: 0.5, llm_perfect: false,
+    llm_judge_source: "canonical_full_trajectory",
+    llm_judge: { model: "gpt-5.6-luna", commit: "abc", screenshots: "all" },
+    llm_original_average_rubric_score: 1, llm_original_perfect: true,
+  }]).trajectories[0];
+  assert.equal(row.llm_average_rubric_score, 0.5);
+  assert.equal(row.llm_judge_source, "canonical_full_trajectory");
+  assert.equal(row.llm_judge.screenshots, "all");
+  assert.equal(row.llm_original_average_rubric_score, 1);
+  assert.equal(row.llm_original_perfect, true);
+
+  // A row with no re-judgment reports itself as packaged, and its "original"
+  // is its own score rather than null, so clients can compare unconditionally.
+  const packaged = buildTrajectoryReportingReport([{
+    manifest_key: "v2-review/trajectory-runs/a/b/manifest.json",
+    task_id: "t2", run_id: "r2", status: "pending",
+    llm_average_rubric_score: 0.8, llm_perfect: false,
+  }]).trajectories[0];
+  assert.equal(packaged.llm_judge_source, "packaged");
+  assert.equal(packaged.llm_judge, null);
+  assert.equal(packaged.llm_original_average_rubric_score, 0.8);
+});
+
+test("a re-judgment for a different rubric set is ignored", () => {
+  const manifest = {
+    metrics: { average_rubric_score: 1, perfect: true, judge_errors: 0 },
+    rubrics: [{ rubric_id: "R1", requirement: "a", llm_status: "SUCCESS", llm_score: 1, llm_reasoning: "old" }],
+  };
+  const stale = cleanTrajectoryRejudgment({
+    schema_version: "apollo-trajectory-rejudgment-v1",
+    judge: { model: "m" },
+    metrics: { average_rubric_score: 0, perfect: false, judge_errors: 0 },
+    rubrics: [{ rubric_id: "OTHER", requirement: "z", llm_status: "FAILURE", llm_score: 0, llm_reasoning: "x" }],
+  });
+  const view = trajectoryJudgmentView(manifest, stale);
+  assert.equal(view.metrics.average_rubric_score, 1);   // packaged judgment stands
+  assert.equal(view.manifest.rubrics[0].llm_reasoning, "old");
+  // No re-judgment at all also falls back cleanly.
+  assert.equal(trajectoryJudgmentView(manifest, null).metrics.perfect, true);
+  assert.equal(cleanTrajectoryRejudgment({ schema_version: "wrong" }), null);
+});
+
+test("the re-judgment key sits beside its manifest", () => {
+  assert.equal(
+    trajectoryRejudgmentKeyFor("v2-review/trajectory-runs/abc/run1/manifest.json"),
+    "v2-review/trajectory-runs/abc/run1/rejudgment.json",
+  );
+});
+
 test("only relative in-run screenshot paths are signed", () => {
   // The old check appended the path to the prefix and then asserted the result
   // still began with it, which is true by construction and rejected nothing.
@@ -1013,6 +1149,92 @@ test("separates V2 and PC upload keys and avoids same-millisecond collisions", (
   assert.match(pcKey, /\/pc\/alice\/internal\/bundle-12345678\/1700000000000-bbbbbbbb_manifest\.json$/);
   assert.notEqual(v2Key, concurrentV2Key);
   assert.notEqual(v2Key, pcKey);
+});
+
+test("signs PC upload completion without exposing the review key", () => {
+  const key = "prolific/journeys/alice/pc/alice/internal/bundle-12345678/1700000000000-aaaaaaaa_review_task_task-a.json";
+  const expiresAt = 1_700_000_600_000;
+  const token = uploadCompletionSignature(key, expiresAt, "review-secret");
+  assert.ok(token);
+  assert.equal(token.includes("review-secret"), false);
+  assert.equal(uploadCompletionTokenMatches(key, expiresAt, token, "review-secret", 1_700_000_000_000), true);
+  assert.equal(uploadCompletionTokenMatches(`${key}-changed`, expiresAt, token, "review-secret", 1_700_000_000_000), false);
+  assert.equal(uploadCompletionTokenMatches(key, expiresAt, token, "review-secret", expiresAt + 1), false);
+  assert.equal(pcUploadCompletionKind(key), "review_task");
+  assert.equal(pcUploadCompletionKind(key.replace(/review_task_task-a\.json$/, "manifest.json")), "manifest");
+  assert.equal(pcUploadCompletionKind(key.replace(/review_task_task-a\.json$/, "records_email.json")), null);
+  const sidecar = {
+    schema_version: "odyssey_long_task_v2",
+    task_id: "pc_task-a",
+    participant: { participant_id: "redacted", name: null, email: null },
+    task: { agent_request: "Use the supplied records." },
+    provenance: { source_journeys: [], attached_urls: [] },
+  };
+  assert.equal(validatePCUploadCompletionSource(key, sidecar).ok, true);
+  assert.equal(validatePCUploadCompletionSource(key, { ...sidecar, records: [] }).ok, false);
+  assert.equal(validatePCUploadCompletionSource(key, { ...sidecar, task_id: "pc_other" }).ok, false);
+  const manifestKey = key.replace(/review_task_task-a\.json$/, "manifest.json");
+  assert.equal(validatePCUploadCompletionSource(manifestKey, {
+    schema_version: "odyssey_personal_context_v1",
+    bundle_id: "pc/alice/internal/bundle-12345678",
+    participant: { participant_id: "alice" },
+    parts: [],
+    privacy_audit: { status: "pass", blocking_findings: 0 },
+  }).ok, true);
+  assert.equal(validatePCUploadCompletionSource(manifestKey, {
+    schema_version: "odyssey_personal_context_v1",
+    bundle_id: "pc/alice/internal/bundle-other",
+    participant: { participant_id: "alice" },
+    parts: [],
+    privacy_audit: { status: "pass", blocking_findings: 0 },
+  }).ok, false);
+});
+
+test("counts PC tasks by sidecar review unit and keeps annotators private but distinct", () => {
+  const root = "prolific/journeys/alice/pc/alice/internal/bundle-12345678/";
+  assert.equal(pcTaskContributionCount([
+    `${root}1_review_task_task-a.json`,
+    `${root}2_review_task_task-a.json`,
+    `${root}3_review_task_task-b.json`,
+    `${root}4_manifest.json`,
+  ]), 2);
+  const source = {
+    task_id: "pc_task-a",
+    participant: { participant_id: "redacted", name: "Private name", email: "private@example.com" },
+    task: { task_title: "Fixture", agent_request: "Use the supplied records.", steps: [] },
+  };
+  const alice = buildAdminItemFromDocuments({ source, sourceKey: `${root}1_review_task_task-a.json` });
+  const bob = buildAdminItemFromDocuments({
+    source,
+    sourceKey: "prolific/journeys/bob/pc/bob/internal/bundle-12345678/1_review_task_task-a.json",
+  });
+  assert.match(alice.participant_id, /^pc-[a-f0-9]{16}$/);
+  assert.notEqual(alice.participant_id, bob.participant_id);
+  assert.match(alice.participant_name, /^Annotator /);
+  assert.equal(alice.participant_email, "");
+  assert.equal(JSON.stringify(alice).includes("Private name"), false);
+});
+
+test("builds a PC showcase only from author-approved task content", () => {
+  const empty = buildPCApprovedShowcase([]);
+  assert.equal(empty.source_tasks, 0);
+  const showcase = buildPCApprovedShowcase([{
+    task_id: "pc_task-a",
+    review_content_hash: "hash-a",
+    participant: { email: "must-not-appear@example.com" },
+    author_approval: { approved_at: "2026-09-10T00:00:00Z" },
+    task: {
+      task_title: "Plan from supplied context",
+      agent_request: "Use the supplied records to make a plan.",
+      difficulty: "high",
+      steps: [{ order: 1, title: "Plan", description: "Compare the options." }],
+      metadata: { subjects: ["Travel and Tourism > Planning"] },
+    },
+  }]);
+  assert.equal(showcase.source_tasks, 1);
+  assert.equal(showcase.examples[0].confidence, "unlabelled");
+  assert.equal(showcase.examples[0].primary_category, "Travel and Tourism > Planning");
+  assert.equal(JSON.stringify(showcase).includes("must-not-appear@example.com"), false);
 });
 
 test("conditional writes allow exactly one winner under contention", async () => {
@@ -1513,6 +1735,35 @@ test("builds a content-free reporting feed for created and QC'd tasks", () => {
   assert.equal(JSON.stringify(report).includes("private task text"), false);
 });
 
+test("PC reporting routes trajectory grading to the upload owner, not the private dashboard id", () => {
+  const report = buildReportingReport({
+    total: 1,
+    truncated: false,
+    users: [],
+    items: [{
+      task_id: "pc_task-a",
+      participant_id: "pc-0123456789abcdef",
+      participant_name: "Annotator 01234567",
+      participant_email: "",
+      source_key: "prolific/journeys/actual-author/pc/actual-author/internal/bundle-12345678/1_review_task_task-a.json",
+      mode: "pc",
+      submitted_at: "2026-09-10T00:00:00Z",
+      status: "approved",
+      reviewer: "Reviewer",
+      reviewed_at: "2026-09-10T01:00:00Z",
+      changed: false,
+      rejection_reason: "",
+      trajectory_count: 0,
+      visit_count: 0,
+      original: { title: "PC task", request: "Use supplied context.", criteria: [], steps: [] },
+      final: { title: "PC task", request: "Use supplied context.", criteria: [], steps: [] },
+      rubrics: [],
+    }],
+  }, "2026-09-10T02:00:00Z");
+  assert.equal(report.tasks[0].participant_id, "pc-0123456789abcdef");
+  assert.equal(report.tasks[0].creator_pid, "actual-author");
+});
+
 test("opt-in reporting exposes complete original/final rubrics and LLM reviews", () => {
   const llmReview = {
     schema_version: "apollo-llm-feasibility-artifact-v5",
@@ -1818,11 +2069,11 @@ test("admin email access is normalized and deny-by-default", () => {
 
 test("summarizes completed PC bundle counts by participant", () => {
   const result = summarizePCBundles([
-    { participant_id: "alice", participant_name: "Alice", participant_email: "alice@example.com", email_count: 12, calendar_count: 3, task_count: 2 },
-    { participant_id: "alice", participant_name: "Alice", participant_email: "alice@example.com", email_count: 4, calendar_count: 1, task_count: 1 },
-    { participant_id: "bob", participant_name: "Bob", participant_email: "bob@example.com", email_count: 8, calendar_count: 0, task_count: 2 },
+    { participant_id: "alice", participant_name: "Alice", participant_email: "alice@example.com", email_count: 12, calendar_count: 3, document_count: 2, task_count: 2 },
+    { participant_id: "alice", participant_name: "Alice", participant_email: "alice@example.com", email_count: 4, calendar_count: 1, document_count: 1, task_count: 1 },
+    { participant_id: "bob", participant_name: "Bob", participant_email: "bob@example.com", email_count: 8, calendar_count: 0, document_count: 0, task_count: 2 },
   ]);
-  assert.deepEqual(result.totals, { bundles: 3, email: 24, calendar: 4, tasks: 5 });
+  assert.deepEqual(result.totals, { bundles: 3, email: 24, calendar: 4, documents: 3, tasks: 5 });
   assert.deepEqual(result.users[0], {
     participant_id: "alice",
     name: "Alice",
@@ -1830,6 +2081,7 @@ test("summarizes completed PC bundle counts by participant", () => {
     bundles: 2,
     email_count: 16,
     calendar_count: 4,
+    document_count: 3,
     task_count: 3,
   });
 });
@@ -1909,6 +2161,12 @@ test("calendar admin edits allow only summary and description", () => {
   const current = { id: "cal-2", summary: "A", description: "B", attendees: [{ email: "person@example.test" }], dtstart: "2026-08-01", location: "Locked" };
   const safe = restrictPCAdminRecord("calendar", current, { ...current, id: "changed", summary: "Edited", description: "Updated", attendees: [], dtstart: "changed", location: "Changed" });
   assert.deepEqual(safe, { ...current, summary: "Edited", description: "Updated" });
+});
+
+test("document admin edits allow only title and extracted text", () => {
+  const current = { id: "doc-1", filename: "resume.pdf", title: "Resume", text: "Submitted text", mime_type: "application/pdf", size: 1000, page_count: 1 };
+  const safe = restrictPCAdminRecord("documents", current, { ...current, id: "changed", filename: "changed.pdf", title: "Updated resume", text: "Reviewed text", size: 0, page_count: 9 });
+  assert.deepEqual(safe, { ...current, title: "Updated resume", text: "Reviewed text" });
 });
 
 function osworldItem(overrides = {}) {

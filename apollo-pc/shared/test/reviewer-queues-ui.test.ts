@@ -39,7 +39,7 @@ function context(): Ctx {
 describe("enabled reviewer queues", () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it("drops an expired task claim and shows Apollo v2 reviewer totals", async () => {
+  it("drops an expired task claim and keeps team outcomes private", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => response({
       submitted: 12,
       finished: 4,
@@ -56,9 +56,11 @@ describe("enabled reviewer queues", () => {
     ctx.state.reviewClaim = { subKey: "sub", token: "token", task: claimedTask, claimedAtMs: Date.now() - 31 * 60_000, lockTtlMs: 30 * 60_000 };
 
     const root = renderTaskReviewQueue(ctx);
-    await vi.waitFor(() => expect(root.textContent).toContain("You: 2 approved · 1 rejected"));
+    await vi.waitFor(() => expect(root.textContent).toContain("7ready"));
     expect(ctx.state.reviewClaim).toBeNull();
-    expect(root.textContent).toContain("total: you 3 · Teammate 1");
+    expect(root.textContent).not.toContain("Teammate");
+    expect(root.textContent).not.toContain("3approved");
+    expect(root.querySelectorAll(".qc-queue-tile")).toHaveLength(3);
     expect(root.querySelector<HTMLButtonElement>(".qc-claim")?.disabled).toBe(false);
   });
 

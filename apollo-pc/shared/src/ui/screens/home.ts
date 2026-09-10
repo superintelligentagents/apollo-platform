@@ -5,8 +5,10 @@ export function renderHome(ctx: Ctx): HTMLElement {
   const records = [...ctx.state.records.values()];
   const importedEmail = records.filter((record) => record.source === "email" || record.source === "orders").length;
   const importedCalendar = records.filter((record) => record.source === "calendar").length;
+  const importedDocuments = records.filter((record) => record.source === "documents").length;
   const selectedEmail = records.filter((record) => (record.source === "email" || record.source === "orders") && ctx.actions.isIncluded(record)).length;
   const selectedCalendar = records.filter((record) => record.source === "calendar" && ctx.actions.isIncluded(record)).length;
+  const selectedDocuments = records.filter((record) => record.source === "documents" && ctx.actions.isIncluded(record)).length;
   const uploaded = ctx.state.uploadedBySource;
 
   return el(
@@ -18,7 +20,8 @@ export function renderHome(ctx: Ctx): HTMLElement {
       "section",
       { class: "dashboard-counts", "aria-label": "Data counts" },
       dashboardRow("Mail", importedEmail, uploaded.knownBundles || !ctx.state.uploadedCount ? uploaded.email : "—"),
-      dashboardRow("Calendar", importedCalendar, uploaded.knownBundles || !ctx.state.uploadedCount ? uploaded.calendar : "—")
+      dashboardRow("Calendar", importedCalendar, uploaded.knownBundles || !ctx.state.uploadedCount ? uploaded.calendar : "—"),
+      dashboardRow("Documents", importedDocuments, uploaded.knownBundles || !ctx.state.uploadedCount ? uploaded.documents : "—")
     ),
     uploaded.knownBundles < ctx.state.uploadedCount
       ? el("p", { class: "dashboard-note" }, `${ctx.state.uploadedCount - uploaded.knownBundles} earlier submission${ctx.state.uploadedCount - uploaded.knownBundles === 1 ? "" : "s"} contained ${uploaded.legacyRecords.toLocaleString()} records total. Its email/calendar split was not recorded, so it is not guessed above. New submissions will appear exactly.`)
@@ -26,9 +29,11 @@ export function renderHome(ctx: Ctx): HTMLElement {
     el(
       "section",
       { class: "dashboard-workflows major-workflows" },
-      majorWorkflow("1", "Import data", `${(importedEmail + importedCalendar).toLocaleString()} records`, "sources", ctx),
-      majorWorkflow("2", "Upload data", `${(selectedEmail + selectedCalendar).toLocaleString()} selected`, "items", ctx),
-      majorWorkflow("3", "Write tasks", `${ctx.state.tasks.length.toLocaleString()} saved`, "tasks", ctx)
+      majorWorkflow("1", "Import data", `${(importedEmail + importedCalendar + importedDocuments).toLocaleString()} records`, "sources", ctx),
+      majorWorkflow("2", "Upload data", `${(selectedEmail + selectedCalendar + selectedDocuments).toLocaleString()} selected`, "items", ctx),
+      majorWorkflow("3", "Discover tasks", `${ctx.state.tasks.length.toLocaleString()} saved`, "tasks", ctx),
+      majorWorkflow("4", "My tasks", "Feedback, revisions & sign-off", "my-tasks", ctx),
+      majorWorkflow("5", "Metrics & admin", "Contributions and team quality", "metrics", ctx)
     )
   );
 }

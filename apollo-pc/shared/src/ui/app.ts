@@ -1,6 +1,7 @@
 import { buildLookup, createAliasPool, detectEntities, normalizeName, normalizePhoneKey } from "../alias";
+import type { AppRecommendation } from "../app-catalog";
 import { assembleBundle } from "../bundle";
-import { defaultReviewKey, MANIFEST_FILENAME, MAX_BODY_CHARS } from "../config";
+import { MANIFEST_FILENAME, MAX_BODY_CHARS, MAX_DOCUMENT_CHARS } from "../config";
 import { appendUploadLog, loadUploadLog, STORAGE_KEYS, type PlatformAdapter } from "../platform";
 import { buildReviewTaskSidecar, reviewTaskFilename } from "../review-task";
 import { clearClaimSnapshot, clearTrajectoryClaimSnapshot, saveClaimSnapshot, saveTrajectoryClaimSnapshot, seedTrajectoryJudgment, type ReviewClaim, type TrajectoryClaim } from "../review-client";
@@ -23,12 +24,15 @@ import { initialState, type AppState, type Ctx, type Screen } from "./context";
 import { participantKey } from "./identity";
 import { renderEntities } from "./screens/entities";
 import { renderHome } from "./screens/home";
-import { renderEmailItems, renderItems, renderCalendarItems } from "./screens/items";
+import { renderDocumentItems, renderEmailItems, renderItems, renderCalendarItems } from "./screens/items";
 import { renderLogin } from "./screens/login";
+import { renderMetrics } from "./screens/metrics";
+import { renderExamples } from "./screens/examples";
 import { renderProgress } from "./screens/progress";
 import { renderReview } from "./screens/review";
-import { renderCalendarImport, renderMailImport, renderSources } from "./screens/sources";
+import { renderCalendarImport, renderDocumentImport, renderMailImport, renderSources } from "./screens/sources";
 import { renderTaskEdit } from "./screens/task-edit";
+import { renderMyTask, renderMyTasks, resetMyTasksViewState } from "./screens/my-tasks";
 import { renderTasks } from "./screens/tasks";
 import { renderTaskReviewQueue } from "./screens/task-review-queue";
 import { renderTaskReviewEdit } from "./screens/task-review-edit";
@@ -41,14 +45,20 @@ const SCREEN_PATH: Record<Screen, string> = {
   sources: "/sources",
   "import-mail": "/import/mail",
   "import-calendar": "/import/calendar",
+  "import-documents": "/import/documents",
   items: "/items",
   "upload-email": "/upload/email",
   "upload-calendar": "/upload/calendar",
+  "upload-documents": "/upload/documents",
   entities: "/people",
+  "my-tasks": "/my-tasks",
+  "my-task": "/my-tasks/task",
   tasks: "/tasks",
   "task-edit": "/write-task",
   review: "/review",
   progress: "/progress",
+  metrics: "/metrics",
+  examples: "/examples",
   "task-review-queue": "/review-task",
   "task-review-edit": "/review-task/edit",
   "trajectory-queue": "/grade",
@@ -64,7 +74,6 @@ export function screenFromHash(hash: string): Screen | null {
 
 export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Promise<void> {
   const state: AppState = initialState();
-  state.reviewKey = defaultReviewKey();
   const store: RecordStore = await openStore();
   const aliasPool = createAliasPool();
   let requestedScreenOnLogin = typeof window === "undefined" ? null : screenFromHash(window.location.hash);
@@ -230,12 +239,13 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
             if (entry.source_counts) {
               totals.email += entry.source_counts.email ?? 0;
               totals.calendar += entry.source_counts.calendar ?? 0;
+              totals.documents += entry.source_counts.documents ?? 0;
               totals.knownBundles += 1;
             } else {
               totals.legacyRecords += entry.record_count;
             }
             return totals;
-          }, { email: 0, calendar: 0, knownBundles: 0, legacyRecords: 0 });
+          }, { email: 0, calendar: 0, documents: 0, knownBundles: 0, legacyRecords: 0 });
           rebuildReceiptEmailIds();
           // A saved entity index was produced after the most recent import;
           // trusting it avoids another full 100k-message sender analysis on
@@ -264,6 +274,11 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       },
 
       goto,
+      setReviewKey(key: string | null) {
+        state.reviewKey = key;
+        void adapter.storage.set(STORAGE_KEYS.reviewKey, key ?? "").catch(() => {});
+        render();
+      },
 
       async importFiles(kind: SourceKind, files: File[]) {
         const card = cardFor(kind);
@@ -280,6 +295,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
             files,
             {
               maxBodyChars: MAX_BODY_CHARS,
+              maxDocumentChars: MAX_DOCUMENT_CHARS,
               dateFloor: floor,
               locale: state.waDateOrder === "auto" ? {} : { dateOrder: state.waDateOrder },
             },
@@ -308,7 +324,9 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
           notify(
             `Imported ${fresh.length.toLocaleString()} ${kind} record${fresh.length === 1 ? "" : "s"}` +
               (mined ? ` · mined ${mined} orders from receipts` : "") +
-              (result.stats.itemsSkipped ? ` · ${result.stats.itemsSkipped.toLocaleString()} outside your date window` : ""),
+              (result.stats.itemsSkipped
+                ? ` · ${result.stats.itemsSkipped.toLocaleString()} ${kind === "documents" ? "skipped" : "outside your date window"}`
+                : ""),
             "ok"
           );
         } catch (err) {
@@ -432,16 +450,43 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       startTask(template: PCTemplate) {
         state.activeTemplate = template;
         state.taskDraft = {
+          region: "",
+          subjects: [],
           taskId: `task-${crypto.randomUUID().slice(0, 8)}`,
           templateId: template.id,
           category: template.category,
           title: "",
           request: template.requestScaffold,
+          difficulty: "high",
           steps: template.steps.map((s, i) => ({ order: i, title: s.title, description: "" })),
           successCriteria: [],
+          requiredOutputs: [],
           referencedRecordIds: [],
           expectedAnswer: "",
           notes: "",
+        };
+        state.formErrors = {};
+        goto("task-edit");
+      },
+
+      startRecommendedTask(recommendation: AppRecommendation) {
+        const source = recommendation.app.task;
+        state.activeTemplate = null;
+        state.taskDraft = {
+          region: "GLOBAL",
+          subjects: [...source.subjects],
+          taskId: `task-${crypto.randomUUID().slice(0, 8)}`,
+          templateId: `mypcbench-${recommendation.app.id}`,
+          category: source.category,
+          title: source.title,
+          request: source.request,
+          difficulty: "high",
+          steps: source.steps.map((step, index) => ({ ...step, order: index })),
+          successCriteria: [...source.successCriteria],
+          requiredOutputs: [...source.requiredOutputs],
+          referencedRecordIds: recommendation.recordIds.filter((id) => state.records.has(id)),
+          expectedAnswer: "",
+          notes: `MyPCBench app: ${recommendation.app.name}`,
         };
         state.formErrors = {};
         goto("task-edit");
@@ -452,13 +497,17 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         if (!task) return;
         state.activeTemplate = null;
         state.taskDraft = {
+          region: task.metadata?.region ?? "",
+          subjects: task.metadata?.subjects ?? [],
           taskId: task.task_id,
           templateId: "",
           category: task.category,
           title: task.task_title,
           request: task.agent_request,
+          difficulty: task.difficulty ?? "high",
           steps: task.steps.length ? task.steps : [{ order: 0, title: "Step", description: "" }],
           successCriteria: task.success_criteria,
+          requiredOutputs: task.required_outputs ?? [],
           referencedRecordIds: task.referenced_record_ids,
           expectedAnswer: task.expected_answer ?? "",
           notes: task.notes ?? "",
@@ -476,6 +525,8 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         if (request.length < 15) errors.request = "Write the request out — a sentence or two.";
         if (/\[[^\]]+\]/.test(request)) errors.request = "Replace the [bracketed] placeholders with your own details.";
         if (!steps.length) errors.steps = "Fill in at least one task step — a sentence is enough.";
+        if (!draft.region) errors.region = "Choose the country or Global.";
+        if (!draft.subjects.length) errors.subjects = "Choose at least one subject.";
         const template = state.activeTemplate;
         if (template?.requiresExpectedAnswer && !draft.expectedAnswer.trim()) {
           errors.expected = "This task type needs the ground-truth answer (you know it — the agent has to find it).";
@@ -492,14 +543,17 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
           if (r) sources.add(r.source);
         }
         const task: PCTask = {
+          metadata: { region: draft.region || undefined, subjects: draft.subjects ?? [] },
           task_id: draft.taskId,
           category: draft.category,
           task_title: draft.title.trim() || deriveTitle(request),
           agent_request: request,
+          difficulty: draft.difficulty,
           steps,
           success_criteria: draft.successCriteria.filter((c) => c.trim()).length
             ? draft.successCriteria.filter((c) => c.trim())
             : seedCriteriaFromSteps(steps),
+          required_outputs: draft.requiredOutputs.filter((value) => value.trim()),
           required_sources: [...sources],
           referenced_record_ids: draft.referencedRecordIds,
           expected_answer: draft.expectedAnswer.trim() || null,
@@ -625,12 +679,14 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
             source_counts: {
               email: included.filter((record) => record.source === "email" || record.source === "orders").length,
               calendar: included.filter((record) => record.source === "calendar").length,
+              documents: included.filter((record) => record.source === "documents").length,
             },
             task_count: state.tasks.length,
             at: new Date().toISOString(),
           });
           state.uploadedBySource.email += included.filter((record) => record.source === "email" || record.source === "orders").length;
           state.uploadedBySource.calendar += included.filter((record) => record.source === "calendar").length;
+          state.uploadedBySource.documents += included.filter((record) => record.source === "documents").length;
           state.uploadedBySource.knownBundles += 1;
           state.bundleId = null;
           state.bundleCreatedAt = null;
@@ -648,6 +704,9 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       },
 
       async eraseAll() {
+        resetMyTasksViewState();
+        await adapter.storage.set(STORAGE_KEYS.reviewKey, "");
+        state.myTaskSelection = null;
         await store.clearAll();
         if (state.identity) await clearDecisions(adapter.storage, participantKey(state.identity));
         const identity = state.identity;
@@ -676,7 +735,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         return state.identity?.name || state.identity?.email || "unknown";
       },
       reviewerPid() {
-        return state.identity ? schemaParticipantId(state.identity) : "";
+        return state.identity ? schemaParticipantId(participantUploadIdentity(state.identity, state.entities)) : "";
       },
       startReview(claim: ReviewClaim) {
         state.reviewClaim = claim;
@@ -736,8 +795,9 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
   }
 
   function transition(screen: Screen) {
-    if (screen === "upload-email" && state.filters.source !== "email") Object.assign(state.filters, { source: "email", category: "all", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 });
-    if (screen === "upload-calendar" && state.filters.source !== "calendar") Object.assign(state.filters, { source: "calendar", category: "all", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 });
+    if (screen === "upload-email" && state.filters.source !== "email") Object.assign(state.filters, { source: "email", category: "all", app: "", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 });
+    if (screen === "upload-calendar" && state.filters.source !== "calendar") Object.assign(state.filters, { source: "calendar", category: "all", app: "", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 });
+    if (screen === "upload-documents" && state.filters.source !== "documents") Object.assign(state.filters, { source: "documents", category: "all", app: "", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 });
     state.screen = screen;
     state.openItemId = null;
     state.openItemBody = null;
@@ -761,6 +821,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
   function reachableScreen(target: Screen): Screen {
     if (!state.identity) return "login";
     if (target === "login") return "home";
+    if (target === "my-task" && !state.myTaskSelection) return "my-tasks";
     if (target === "task-edit" && !state.taskDraft) return "tasks";
     if (target === "task-review-edit" && !state.reviewClaim) return "task-review-queue";
     if (target === "trajectory-edit" && !state.trajectoryClaim) return "trajectory-queue";
@@ -788,9 +849,12 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
     );
     const NAV: Array<{ label: string; target: Screen; owns: Screen[] }> = [
       { label: "Dashboard", target: "home", owns: ["home", "progress"] },
-      { label: "1. Import data", target: "sources", owns: ["sources", "import-mail", "import-calendar"] },
-      { label: "2. Upload data", target: "items", owns: ["items", "upload-email", "upload-calendar", "entities", "review"] },
-      { label: "3. Write tasks", target: "tasks", owns: ["tasks", "task-edit"] },
+      { label: "1. Import data", target: "sources", owns: ["sources", "import-mail", "import-calendar", "import-documents"] },
+      { label: "2. Upload data", target: "items", owns: ["items", "upload-email", "upload-calendar", "upload-documents", "entities", "review"] },
+      { label: "3. Discover tasks", target: "tasks", owns: ["tasks", "task-edit"] },
+      { label: "Metrics & admin", target: "metrics", owns: ["metrics"] },
+      { label: "Examples", target: "examples", owns: ["examples"] },
+      { label: "My tasks", target: "my-tasks", owns: ["my-tasks", "my-task"] },
       { label: "Review", target: "task-review-queue", owns: ["task-review-queue", "task-review-edit"] },
       { label: "Grade", target: "trajectory-queue", owns: ["trajectory-queue", "trajectory-edit"] },
     ];
@@ -830,14 +894,20 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       sources: renderSources,
       "import-mail": renderMailImport,
       "import-calendar": renderCalendarImport,
+      "import-documents": renderDocumentImport,
       items: renderItems,
       "upload-email": renderEmailItems,
       "upload-calendar": renderCalendarItems,
+      "upload-documents": renderDocumentItems,
       entities: renderEntities,
+      "my-tasks": renderMyTasks,
+      "my-task": renderMyTask,
       tasks: renderTasks,
       "task-edit": renderTaskEdit,
       review: renderReview,
       progress: renderProgress,
+      metrics: renderMetrics,
+      examples: renderExamples,
       "task-review-queue": renderTaskReviewQueue,
       "task-review-edit": renderTaskReviewEdit,
       "trajectory-queue": renderTrajectoryQueue,
@@ -913,6 +983,11 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       }
     }
   });
+
+  // Team access is entered on this device, never compiled into public assets.
+  void adapter.storage.get(STORAGE_KEYS.reviewKey).then((key) => {
+    if (key) { state.reviewKey = key; if (state.screen !== "login") render(); }
+  }).catch(() => {});
 
   // Prefill the login form with the last-used identity (never auto-login).
   adapter.storage
