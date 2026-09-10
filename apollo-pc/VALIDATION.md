@@ -10,8 +10,8 @@ computer-use pass wrote a request and step, observed the saved status, reloaded 
 page, and verified the exact draft was restored. The post-deploy browser console was
 clear.
 
-Deployment: https://apollo-pc-site-lv8q7dacr-lawrences-projects-aa5ba59b.vercel.app
-Vercel deployment ID: `dpl_4nrcGbxaCY63xNALVWcS2UgHKGzw`.
+Deployment: https://apollo-pc-site-gnm5qeuin-lawrences-projects-aa5ba59b.vercel.app
+Vercel deployment ID: `dpl_B7XY4uYgqk4wiNjPFRy7d4a1WTvw`.
 The isolated PC Lambda was deployed with code SHA-256
 `S28jDksNv9XpHtCw6Cfisul+ihAsMD5J2YKSbfKsVu4=`. Its function, role, scope,
 review prefix, API Gateway, S3 layout, and DynamoDB table are unchanged. The primary
@@ -36,7 +36,7 @@ skipped so unrelated PC pull requests do not fail on the absent showcase directo
 | Identity | Author lookup and reviewer/creator assignment use the same protected participant ID as PC uploads. Explicit study IDs remain unchanged. |
 | Runtime access | Team key is validated against PC before device-local storage. No build-time review key. Built JavaScript checked against the configured key without printing it. |
 | Admin records | Email, calendar, and extracted-document counts/details are available to the same admin allowlist as v2. Document admins may edit only title and extracted text; filename, type, size, page count, ID, and uploaded original remain immutable. |
-| Runtime performance | The initial production JavaScript fell from 348.57 KB (110.75 KB gzip) to 62.82 KB (22.15 KB gzip), an 82% raw and 80% gzip reduction. Larger workspaces and PDF extraction load on demand. App recommendations make one bounded pass over history, imported records persist in 2,000-record transactions, and entity indexing finishes after the import becomes usable. A 100,000-message recommendation/search regression stays under its 4-second/1.5-second limits. Hash-named JavaScript assets return `Cache-Control: public, max-age=31536000, immutable`; HTML continues to revalidate. |
+| Runtime performance | The initial production JavaScript fell from 348.57 KB (110.75 KB gzip) to 62.80 KB (22.19 KB gzip), an 82% raw and 80% gzip reduction. Larger workspaces and PDF extraction load on demand. App recommendations make one bounded pass over history, email-service classification is cached per record, imported records persist in 2,000-record transactions, and entity indexing finishes after the import becomes usable. Three cold 100,000-message runs completed in about 2.2 seconds each, safely below the 4-second recommendation and 1.5-second search limits. Hash-named JavaScript assets return `Cache-Control: public, max-age=31536000, immutable`; HTML continues to revalidate. |
 | Concurrent author history | Each global task row has an author-scoped DynamoDB mirror. `My tasks` queries that prefix and reads S3 only for the requested page, so hundreds of annotators do not force a table scan or full task hydration. Optimistic revisions protect overlapping registration, review, appeal, sign-off, amendment, and re-queue updates. A readiness marker keeps the legacy path available until a verified backfill completes. |
 
 | Admin / annotator metrics | Added contributions, queue activity, reviewer quality, author outcomes, QC/sign-off progress, distribution, search/filter/pagination, details, and re-queue controls. Same seven-email allowlist as v2. PC authors now have separate stable private IDs rather than one combined redacted row. |
