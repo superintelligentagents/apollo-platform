@@ -4,7 +4,7 @@ import { createAliasPool, detectEntities } from "../src/alias";
 import { buildRedactContext, redactTaskForUpload, serializeRecord } from "../src/redact";
 import { applyMasks, scrubText } from "../src/scrub";
 import { splitRecordsIntoParts, validateBundle } from "../src/schema";
-import type { CalendarRecord, ContactRecord, EmailRecord, MessageRecord, OrderRecord, PCTask, SerializedRecord, TransactionRecord } from "../src/types";
+import type { CalendarRecord, ContactRecord, DocumentRecord, EmailRecord, MessageRecord, OrderRecord, PCTask, SerializedRecord, TransactionRecord } from "../src/types";
 
 function email(over: Partial<EmailRecord> = {}): EmailRecord {
   return {
@@ -436,6 +436,19 @@ describe("edits + rules", () => {
 });
 
 describe("expanded direct-identifier baseline", () => {
+  it("redacts imported document text through the same privacy pipeline", () => {
+    const identity = { kind: "internal" as const, participantId: "", name: "Lawrence Jang", email: "lj@example.com", consent: { version: "1", accepted_at: "now" } };
+    const selfMail = email({ from: { name: "Lawrence Jang", email: "lj@example.com" }, to: [], subject: "Resume draft" });
+    const entities = detectEntities([selfMail], [], createAliasPool(), identity);
+    const document: DocumentRecord = { id: "doc-1", source: "documents", sourceDetail: "document-pdf", timestamp: "2026-09-01T00:00:00Z", searchText: "", filename: "lawrence-resume.pdf", title: "Lawrence Jang resume", mimeType: "application/pdf", size: 900, text: "Lawrence Jang · lj@example.com · SSN 123-45-6789", pageCount: 1, bodyTruncated: false };
+    const output = serializeRecord(document, undefined, buildRedactContext(entities, []), null);
+    const serialized = JSON.stringify(output.record);
+    expect(serialized).not.toContain("Lawrence Jang");
+    expect(serialized).not.toContain("lj@example.com");
+    expect(serialized).not.toContain("123-45-6789");
+    expect(serialized).toContain("[ssn]");
+  });
+
   it("masks international contact, government, financial, device, account, and location identifiers", () => {
     const samples: Array<[string, string]> = [
       ["passport-number", "Passport number X12345678"],

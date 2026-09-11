@@ -97,14 +97,24 @@ function containsAlias(senderName: string, alias: string): boolean {
 export function emailMatchesService(record: EmailRecord, serviceId: string): boolean {
   const definition = MYPCBENCH_EMAIL_SERVICES.find((entry) => entry.id === serviceId);
   if (!definition) return serviceId.startsWith("detected:") && registrableSenderDomain(record) === serviceId.slice("detected:".length);
+  return emailMatchesDefinition(record, definition);
+}
+
+function emailMatchesDefinition(record: EmailRecord, definition: EmailService): boolean {
   const domain = senderDomain(record);
   if (definition.domains.some((candidate) => domainMatches(domain, candidate))) return true;
   if (definition.cloneSlugs.some((slug) => domainMatches(domain, `${slug}.mypcbench.app`) || domainMatches(domain, `${slug}.mypcbench.com`))) return true;
   return definition.aliases.some((alias) => containsAlias(record.from.name, alias));
 }
 
+const emailServiceCache = new WeakMap<EmailRecord, EmailService | null>();
+
 export function emailService(record: EmailRecord): EmailService | null {
-  return MYPCBENCH_EMAIL_SERVICES.find((serviceDefinition) => emailMatchesService(record, serviceDefinition.id)) ?? null;
+  const cached = emailServiceCache.get(record);
+  if (cached !== undefined) return cached;
+  const match = MYPCBENCH_EMAIL_SERVICES.find((definition) => emailMatchesDefinition(record, definition)) ?? null;
+  emailServiceCache.set(record, match);
+  return match;
 }
 
 export function emailServiceCounts(records: EmailRecord[]): Map<string, number> {

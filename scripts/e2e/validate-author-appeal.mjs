@@ -10,16 +10,22 @@ import { cleanRubrics, cleanTaskSnapshot, reportingTaskContentHash } from "../..
 const require = createRequire(new URL("../../backend/package.json", import.meta.url));
 const { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } = require("@aws-sdk/client-s3");
 const { DeleteItemCommand, DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+const { DynamoDBDocumentClient, PutCommand } = require("@aws-sdk/lib-dynamodb");
 
-const REVIEW_KEY = process.env.E2E_V2_REVIEW_KEY || process.env.E2E_REVIEW_KEY || "";
-if (!REVIEW_KEY) throw new Error("E2E_V2_REVIEW_KEY is required");
+const APP = String(process.env.E2E_APP || "v2").toLowerCase();
+if (!["v2", "pc"].includes(APP)) throw new Error("E2E_APP must be v2 or pc");
+const IS_PC = APP === "pc";
+const REVIEW_KEY = (IS_PC ? process.env.E2E_PC_REVIEW_KEY : process.env.E2E_V2_REVIEW_KEY) || process.env.E2E_REVIEW_KEY || "";
+if (!REVIEW_KEY) throw new Error(`${IS_PC ? "E2E_PC_REVIEW_KEY" : "E2E_V2_REVIEW_KEY"} is required`);
 const BUCKET = process.env.E2E_BUCKET || "journeys-prolific";
-const ENDPOINT = process.env.E2E_V2_REVIEW_ENDPOINT || "https://2fb2wkpayf.execute-api.us-east-1.amazonaws.com";
+const ENDPOINT = (IS_PC ? process.env.E2E_PC_REVIEW_ENDPOINT : process.env.E2E_V2_REVIEW_ENDPOINT)
+  || (IS_PC ? "https://t1ynh195m1.execute-api.us-east-1.amazonaws.com" : "https://2fb2wkpayf.execute-api.us-east-1.amazonaws.com");
 const TABLE = process.env.E2E_DASHBOARD_TABLE || "apollo-dashboard-index";
-const ROOT = "v2-review/";
+const ROOT = IS_PC ? "pc-review/" : "v2-review/";
 const region = process.env.AWS_REGION || "us-east-1";
 const s3 = new S3Client({ region });
 const dynamo = new DynamoDBClient({ region });
+const dashboardDb = DynamoDBDocumentClient.from(dynamo);
 const b64url = (value) => Buffer.from(String(value), "utf8").toString("base64url");
 const check = (condition, message) => {
   if (!condition) throw new Error(`FAIL: ${message}`);
@@ -52,9 +58,11 @@ const stamp = `${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`.toLowerCa
 const authorPid = `e2e-appeal-author-${stamp}`.slice(0, 40).replace(/-$/, "0");
 const rejecterPid = `e2e-rejecter-${stamp}`.slice(0, 40).replace(/-$/, "0");
 const secondPid = `e2e-second-${stamp}`.slice(0, 40).replace(/-$/, "0");
-const rawTaskId = `v2/${authorPid}/internal/task-${stamp}`;
+const rawTaskId = IS_PC ? `pc_task-${stamp}` : `v2/${authorPid}/internal/task-${stamp}`;
 const safeTaskId = rawTaskId.replace(/[^A-Za-z0-9_-]/g, "_");
-const sourceKey = `prolific/journeys/${authorPid}/${rawTaskId}/${Date.now()}-${randomUUID().slice(0, 8)}_long_task.json`;
+const sourceKey = IS_PC
+  ? `prolific/journeys/${authorPid}/pc/${authorPid}/internal/bundle-${stamp}/${Date.now()}-${randomUUID().slice(0, 8)}_review_task_${stamp}.json`
+  : `prolific/journeys/${authorPid}/${rawTaskId}/${Date.now()}-${randomUUID().slice(0, 8)}_long_task.json`;
 const inboxKey = `${ROOT}inbox/${b64url(sourceKey)}`;
 const doneKey = `${ROOT}done/${b64url(sourceKey)}`;
 const rejectedKey = `${ROOT}rejected/${safeTaskId}_${createHash("sha256").update(sourceKey).digest("hex").slice(0, 16)}.json`;
@@ -86,6 +94,33 @@ const source = {
   provenance: { source_journeys: [], theme_suggestion: null, template: null, attached_urls: [] },
 };
 
+async function seedDashboardIndex() {
+  const base = {
+    scope: APP,
+    entity_type: "TASK",
+    task_id: rawTaskId,
+    source_key: sourceKey,
+    review_unit: sourceKey,
+    done_target: rejectedKey,
+    participant_id: authorPid,
+    participant_name: "Synthetic Appeal Author",
+    mode: "guided",
+    submitted_at: source.created_at,
+    status: "rejected",
+    reviewer: "Synthetic Rejecter",
+    reviewed_at: new Date().toISOString(),
+    rejection_reason: firstRejectionReason,
+    original_title: task.task_title,
+    original_difficulty: task.difficulty,
+    appeal_number: 0,
+    indexed_at: new Date().toISOString(),
+  };
+  await Promise.all([
+    dashboardDb.send(new PutCommand({ TableName: TABLE, Item: { ...base, entity_key: `TASK#${rawTaskId}` } })),
+    dashboardDb.send(new PutCommand({ TableName: TABLE, Item: { ...base, entity_key: `AUTHOR#${authorPid}#TASK#${b64url(rawTaskId)}`, entity_type: "AUTHOR_TASK", author_participant_id: authorPid } })),
+  ]);
+}
+
 try {
   await putJson(sourceKey, source);
   await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: inboxKey, Body: sourceKey, ContentType: "text/plain", IfNoneMatch: "*" }));
@@ -100,6 +135,7 @@ try {
     rejected_at: new Date().toISOString(),
   });
   await putJson(doneKey, { target: rejectedKey, outcome: "rejected", reviewer: "Synthetic Rejecter", reviewer_pid: rejecterPid, task_id: safeTaskId, completed_at: new Date().toISOString() });
+  await seedDashboardIndex();
 
   const list = await post("/review/my-tasks", { participant_id: authorPid, offset: 0, limit: 10 });
   check(list.items?.[0]?.can_appeal === true, "verified rejection offers one appeal");
@@ -195,8 +231,12 @@ try {
   for (const key of [...cleanup].reverse()) await remove(key);
   await dynamo.send(new DeleteItemCommand({
     TableName: TABLE,
-    Key: { scope: { S: "v2" }, entity_key: { S: `TASK#${rawTaskId}` } },
+    Key: { scope: { S: APP }, entity_key: { S: `TASK#${rawTaskId}` } },
+  })).catch(() => {});
+  await dynamo.send(new DeleteItemCommand({
+    TableName: TABLE,
+    Key: { scope: { S: APP }, entity_key: { S: `AUTHOR#${authorPid}#TASK#${b64url(rawTaskId)}` } },
   })).catch(() => {});
 }
 
-console.log("Author appeal validation complete; synthetic artifacts removed.");
+console.log(`${APP.toUpperCase()} author appeal validation complete; synthetic artifacts removed.`);

@@ -11,8 +11,8 @@ import {
 import type { PCAdminBundle } from "../src/admin-client";
 
 const bundles: PCAdminBundle[] = [
-  { bundle_id: "pc/alice/internal/bundle-one", created_at: "2026-08-01T00:00:00Z", participant_id: "alice", participant_name: "Alice", participant_email: "alice@example.com", email_count: 10, calendar_count: 2, task_count: 1, edited_count: 0, masked_count: 0 },
-  { bundle_id: "pc/bob/internal/bundle-two", created_at: "2026-08-01T00:00:00Z", participant_id: "bob", participant_name: "Bob", participant_email: "bob@example.com", email_count: 3, calendar_count: 4, task_count: 2, edited_count: 0, masked_count: 0 },
+  { bundle_id: "pc/alice/internal/bundle-one", created_at: "2026-08-01T00:00:00Z", participant_id: "alice", participant_name: "Alice", participant_email: "alice@example.com", email_count: 10, calendar_count: 2, document_count: 1, task_count: 1, edited_count: 0, masked_count: 0 },
+  { bundle_id: "pc/bob/internal/bundle-two", created_at: "2026-08-01T00:00:00Z", participant_id: "bob", participant_name: "Bob", participant_email: "bob@example.com", email_count: 3, calendar_count: 4, document_count: 0, task_count: 2, edited_count: 0, masked_count: 0 },
 ];
 
 describe("Apollo PC admin bundle filters", () => {

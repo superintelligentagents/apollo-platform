@@ -4,6 +4,8 @@ import { screenFromHash } from "../src/ui/app";
 describe("refresh routing", () => {
   it("restores public workflow hashes", () => {
     expect(screenFromHash("#/home")).toBe("home");
+    expect(screenFromHash("#/my-tasks")).toBe("my-tasks");
+    expect(screenFromHash("#/my-tasks/task")).toBe("my-task");
     expect(screenFromHash("#/tasks")).toBe("tasks");
     expect(screenFromHash("#/upload/calendar")).toBe("upload-calendar");
     expect(screenFromHash("#/review")).toBe("review");

@@ -1,14 +1,12 @@
 import { buildLookup, createAliasPool, detectEntities, normalizeName, normalizePhoneKey } from "../alias";
-import { assembleBundle } from "../bundle";
-import { defaultReviewKey, MANIFEST_FILENAME, MAX_BODY_CHARS } from "../config";
+import type { AppRecommendation } from "../app-catalog";
+import { MANIFEST_FILENAME, MAX_BODY_CHARS, MAX_DOCUMENT_CHARS } from "../config";
+import { shortId } from "../ids";
 import { appendUploadLog, loadUploadLog, STORAGE_KEYS, type PlatformAdapter } from "../platform";
-import { buildReviewTaskSidecar, reviewTaskFilename } from "../review-task";
-import { clearClaimSnapshot, clearTrajectoryClaimSnapshot, saveClaimSnapshot, saveTrajectoryClaimSnapshot, seedTrajectoryJudgment, type ReviewClaim, type TrajectoryClaim } from "../review-client";
+import type { ReviewClaim, TrajectoryClaim } from "../review-client";
 import { buildBundleId, participantId as schemaParticipantId, participantUploadIdentity, validateBundle } from "../schema";
 import { META_KEYS, openStore, type RecordStore } from "../store";
-import { cardFor } from "../sources/registry";
-import { isReceiptCandidate, mineReceipt } from "../sources/receipts";
-import { seedCriteriaFromSteps, substantiveSteps, type PCTemplate } from "../templates";
+import { seedCriteriaFromSteps, shortTouchedSteps, substantiveSteps, type PCTemplate } from "../templates";
 import type {
   Entity,
   ItemDecision,
@@ -21,19 +19,8 @@ import { applyDecisions, clearDecisions, loadDecisions, saveDecisions } from "./
 import { el } from "./components/helpers";
 import { initialState, type AppState, type Ctx, type Screen } from "./context";
 import { participantKey } from "./identity";
-import { renderEntities } from "./screens/entities";
 import { renderHome } from "./screens/home";
-import { renderEmailItems, renderItems, renderCalendarItems } from "./screens/items";
 import { renderLogin } from "./screens/login";
-import { renderProgress } from "./screens/progress";
-import { renderReview } from "./screens/review";
-import { renderCalendarImport, renderMailImport, renderSources } from "./screens/sources";
-import { renderTaskEdit } from "./screens/task-edit";
-import { renderTasks } from "./screens/tasks";
-import { renderTaskReviewQueue } from "./screens/task-review-queue";
-import { renderTaskReviewEdit } from "./screens/task-review-edit";
-import { renderTrajectoryQueue } from "./screens/trajectory-queue";
-import { renderTrajectoryEdit } from "./screens/trajectory-edit";
 
 const SCREEN_PATH: Record<Screen, string> = {
   login: "/",
@@ -41,20 +28,52 @@ const SCREEN_PATH: Record<Screen, string> = {
   sources: "/sources",
   "import-mail": "/import/mail",
   "import-calendar": "/import/calendar",
+  "import-documents": "/import/documents",
   items: "/items",
   "upload-email": "/upload/email",
   "upload-calendar": "/upload/calendar",
+  "upload-documents": "/upload/documents",
   entities: "/people",
+  "my-tasks": "/my-tasks",
+  "my-task": "/my-tasks/task",
   tasks: "/tasks",
   "task-edit": "/write-task",
   review: "/review",
   progress: "/progress",
+  metrics: "/metrics",
+  examples: "/examples",
   "task-review-queue": "/review-task",
   "task-review-edit": "/review-task/edit",
   "trajectory-queue": "/grade",
   "trajectory-edit": "/grade/run",
 };
 const ENTITY_CLASSIFICATION_VERSION = "sender-privacy-v3";
+
+type ScreenRenderer = (ctx: Ctx) => HTMLElement;
+
+const SCREEN_LOADERS: Partial<Record<Screen, () => Promise<ScreenRenderer>>> = {
+  sources: () => import("./screens/items").then((module) => module.renderItems),
+  "import-mail": () => import("./screens/sources").then((module) => module.renderMailImport),
+  "import-calendar": () => import("./screens/sources").then((module) => module.renderCalendarImport),
+  "import-documents": () => import("./screens/sources").then((module) => module.renderDocumentImport),
+  items: () => import("./screens/items").then((module) => module.renderItems),
+  "upload-email": () => import("./screens/items").then((module) => module.renderEmailItems),
+  "upload-calendar": () => import("./screens/items").then((module) => module.renderCalendarItems),
+  "upload-documents": () => import("./screens/items").then((module) => module.renderDocumentItems),
+  entities: () => import("./screens/entities").then((module) => module.renderEntities),
+  "my-tasks": () => import("./screens/my-tasks").then((module) => module.renderMyTasks),
+  "my-task": () => import("./screens/my-tasks").then((module) => module.renderMyTask),
+  tasks: () => import("./screens/tasks").then((module) => module.renderTasks),
+  "task-edit": () => import("./screens/task-edit").then((module) => module.renderTaskEdit),
+  review: () => import("./screens/review").then((module) => module.renderReview),
+  progress: () => import("./screens/progress").then((module) => module.renderProgress),
+  metrics: () => import("./screens/metrics").then((module) => module.renderMetrics),
+  examples: () => import("./screens/examples").then((module) => module.renderExamples),
+  "task-review-queue": () => import("./screens/task-review-queue").then((module) => module.renderTaskReviewQueue),
+  "task-review-edit": () => import("./screens/task-review-edit").then((module) => module.renderTaskReviewEdit),
+  "trajectory-queue": () => import("./screens/trajectory-queue").then((module) => module.renderTrajectoryQueue),
+  "trajectory-edit": () => import("./screens/trajectory-edit").then((module) => module.renderTrajectoryEdit),
+};
 
 export function screenFromHash(hash: string): Screen | null {
   const path = hash.replace(/^#/, "") || "/";
@@ -64,15 +83,52 @@ export function screenFromHash(hash: string): Screen | null {
 
 export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Promise<void> {
   const state: AppState = initialState();
-  state.reviewKey = defaultReviewKey();
   const store: RecordStore = await openStore();
   const aliasPool = createAliasPool();
+  const screenRenderers: Partial<Record<Screen, ScreenRenderer>> = { login: renderLogin, home: renderHome };
+  const screenLoads = new Map<Screen, Promise<void>>();
+  const screenLoadErrors = new Map<Screen, string>();
   let requestedScreenOnLogin = typeof window === "undefined" ? null : screenFromHash(window.location.hash);
 
   let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
-  function flushAutosave() {
-    if (!state.identity) return;
-    void saveDecisions(adapter.storage, participantKey(state.identity), state);
+  function paintSaveStatus() {
+    if (typeof document === "undefined") return;
+    const label = state.saveStatus === "saving"
+      ? "Saving…"
+      : state.saveStatus === "error"
+        ? "Save failed — keep this tab open"
+        : state.lastSavedAt
+          ? `Saved locally ${new Date(state.lastSavedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+          : "Saved locally";
+    for (const node of document.querySelectorAll<HTMLElement>("[data-save-status]")) {
+      node.textContent = label;
+      node.dataset.state = state.saveStatus;
+    }
+  }
+
+  async function flushAutosave() {
+    if (!state.identity) return false;
+    if (autosaveTimer) {
+      clearTimeout(autosaveTimer);
+      autosaveTimer = null;
+    }
+    state.saveStatus = "saving";
+    paintSaveStatus();
+    const saved = await saveDecisions(adapter.storage, participantKey(state.identity), state);
+    state.saveStatus = saved ? "saved" : "error";
+    if (saved) state.lastSavedAt = new Date().toISOString();
+    paintSaveStatus();
+    return saved;
+  }
+
+  if (typeof window !== "undefined") {
+    const flushPendingAutosave = () => {
+      if (autosaveTimer) void flushAutosave();
+    };
+    window.addEventListener("pagehide", flushPendingAutosave);
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "hidden") flushPendingAutosave();
+    });
   }
 
   function defaultIncluded(record: SourceRecord): boolean {
@@ -122,9 +178,13 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
     const records = [...state.records.values()];
     const existing = state.entities;
     const identity = state.identity ?? undefined;
-    entityRefreshPromise = new Promise<Entity[]>((resolve) => {
+    entityRefreshPromise = new Promise<Entity[]>((resolve, reject) => {
       if (typeof Worker === "undefined") {
-        resolve(detectEntities(records, existing, aliasPool, identity));
+        try {
+          resolve(detectEntities(records, existing, aliasPool, identity));
+        } catch (error) {
+          reject(error);
+        }
         return;
       }
       const worker = new Worker(new URL("../entity-worker.ts", import.meta.url), { type: "module" });
@@ -134,7 +194,11 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       };
       worker.onerror = () => {
         worker.terminate();
-        resolve(detectEntities(records, existing, aliasPool, identity));
+        try {
+          resolve(detectEntities(records, existing, aliasPool, identity));
+        } catch (error) {
+          reject(error);
+        }
       };
       worker.postMessage({ records, existing, identity });
     }).then((entities) => {
@@ -152,6 +216,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
   }
 
   async function mineReceipts(): Promise<number> {
+    const { isReceiptCandidate, mineReceipt } = await import("../sources/receipts");
     const candidates = [...state.records.values()].filter(
       (r): r is Extract<SourceRecord, { source: "email" }> => r.source === "email" && isReceiptCandidate(r)
     );
@@ -169,6 +234,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
     }
     if (orders.length) await store.putRecords(orders);
     if (added) {
+      state.historyRevision++;
       state.imports.orders = {
         stats: {
           recordsEmitted: [...state.records.values()].filter((r) => r.source === "orders").length,
@@ -201,7 +267,9 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
     },
     autosave() {
       if (autosaveTimer) clearTimeout(autosaveTimer);
-      autosaveTimer = setTimeout(flushAutosave, 400);
+      state.saveStatus = "saving";
+      paintSaveStatus();
+      autosaveTimer = setTimeout(() => void flushAutosave(), 400);
     },
     update(patch) {
       Object.assign(state, patch);
@@ -224,18 +292,22 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
           ]);
           state.records = new Map(records.map((r) => [r.id, r]));
           state.entities = savedEntities?.entities ?? [];
-          if (saved) applyDecisions(state, saved);
+          if (saved) {
+            applyDecisions(state, saved);
+            state.lastSavedAt = saved.savedAt;
+          }
           state.uploadedCount = log.length;
           state.uploadedBySource = log.reduce((totals, entry) => {
             if (entry.source_counts) {
               totals.email += entry.source_counts.email ?? 0;
               totals.calendar += entry.source_counts.calendar ?? 0;
+              totals.documents += entry.source_counts.documents ?? 0;
               totals.knownBundles += 1;
             } else {
               totals.legacyRecords += entry.record_count;
             }
             return totals;
-          }, { email: 0, calendar: 0, knownBundles: 0, legacyRecords: 0 });
+          }, { email: 0, calendar: 0, documents: 0, knownBundles: 0, legacyRecords: 0 });
           rebuildReceiptEmailIds();
           // A saved entity index was produced after the most recent import;
           // trusting it avoids another full 100k-message sender analysis on
@@ -264,8 +336,14 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       },
 
       goto,
+      setReviewKey(key: string | null) {
+        state.reviewKey = key;
+        void adapter.storage.set(STORAGE_KEYS.reviewKey, key ?? "").catch(() => {});
+        render();
+      },
 
       async importFiles(kind: SourceKind, files: File[]) {
+        const { cardFor } = await import("../sources/registry");
         const card = cardFor(kind);
         if (!card.parser || !files.length) return;
         const floor =
@@ -280,6 +358,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
             files,
             {
               maxBodyChars: MAX_BODY_CHARS,
+              maxDocumentChars: MAX_DOCUMENT_CHARS,
               dateFloor: floor,
               locale: state.waDateOrder === "auto" ? {} : { dateOrder: state.waDateOrder },
             },
@@ -299,16 +378,26 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
           );
           const fresh = result.records.filter((r) => !state.records.has(r.id));
           for (const r of result.records) state.records.set(r.id, r);
+          if (result.records.length) state.historyRevision++;
           await store.putRecords(result.records);
           state.imports[kind] = { stats: result.stats, issues: result.issues, importedAt: new Date().toISOString() };
           let mined = 0;
           if (kind === "email") mined = await mineReceipts();
-          await refreshEntities();
           invalidatePrivacyAudit();
+          void refreshEntities()
+            .then(() => {
+              invalidatePrivacyAudit();
+            })
+            .catch((error) => {
+              notify(`Couldn't refresh privacy classifications: ${message(error)}`, "err");
+            })
+            .finally(render);
           notify(
             `Imported ${fresh.length.toLocaleString()} ${kind} record${fresh.length === 1 ? "" : "s"}` +
               (mined ? ` · mined ${mined} orders from receipts` : "") +
-              (result.stats.itemsSkipped ? ` · ${result.stats.itemsSkipped.toLocaleString()} outside your date window` : ""),
+              (result.stats.itemsSkipped
+                ? ` · ${result.stats.itemsSkipped.toLocaleString()} ${kind === "documents" ? "skipped" : "outside your date window"}`
+                : ""),
             "ok"
           );
         } catch (err) {
@@ -329,6 +418,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       toggleInclude(id: string) {
         const d = decisionFor(id);
         d.included = !d.included;
+        state.historyRevision++;
         invalidatePrivacyAudit();
         ctx.autosave();
         render();
@@ -346,6 +436,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
             state.decisions.set(id, { included, edits: {}, bodyEdit: null, maskOverrides: {} });
           }
         }
+        state.historyRevision++;
         invalidatePrivacyAudit();
         ctx.autosave();
         render();
@@ -353,6 +444,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
 
       bulkIncludeSources(sources: SourceKind[], included: boolean) {
         setSourcesIncluded(sources, included);
+        state.historyRevision++;
         invalidatePrivacyAudit();
         ctx.autosave();
         render();
@@ -431,17 +523,46 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
 
       startTask(template: PCTemplate) {
         state.activeTemplate = template;
+        state.pickerApp = "";
         state.taskDraft = {
-          taskId: `task-${crypto.randomUUID().slice(0, 8)}`,
+          region: "",
+          subjects: [],
+          taskId: `task-${shortId(8)}`,
           templateId: template.id,
           category: template.category,
           title: "",
           request: template.requestScaffold,
+          difficulty: "high",
           steps: template.steps.map((s, i) => ({ order: i, title: s.title, description: "" })),
           successCriteria: [],
+          requiredOutputs: [],
           referencedRecordIds: [],
           expectedAnswer: "",
           notes: "",
+        };
+        state.formErrors = {};
+        goto("task-edit");
+      },
+
+      startRecommendedTask(recommendation: AppRecommendation) {
+        const source = recommendation.app.task;
+        state.activeTemplate = null;
+        state.pickerApp = recommendation.app.id;
+        state.taskDraft = {
+          region: "GLOBAL",
+          subjects: [...source.subjects],
+          taskId: `task-${shortId(8)}`,
+          templateId: `mypcbench-${recommendation.app.id}`,
+          category: source.category,
+          title: source.title,
+          request: source.request,
+          difficulty: "high",
+          steps: source.steps.map((step, index) => ({ ...step, order: index })),
+          successCriteria: [...source.successCriteria],
+          requiredOutputs: [...source.requiredOutputs],
+          referencedRecordIds: recommendation.recordIds.filter((id) => state.records.has(id)),
+          expectedAnswer: "",
+          notes: `MyPCBench app: ${recommendation.app.name}`,
         };
         state.formErrors = {};
         goto("task-edit");
@@ -451,14 +572,19 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         const task = state.tasks.find((t) => t.task_id === taskId);
         if (!task) return;
         state.activeTemplate = null;
+        state.pickerApp = "";
         state.taskDraft = {
+          region: task.metadata?.region ?? "",
+          subjects: task.metadata?.subjects ?? [],
           taskId: task.task_id,
           templateId: "",
           category: task.category,
           title: task.task_title,
           request: task.agent_request,
+          difficulty: task.difficulty ?? "high",
           steps: task.steps.length ? task.steps : [{ order: 0, title: "Step", description: "" }],
           successCriteria: task.success_criteria,
+          requiredOutputs: task.required_outputs ?? [],
           referencedRecordIds: task.referenced_record_ids,
           expectedAnswer: task.expected_answer ?? "",
           notes: task.notes ?? "",
@@ -472,10 +598,21 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         if (!draft) return false;
         const errors: Record<string, string> = {};
         const request = draft.request.trim();
+        const tooShortSteps = shortTouchedSteps(draft.steps);
         const steps = substantiveSteps(draft.steps);
+        const isAppGuided = draft.templateId.startsWith("mypcbench-");
         if (request.length < 15) errors.request = "Write the request out — a sentence or two.";
+        if (isAppGuided && request.length < 120) errors.request = "Keep the full goal, constraints, connected apps, and final deliverable in the request.";
         if (/\[[^\]]+\]/.test(request)) errors.request = "Replace the [bracketed] placeholders with your own details.";
-        if (!steps.length) errors.steps = "Fill in at least one task step — a sentence is enough.";
+        if (tooShortSteps.length) {
+          errors.steps = `Finish ${tooShortSteps.map((step) => `“${step.title.trim() || "Untitled"}”`).join(", ")} as a complete rubric sentence, or clear ${tooShortSteps.length === 1 ? "it" : "them"}.`;
+        } else if (!steps.length) {
+          errors.steps = "Fill in at least one task step — a sentence is enough.";
+        } else if (isAppGuided && steps.length < 4) {
+          errors.steps = "Keep at least four dependent phases so this remains a long-horizon app workflow.";
+        }
+        if (!draft.region) errors.region = "Choose the country or Global.";
+        if (!draft.subjects.length) errors.subjects = "Choose at least one subject.";
         const template = state.activeTemplate;
         if (template?.requiresExpectedAnswer && !draft.expectedAnswer.trim()) {
           errors.expected = "This task type needs the ground-truth answer (you know it — the agent has to find it).";
@@ -492,14 +629,17 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
           if (r) sources.add(r.source);
         }
         const task: PCTask = {
+          metadata: { region: draft.region || undefined, subjects: draft.subjects ?? [] },
           task_id: draft.taskId,
           category: draft.category,
           task_title: draft.title.trim() || deriveTitle(request),
           agent_request: request,
+          difficulty: draft.difficulty,
           steps,
           success_criteria: draft.successCriteria.filter((c) => c.trim()).length
             ? draft.successCriteria.filter((c) => c.trim())
             : seedCriteriaFromSteps(steps),
+          required_outputs: draft.requiredOutputs.filter((value) => value.trim()),
           required_sources: [...sources],
           referenced_record_ids: draft.referencedRecordIds,
           expected_answer: draft.expectedAnswer.trim() || null,
@@ -556,7 +696,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         if (!state.bundleId || !state.bundleId.startsWith(`pc/${uploadParticipantId}/internal/`)) {
           state.bundleCreatedAt = new Date().toISOString();
           state.bundleId = buildBundleId(uploadIdentity, state.bundleCreatedAt);
-          flushAutosave();
+          void flushAutosave();
         }
         const bundleId = state.bundleId;
         state.busy = "Preparing your bundle…";
@@ -567,6 +707,8 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
           // produces a claimable task. Assembly is shared with the review
           // screen's download-preview, so what you previewed is exactly what
           // ships.
+          const { assembleBundle } = await import("../bundle");
+          const { buildReviewTaskSidecar, reviewTaskFilename } = await import("../review-task");
           const { uploads, manifestBody, privacyAudit, sanitizedTasks } = await assembleBundle(
             state,
             store,
@@ -625,18 +767,20 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
             source_counts: {
               email: included.filter((record) => record.source === "email" || record.source === "orders").length,
               calendar: included.filter((record) => record.source === "calendar").length,
+              documents: included.filter((record) => record.source === "documents").length,
             },
             task_count: state.tasks.length,
             at: new Date().toISOString(),
           });
           state.uploadedBySource.email += included.filter((record) => record.source === "email" || record.source === "orders").length;
           state.uploadedBySource.calendar += included.filter((record) => record.source === "calendar").length;
+          state.uploadedBySource.documents += included.filter((record) => record.source === "documents").length;
           state.uploadedBySource.knownBundles += 1;
           state.bundleId = null;
           state.bundleCreatedAt = null;
           state.tasks = [];
           state.privacyAudit = null;
-          flushAutosave();
+          void flushAutosave();
           notify("Bundle submitted. Thank you — this is exactly the data we need.", "ok");
           goto("home");
         } catch (err) {
@@ -648,6 +792,10 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       },
 
       async eraseAll() {
+        const { resetMyTasksViewState } = await import("./screens/my-tasks");
+        resetMyTasksViewState();
+        await adapter.storage.set(STORAGE_KEYS.reviewKey, "");
+        state.myTaskSelection = null;
         await store.clearAll();
         if (state.identity) await clearDecisions(adapter.storage, participantKey(state.identity));
         const identity = state.identity;
@@ -676,34 +824,38 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         return state.identity?.name || state.identity?.email || "unknown";
       },
       reviewerPid() {
-        return state.identity ? schemaParticipantId(state.identity) : "";
+        return state.identity ? schemaParticipantId(participantUploadIdentity(state.identity, state.entities)) : "";
       },
       startReview(claim: ReviewClaim) {
         state.reviewClaim = claim;
         state.reviewRubrics = null;
+        state.reviewRemovedRubrics = null;
         state.reviewEdits = null;
-        void saveClaimSnapshot(adapter.storage, { claim, rubrics: null, edits: null });
+        void import("../review-client").then(({ saveClaimSnapshot }) => saveClaimSnapshot(adapter.storage, { claim, rubrics: null, removedRubrics: null, edits: null }));
         goto("task-review-edit");
       },
       endReview(message: string) {
         state.reviewClaim = null;
         state.reviewRubrics = null;
+        state.reviewRemovedRubrics = null;
         state.reviewEdits = null;
-        void clearClaimSnapshot(adapter.storage);
+        void import("../review-client").then(({ clearClaimSnapshot }) => clearClaimSnapshot(adapter.storage));
         notify(message, "ok");
         goto("task-review-queue");
       },
       startTrajectoryReview(claim: TrajectoryClaim) {
-        const judgment = seedTrajectoryJudgment(claim.run);
-        state.trajectoryClaim = claim;
-        state.trajectoryJudgment = judgment;
-        void saveTrajectoryClaimSnapshot(adapter.storage, { claim, judgment });
-        goto("trajectory-edit");
+        void import("../review-client").then(({ saveTrajectoryClaimSnapshot, seedTrajectoryJudgment }) => {
+          const judgment = seedTrajectoryJudgment(claim.run);
+          state.trajectoryClaim = claim;
+          state.trajectoryJudgment = judgment;
+          void saveTrajectoryClaimSnapshot(adapter.storage, { claim, judgment });
+          goto("trajectory-edit");
+        });
       },
       endTrajectoryReview(message: string) {
         state.trajectoryClaim = null;
         state.trajectoryJudgment = null;
-        void clearTrajectoryClaimSnapshot(adapter.storage);
+        void import("../review-client").then(({ clearTrajectoryClaimSnapshot }) => clearTrajectoryClaimSnapshot(adapter.storage));
         notify(message, "ok");
         goto("trajectory-queue");
       },
@@ -736,8 +888,9 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
   }
 
   function transition(screen: Screen) {
-    if (screen === "upload-email" && state.filters.source !== "email") Object.assign(state.filters, { source: "email", category: "all", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 });
-    if (screen === "upload-calendar" && state.filters.source !== "calendar") Object.assign(state.filters, { source: "calendar", category: "all", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 });
+    if (screen === "upload-email" && state.filters.source !== "email") Object.assign(state.filters, { source: "email", category: "all", app: "", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 });
+    if (screen === "upload-calendar" && state.filters.source !== "calendar") Object.assign(state.filters, { source: "calendar", category: "all", app: "", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 });
+    if (screen === "upload-documents" && state.filters.source !== "documents") Object.assign(state.filters, { source: "documents", category: "all", app: "", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 });
     state.screen = screen;
     state.openItemId = null;
     state.openItemBody = null;
@@ -749,7 +902,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
     }
     render();
     window.scrollTo({ top: 0 });
-    flushAutosave();
+    void flushAutosave();
   }
 
   function goto(screen: Screen) {
@@ -761,6 +914,7 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
   function reachableScreen(target: Screen): Screen {
     if (!state.identity) return "login";
     if (target === "login") return "home";
+    if (target === "my-task" && !state.myTaskSelection) return "my-tasks";
     if (target === "task-edit" && !state.taskDraft) return "tasks";
     if (target === "task-review-edit" && !state.reviewClaim) return "task-review-queue";
     if (target === "trajectory-edit" && !state.trajectoryClaim) return "trajectory-queue";
@@ -788,9 +942,11 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
     );
     const NAV: Array<{ label: string; target: Screen; owns: Screen[] }> = [
       { label: "Dashboard", target: "home", owns: ["home", "progress"] },
-      { label: "1. Import data", target: "sources", owns: ["sources", "import-mail", "import-calendar"] },
-      { label: "2. Upload data", target: "items", owns: ["items", "upload-email", "upload-calendar", "entities", "review"] },
-      { label: "3. Write tasks", target: "tasks", owns: ["tasks", "task-edit"] },
+      { label: "1. Upload & import data", target: "items", owns: ["sources", "import-mail", "import-calendar", "import-documents", "items", "upload-email", "upload-calendar", "upload-documents", "entities", "review"] },
+      { label: "2. Write tasks", target: "tasks", owns: ["tasks", "task-edit"] },
+      { label: "Metrics & admin", target: "metrics", owns: ["metrics"] },
+      { label: "Examples", target: "examples", owns: ["examples"] },
+      { label: "My tasks", target: "my-tasks", owns: ["my-tasks", "my-task"] },
       { label: "Review", target: "task-review-queue", owns: ["task-review-queue", "task-review-edit"] },
       { label: "Grade", target: "trajectory-queue", owns: ["trajectory-queue", "trajectory-edit"] },
     ];
@@ -806,6 +962,11 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       )
     );
     bar.append(el("div", { class: "topbar-left" }, navGroup, brand, navLinks));
+    const activeNav = navLinks.querySelector<HTMLElement>(".topnav-link.active");
+    requestAnimationFrame(() => {
+      if (!activeNav || navLinks.scrollWidth <= navLinks.clientWidth) return;
+      navLinks.scrollLeft = Math.max(0, activeNav.offsetLeft - (navLinks.clientWidth - activeNav.clientWidth) / 2);
+    });
     if (state.identity) {
       bar.append(
         el(
@@ -824,25 +985,6 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
   }
 
   function render() {
-    const screens: Record<Screen, (c: Ctx) => HTMLElement> = {
-      login: renderLogin,
-      home: renderHome,
-      sources: renderSources,
-      "import-mail": renderMailImport,
-      "import-calendar": renderCalendarImport,
-      items: renderItems,
-      "upload-email": renderEmailItems,
-      "upload-calendar": renderCalendarItems,
-      entities: renderEntities,
-      tasks: renderTasks,
-      "task-edit": renderTaskEdit,
-      review: renderReview,
-      progress: renderProgress,
-      "task-review-queue": renderTaskReviewQueue,
-      "task-review-edit": renderTaskReviewEdit,
-      "trajectory-queue": renderTrajectoryQueue,
-      "trajectory-edit": renderTrajectoryEdit,
-    };
     const children: HTMLElement[] = [];
     if (state.screen !== "login") children.push(topBar());
     if (state.notice) {
@@ -867,11 +1009,56 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
         )
       );
     }
-    children.push(screens[state.screen](ctx));
+    const renderer = screenRenderers[state.screen];
+    if (renderer) children.push(renderer(ctx));
+    else {
+      if (!screenLoadErrors.has(state.screen)) void loadScreen(state.screen);
+      children.push(renderScreenLoading(state.screen));
+    }
     root.replaceChildren(...children);
   }
 
+  function loadScreen(screen: Screen): Promise<void> {
+    if (screenRenderers[screen] || screenLoads.has(screen)) return screenLoads.get(screen) ?? Promise.resolve();
+    const loader = SCREEN_LOADERS[screen];
+    if (!loader) return Promise.reject(new Error(`No renderer for ${screen}`));
+    screenLoadErrors.delete(screen);
+    const pending = loader()
+      .then((renderer) => {
+        screenRenderers[screen] = renderer;
+      })
+      .catch((error) => {
+        screenLoadErrors.set(screen, message(error));
+      })
+      .finally(() => {
+        screenLoads.delete(screen);
+        if (state.screen === screen) render();
+      });
+    screenLoads.set(screen, pending);
+    return pending;
+  }
+
+  function renderScreenLoading(screen: Screen): HTMLElement {
+    const error = screenLoadErrors.get(screen);
+    return el(
+      "section",
+      { class: "screen narrow screen-loading", role: "status", "aria-live": "polite" },
+      el("p", { class: "step-kicker mono" }, error ? "LOAD ERROR" : "LOADING"),
+      el("h2", { class: "display" }, error ? "This screen couldn't load" : "Opening workspace…"),
+      error ? el("p", { class: "screen-sub" }, error) : el("p", { class: "screen-sub" }, "Apollo is loading only the tools needed for this step."),
+      error ? el("button", { class: "btn primary", type: "button", onclick: () => { screenLoadErrors.delete(screen); void loadScreen(screen); render(); } }, "Try again") : null
+    );
+  }
+
   render();
+
+  const preloadCoreScreens = () => {
+    void loadScreen("items");
+    void loadScreen("tasks");
+    void loadScreen("task-edit");
+  };
+  if (typeof requestIdleCallback === "function") requestIdleCallback(preloadCoreScreens, { timeout: 2_000 });
+  else setTimeout(preloadCoreScreens, 750);
 
   if (typeof history !== "undefined" && typeof window !== "undefined") {
     setUrl(state.screen, true);
@@ -913,6 +1100,11 @@ export async function mountApp(root: HTMLElement, adapter: PlatformAdapter): Pro
       }
     }
   });
+
+  // Team access is entered on this device, never compiled into public assets.
+  void adapter.storage.get(STORAGE_KEYS.reviewKey).then((key) => {
+    if (key) { state.reviewKey = key; if (state.screen !== "login") render(); }
+  }).catch(() => {});
 
   // Prefill the login form with the last-used identity (never auto-login).
   adapter.storage

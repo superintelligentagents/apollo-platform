@@ -194,6 +194,8 @@ export function serializeRecord(
     ? { subject: d.edits.subject }
     : record.source === "calendar"
       ? { summary: d.edits.summary, description: d.edits.description }
+      : record.source === "documents"
+        ? { title: d.edits.title, text: d.edits.text }
       : d.edits;
   const effectiveDecision: ItemDecision = { ...d, edits: allowedEdits };
   const edited = Object.keys(allowedEdits).filter((k) => allowedEdits[k] !== undefined);
@@ -251,6 +253,18 @@ export function serializeRecord(
         attendees: record.attendees.map((a, index) => redactAddress(a, ctx, aliased, text, `attendee_${index}`)),
         rrule: record.rrule === null ? null : text("rrule", record.rrule),
         status: record.status === null ? null : text("status", record.status),
+      };
+      break;
+    case "documents":
+      out = {
+        ...base,
+        filename: text("filename", record.filename),
+        title: text("title", editString(d.edits.title, record.title)),
+        mime_type: text("mime_type", record.mimeType),
+        size: record.size,
+        text: text("text", editString(d.edits.text, record.text)),
+        page_count: record.pageCount,
+        body_truncated: record.bodyTruncated,
       };
       break;
     case "contacts": {

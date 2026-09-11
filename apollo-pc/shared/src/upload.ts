@@ -1,6 +1,8 @@
 export type PresignResponse = {
   url: string;
   fields: Record<string, string>;
+  key?: string;
+  completion?: { token: string; expires_at: number };
 };
 
 export type PresignRequest = {
@@ -51,7 +53,40 @@ export async function requestPresign(endpoint: string, req: PresignRequest): Pro
   if (!data.url || !data.fields) throw new Error("Presign returned a malformed response.");
   assertSecureUploadUrl(data.url, "Presigned upload");
   assertEncryptedPresignFields(data.fields);
-  return { url: data.url, fields: data.fields };
+  return {
+    url: data.url,
+    fields: data.fields,
+    key: typeof data.key === "string" ? data.key : undefined,
+    completion: data.completion && typeof data.completion.token === "string" && Number.isFinite(Number(data.completion.expires_at))
+      ? { token: data.completion.token, expires_at: Number(data.completion.expires_at) }
+      : undefined,
+  };
+}
+
+export function uploadCompletionEndpoint(presignEndpoint: string): string {
+  const url = new URL(presignEndpoint);
+  url.pathname = url.pathname.replace(/\/presign\/?$/, "/upload/complete");
+  if (!url.pathname.endsWith("/upload/complete")) url.pathname = "/upload/complete";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+export async function completeUploadedObject(endpoint: string, presign: PresignResponse): Promise<void> {
+  if (!presign.key || !presign.completion) return;
+  const res = await fetch(uploadCompletionEndpoint(endpoint), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      key: presign.key,
+      token: presign.completion.token,
+      expires_at: presign.completion.expires_at,
+    }),
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`Upload indexing failed: HTTP ${res.status} ${text.trim()}`.trim());
+  }
 }
 
 export async function uploadViaPresign(
@@ -78,4 +113,5 @@ export async function uploadJsonBrowser(
 ): Promise<void> {
   const presign = await requestPresign(endpoint, req);
   await uploadViaPresign(presign, body, req.filename);
+  await completeUploadedObject(endpoint, presign);
 }

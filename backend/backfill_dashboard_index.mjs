@@ -30,7 +30,23 @@ async function writeBatchFully(client, tableName, records) {
   }
 }
 
-async function queryTaskRecords(client, tableName, scope) {
+async function deleteBatchFully(client, tableName, records) {
+  let pending = records.map((record) => ({ DeleteRequest: { Key: { scope: record.scope, entity_key: record.entity_key } } }));
+  let attempt = 0;
+  while (pending.length) {
+    const response = await client.send(new BatchWriteCommand({
+      RequestItems: { [tableName]: pending },
+    }));
+    pending = response.UnprocessedItems?.[tableName] || [];
+    if (pending.length) {
+      attempt += 1;
+      if (attempt > 8) throw new Error(`${pending.length} stale author index records remained unprocessed.`);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(2_000, 100 * 2 ** attempt)));
+    }
+  }
+}
+
+async function queryRecords(client, tableName, scope, prefix) {
   const records = [];
   let ExclusiveStartKey;
   do {
@@ -38,7 +54,7 @@ async function queryTaskRecords(client, tableName, scope) {
       TableName: tableName,
       KeyConditionExpression: "#scope = :scope AND begins_with(#entity, :task)",
       ExpressionAttributeNames: { "#scope": "scope", "#entity": "entity_key" },
-      ExpressionAttributeValues: { ":scope": scope, ":task": "TASK#" },
+      ExpressionAttributeValues: { ":scope": scope, ":task": prefix },
       ExclusiveStartKey,
       ConsistentRead: true,
     }));
@@ -64,6 +80,7 @@ process.env.DASHBOARD_TABLE = "";
 
 const moduleUrl = new URL(`./lambda_presign.js?backfill=${scope}-${Date.now()}`, import.meta.url);
 const {
+  buildAuthorDashboardIndexRecord,
   buildDashboardIndexRecord,
   dashboardIndexScope,
   loadAdminDashboard,
@@ -76,6 +93,8 @@ const uniqueKeys = new Set(records.map((record) => record.entity_key));
 if (uniqueKeys.size !== records.length) {
   throw new Error(`Index key collision: ${records.length - uniqueKeys.size} duplicate task id(s).`);
 }
+const authorRecords = records.map((record) => buildAuthorDashboardIndexRecord(record));
+if (authorRecords.some((record) => !record)) throw new Error("At least one task has no valid author index key.");
 
 const statusCounts = records.reduce((counts, record) => {
   counts[record.status] = (counts[record.status] || 0) + 1;
@@ -87,6 +106,7 @@ console.log(JSON.stringify({
   table: tableName,
   source_total: dashboard.total,
   converted: records.length,
+  author_records: authorRecords.length,
   status_counts: statusCounts,
   s3_writes: 0,
 }, null, 2));
@@ -95,7 +115,11 @@ if (!write) process.exit(0);
 const client = DynamoDBDocumentClient.from(new DynamoDBClient({ region: process.env.AWS_REGION || "us-east-1" }), {
   marshallOptions: { removeUndefinedValues: true },
 });
-for (const batch of chunks(records, 25)) await writeBatchFully(client, tableName, batch);
+const existingAuthors = await queryRecords(client, tableName, scope, "AUTHOR#");
+const expectedAuthorKeys = new Set(authorRecords.map((record) => record.entity_key));
+const staleAuthors = existingAuthors.filter((record) => !expectedAuthorKeys.has(record.entity_key));
+for (const batch of chunks(staleAuthors, 25)) await deleteBatchFully(client, tableName, batch);
+for (const batch of chunks([...records, ...authorRecords], 25)) await writeBatchFully(client, tableName, batch);
 await client.send(new PutCommand({
   TableName: tableName,
   Item: {
@@ -108,8 +132,23 @@ await client.send(new PutCommand({
     indexed_at: indexedAt,
   },
 }));
+await client.send(new PutCommand({
+  TableName: tableName,
+  Item: {
+    scope,
+    entity_key: "AUTHOR_META",
+    entity_type: "META",
+    ready: true,
+    expected_count: authorRecords.length,
+    backfilled_at: indexedAt,
+    indexed_at: indexedAt,
+  },
+}));
 
-const stored = await queryTaskRecords(client, tableName, scope);
+const [stored, storedAuthors] = await Promise.all([
+  queryRecords(client, tableName, scope, "TASK#"),
+  queryRecords(client, tableName, scope, "AUTHOR#"),
+]);
 const expected = new Map(records.map((record) => [record.entity_key, record]));
 const mismatches = stored.filter((record) => {
   const source = expected.get(record.entity_key);
@@ -129,13 +168,15 @@ const mismatches = stored.filter((record) => {
     "signoff_action",
   ].some((field) => (record[field] ?? null) !== (source[field] ?? null));
 });
-if (stored.length !== records.length || mismatches.length) {
-  throw new Error(`Index parity failed: expected ${records.length}, stored ${stored.length}, mismatches ${mismatches.length}.`);
+if (stored.length !== records.length || storedAuthors.length !== authorRecords.length || mismatches.length) {
+  throw new Error(`Index parity failed: expected ${records.length}/${authorRecords.length}, stored ${stored.length}/${storedAuthors.length}, mismatches ${mismatches.length}.`);
 }
 console.log(JSON.stringify({
   verified: true,
   scope,
   stored: stored.length,
+  author_records: storedAuthors.length,
+  stale_author_records_removed: staleAuthors.length,
   mismatches: 0,
   meta_written_last: true,
   s3_writes: 0,

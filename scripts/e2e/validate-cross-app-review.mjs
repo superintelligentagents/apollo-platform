@@ -152,6 +152,19 @@ function deleteS3(key) {
   spawnSync("aws", ["s3api", "delete-object", "--bucket", BUCKET, "--key", key], { stdio: "ignore" });
 }
 
+function deleteDashboardRows(app, participantId, taskId) {
+  for (const entityKey of [`TASK#${taskId}`, `AUTHOR#${participantId}#TASK#${b64url(taskId)}`]) {
+    spawnSync("aws", [
+      "dynamodb",
+      "delete-item",
+      "--table-name",
+      "apollo-dashboard-index",
+      "--key",
+      JSON.stringify({ scope: { S: app }, entity_key: { S: entityKey } }),
+    ], { stdio: "ignore" });
+  }
+}
+
 function s3Exists(key) {
   if (!key) return false;
   return spawnSync("aws", ["s3api", "head-object", "--bucket", BUCKET, "--key", key], { stdio: "ignore" }).status === 0;
@@ -176,9 +189,11 @@ async function validate(app) {
   const otherBaseline = await reviewStatus(otherApp, otherPid);
   let sourceKey = "";
   let auditKey = "";
+  let taskId = "";
   try {
     const uploaded = await uploadReviewTask(app, authorPid, marker);
     sourceKey = uploaded.sourceKey;
+    taskId = String(uploaded.payload.task_id);
     auditKey = uploadCompletedAudit(app, uploaded.payload);
     const expectedSegment = app === "pc"
       ? `/${authorPid}/pc/${authorPid}/internal/bundle-${marker}/`
@@ -205,6 +220,7 @@ async function validate(app) {
       check(!s3Exists(lockKey), `${app}: disposable review lock removed`);
       check(!s3Exists(auditKey), `${app}: disposable pre-QC artifact removed`);
     }
+    if (taskId) deleteDashboardRows(app, authorPid, taskId);
   }
   return sourceKey;
 }

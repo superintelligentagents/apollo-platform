@@ -134,7 +134,16 @@ export const PC_TEMPLATES: PCTemplate[] = [
   },
 ];
 
-export const MIN_STEP_LENGTH = 12;
+// Match Apollo v2: every authored step becomes a rubric item, so a touched
+// step must contain at least a short, complete sentence before it can be saved.
+export const MIN_STEP_LENGTH = 15;
+
+export function shortTouchedSteps(steps: PCTaskStep[]): PCTaskStep[] {
+  return steps.filter((step) => {
+    const length = step.description.trim().length;
+    return length > 0 && length < MIN_STEP_LENGTH;
+  });
+}
 
 export function substantiveSteps(steps: PCTaskStep[]): PCTaskStep[] {
   return steps

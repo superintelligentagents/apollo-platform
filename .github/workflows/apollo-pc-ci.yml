@@ -1,0 +1,74 @@
+name: Apollo PC CI
+
+on:
+  pull_request:
+    paths:
+      - "apollo-pc/**"
+      - "backend/**"
+      - "scripts/osworld_runner/**"
+      - "scripts/trajectory_review/**"
+      - ".github/workflows/apollo-pc-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apollo-pc-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web-and-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            apollo-pc/package-lock.json
+            backend/package-lock.json
+
+      - name: Install PC dependencies
+        run: npm ci --prefix apollo-pc
+
+      - name: Typecheck PC
+        run: npm run typecheck --prefix apollo-pc
+
+      - name: Test PC
+        run: npm test --prefix apollo-pc
+
+      - name: Build PC web client
+        run: npm run build:web --prefix apollo-pc
+
+      - name: Install backend dependencies
+        run: npm ci --prefix backend
+
+      - name: Test shared backend
+        run: npm test --prefix backend
+
+      - name: Test PC context provisioner
+        run: node --test scripts/osworld_runner/prepare_pc_context.test.mjs
+
+  runner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test OSWorld bridge
+        run: python -m unittest scripts.osworld_runner.test_run
+
+      - name: Test trajectory packaging and judging
+        run: python -m unittest discover -s scripts/trajectory_review -p 'test_*.py'

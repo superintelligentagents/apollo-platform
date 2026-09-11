@@ -59,12 +59,12 @@ export async function loadDecisions(storage: KeyValueStore, participantId: strin
   }
 }
 
-export async function saveDecisions(storage: KeyValueStore, participantId: string, state: AppState): Promise<void> {
+export async function saveDecisions(storage: KeyValueStore, participantId: string, state: AppState): Promise<boolean> {
   try {
     await storage.set(STORAGE_KEYS.decisions(participantId), JSON.stringify(serializeDecisions(state)));
+    return true;
   } catch {
-    // localStorage quota — decisions are sparse so this is unlikely; a failed
-    // autosave must never break the flow.
+    return false;
   }
 }
 

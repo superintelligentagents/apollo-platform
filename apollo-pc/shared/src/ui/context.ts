@@ -1,6 +1,7 @@
 import type { PlatformAdapter } from "../platform";
 import type { RecordStore } from "../store";
 import type { PCTemplate } from "../templates";
+import type { AppCategory, AppRecommendation } from "../app-catalog";
 import type {
   Entity,
   ItemDecision,
@@ -19,14 +20,20 @@ export type Screen =
   | "sources"
   | "import-mail"
   | "import-calendar"
+  | "import-documents"
   | "items"
   | "upload-email"
   | "upload-calendar"
+  | "upload-documents"
   | "entities"
+  | "my-tasks"
+  | "my-task"
   | "tasks"
   | "task-edit"
   | "review"
   | "progress"
+  | "metrics"
+  | "examples"
   | "task-review-queue"
   | "task-review-edit"
   | "trajectory-queue"
@@ -42,6 +49,7 @@ export type ItemFilters = {
   queryScope: "all" | "email" | "sender" | "subject";
   status: "all" | "included" | "excluded" | "edited";
   category: string;
+  app: string;
   direction: "all" | "received" | "sent";
   correspondent: string;
   service: string;
@@ -59,13 +67,17 @@ export type SourceImportInfo = {
 };
 
 export type TaskDraft = {
+  region: string;
+  subjects: string[];
   taskId: string; // stable across edits
   templateId: string;
   category: PCTask["category"];
   title: string;
   request: string;
+  difficulty: "low" | "medium" | "high";
   steps: { order: number; title: string; description: string }[];
   successCriteria: string[];
+  requiredOutputs: string[];
   referencedRecordIds: string[];
   expectedAnswer: string;
   notes: string;
@@ -76,7 +88,7 @@ export type AppState = {
   identity: ParticipantIdentity | null;
   lastIdentity: ParticipantIdentity | null;
   uploadedCount: number;
-  uploadedBySource: { email: number; calendar: number; knownBundles: number; legacyRecords: number };
+  uploadedBySource: { email: number; calendar: number; documents: number; knownBundles: number; legacyRecords: number };
 
   // Header-level records in memory; email bodies live in IndexedDB.
   records: Map<string, SourceRecord>;
@@ -85,6 +97,9 @@ export type AppState = {
   // Compact source-wide choices keep a 100k-message "select all/private"
   // action from creating and serializing 100k identical decisions.
   sourceInclusionDefaults: Partial<Record<SourceKind, boolean>>;
+  // Bumped whenever records or their inclusion state change. Mailbox-wide UI
+  // indexes use this to invalidate without hashing 100k entries on each paint.
+  historyRevision: number;
   // Email ids that a mined receipt points back at (promoted to included even
   // when they look promotional).
   receiptEmailIds: Set<string>;
@@ -96,15 +111,20 @@ export type AppState = {
   rules: ReplacementRule[];
   imports: Partial<Record<SourceKind, SourceImportInfo>>;
 
+  myTaskSelection: import("../review-client").MyTaskItem | null;
   tasks: PCTask[];
   taskDraft: TaskDraft | null;
+  saveStatus: "saved" | "saving" | "error";
+  lastSavedAt: string | null;
   activeTemplate: PCTemplate | null;
   // Record-picker search inside task-edit.
   pickerQuery: string;
-  pickerSource: "all" | "email" | "calendar" | "selected";
+  pickerSource: "all" | "email" | "calendar" | "documents" | "selected";
   pickerPage: number;
   pickerOpenId: string | null;
   pickerOpenBody: string | null;
+  pickerApp: string;
+  discoveryCategory: AppCategory | "all";
 
   filters: ItemFilters;
   openItemId: string | null;
@@ -127,6 +147,7 @@ export type AppState = {
   reviewKey: string | null;
   reviewClaim: import("../review-client").ReviewClaim | null;
   reviewRubrics: import("../review-client").RubricRow[] | null;
+  reviewRemovedRubrics: import("../review-client").RemovedRubric[] | null;
   reviewEdits: { title: string; request: string; difficulty: string; evergreenChecked?: boolean } | null;
   trajectoryClaim: import("../review-client").TrajectoryClaim | null;
   trajectoryJudgment: import("../review-client").TrajectoryJudgmentDraft | null;
@@ -142,6 +163,7 @@ export type Ctx = {
   actions: {
     login(identity: ParticipantIdentity): Promise<void>;
     goto(screen: Screen): void;
+    setReviewKey(key: string | null): void;
     importFiles(kind: SourceKind, files: File[]): Promise<void>;
     defaultIncluded(record: SourceRecord): boolean;
     isIncluded(record: SourceRecord): boolean;
@@ -157,6 +179,7 @@ export type Ctx = {
     addRule(rule: ReplacementRule): void;
     removeRule(index: number): void;
     startTask(template: PCTemplate): void;
+    startRecommendedTask(recommendation: AppRecommendation): void;
     editTask(taskId: string): void;
     saveTaskDraft(): boolean;
     deleteTask(taskId: string): void;
@@ -175,7 +198,7 @@ export type Ctx = {
 };
 
 export function emptyFilters(): ItemFilters {
-  return { source: "all", from: "", to: "", query: "", queryScope: "all", status: "all", category: "all", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 };
+  return { source: "all", from: "", to: "", query: "", queryScope: "all", status: "all", category: "all", app: "", direction: "all", correspondent: "", service: "", domain: "", sender: "", recurrence: "all", linked: "all", page: 0 };
 }
 
 export function initialState(): AppState {
@@ -184,10 +207,11 @@ export function initialState(): AppState {
     identity: null,
     lastIdentity: null,
     uploadedCount: 0,
-    uploadedBySource: { email: 0, calendar: 0, knownBundles: 0, legacyRecords: 0 },
+    uploadedBySource: { email: 0, calendar: 0, documents: 0, knownBundles: 0, legacyRecords: 0 },
     records: new Map(),
     decisions: new Map(),
     sourceInclusionDefaults: {},
+    historyRevision: 0,
     receiptEmailIds: new Set(),
     entities: [],
     entityScope: "people",
@@ -196,14 +220,19 @@ export function initialState(): AppState {
     entityIndexing: false,
     rules: [],
     imports: {},
+    myTaskSelection: null,
     tasks: [],
     taskDraft: null,
+    saveStatus: "saved",
+    lastSavedAt: null,
     activeTemplate: null,
     pickerQuery: "",
     pickerSource: "all",
     pickerPage: 0,
     pickerOpenId: null,
     pickerOpenBody: null,
+    pickerApp: "",
+    discoveryCategory: "all",
     filters: emptyFilters(),
     openItemId: null,
     openItemBody: null,
@@ -220,6 +249,7 @@ export function initialState(): AppState {
     reviewKey: null,
     reviewClaim: null,
     reviewRubrics: null,
+    reviewRemovedRubrics: null,
     reviewEdits: null,
     trajectoryClaim: null,
     trajectoryJudgment: null,

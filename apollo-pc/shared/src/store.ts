@@ -10,6 +10,7 @@ const DB_VERSION = 1;
 const RECORDS = "records"; // SourceRecord, keyed by id
 const BODIES = "bodies"; // { id, text } — email bodies, keyed by record id
 const META = "meta"; // { key, value } — entity map, misc
+const RECORD_WRITE_BATCH = 2_000;
 
 export type RecordStore = {
   putRecords(records: SourceRecord[]): Promise<void>;
@@ -52,10 +53,10 @@ export async function openStore(): Promise<RecordStore> {
 
   return {
     async putRecords(records) {
-      for (let i = 0; i < records.length; i += 500) {
+      for (let i = 0; i < records.length; i += RECORD_WRITE_BATCH) {
         const tx = db.transaction(RECORDS, "readwrite");
         const store = tx.objectStore(RECORDS);
-        for (const r of records.slice(i, i + 500)) store.put(r);
+        for (const r of records.slice(i, i + RECORD_WRITE_BATCH)) store.put(r);
         await txDone(tx);
       }
     },

@@ -12,6 +12,10 @@ export function renderReview(ctx: Ctx): HTMLElement {
     el("h2", { class: "display" }, "Review & submit"),
     el("p", { class: "screen-sub" }, "Confirm the selection, review or edit any record, then inspect an exact local copy before you upload.")
   );
+  if (s.entityIndexing) {
+    root.append(el("section", { class: "simple-empty", role: "status" }, el("h3", null, "Finishing the privacy index…"), el("p", null, "You can keep writing tasks while Apollo finishes classifying people and organizations in the background.")));
+    return root;
+  }
 
   const included = [...s.records.values()].filter((r) => ctx.actions.isIncluded(r));
   const byKind = new Map<SourceKind, SourceRecord[]>();
@@ -33,7 +37,7 @@ export function renderReview(ctx: Ctx): HTMLElement {
 
   // Per-source table
   const table = el("div", { class: "review-table card" });
-  const kinds: SourceKind[] = ["email", "calendar", "contacts", "messages", "orders", "transactions"];
+  const kinds: SourceKind[] = ["email", "calendar", "documents", "contacts", "messages", "orders", "transactions"];
   for (const kind of kinds) {
     const total = [...s.records.values()].filter((r) => r.source === kind).length;
     if (!total) continue;

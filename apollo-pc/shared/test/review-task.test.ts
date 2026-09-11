@@ -13,6 +13,7 @@ const task: PCTask = {
   referenced_record_ids: ["private-mail-id"],
   expected_answer: "private ground truth",
   notes: "Keep the result concise.",
+  metadata: {region:"US",subjects:["Travel and Tourism > Tourist Attractions"]},
 };
 
 describe("PC peer-review sidecars", () => {
@@ -26,6 +27,7 @@ describe("PC peer-review sidecars", () => {
 
     expect(parsed.task.agent_request).toBe(task.agent_request);
     expect(parsed.task.steps).toEqual(task.steps);
+    expect(parsed.task.metadata).toEqual(task.metadata);
     expect(parsed.participant).toMatchObject({ participant_id: "redacted", name: null, email: null });
     expect(body).not.toContain("private-mail-id");
     expect(body).not.toContain("private ground truth");

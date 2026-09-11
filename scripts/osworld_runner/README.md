@@ -38,6 +38,46 @@ python3 scripts/osworld_runner/run.py \
   --s3-bucket journeys-prolific
 ```
 
+Apollo PC runs additionally require `--pc-context-config-dir`. The directory is
+private and contains one file per task named with that task's `apollo_b64_…`
+run ID. Each file uses this contract:
+
+```json
+{
+  "schema_version": "apollo-pc-osworld-context-v1",
+  "task_id": "pc_task-id",
+  "config": [{ "type": "launch", "parameters": { "command": ["approved-context-app"] } }],
+  "related_apps": ["approved-context-app"]
+}
+```
+
+`config` contains the OSWorld setup actions that provision that task's
+redacted personal context in its disposable VM. These files can contain private
+data, must stay outside Git (the ignored `.work/` tree is suitable), and must be
+produced by an approved context provisioner. The included provisioner reads only
+the selected task's bundle, verifies every referenced part hash, keeps only the
+email, calendar, or document record IDs the author attached to that task, and
+emits a mode-0600 setup file:
+
+```bash
+node scripts/osworld_runner/prepare_pc_context.mjs \
+  --task-id 'pc_task-id' \
+  --creator-pid 'protected-author-id' \
+  --output-dir '.work/pc-context'
+
+python3 scripts/osworld_runner/run.py \
+  --stage all \
+  --queue pc \
+  --pc-context-config-dir '.work/pc-context' \
+  --limit 1
+```
+
+Use a separate, short-lived read role for the provisioning command; its minimal
+policy is in `aws/pc-context-reader-policy.json`. Keep the trajectory runner's
+AWS role publish-only. The runner fails closed when a PC task has no exact
+matching context config; it never substitutes an empty Chrome session and
+publishes an invalid trajectory.
+
 The default run uses one Docker/KVM environment with the existing
 `/home/ljang/osworld_src/docker_vm_data/Ubuntu.qcow2` image,
 `super_nova_ext`, OSWorld's batched Muse Spark computer tools, and at most 100
@@ -91,5 +131,6 @@ the worker process and are never placed in command arguments or local files.
 
 ```bash
 python3 -m unittest scripts.osworld_runner.test_run
+node --test scripts/osworld_runner/prepare_pc_context.test.mjs
 python3 -m unittest discover -s scripts/trajectory_review -p 'test_*.py'
 ```

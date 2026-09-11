@@ -2,11 +2,24 @@ import { el } from "../components/helpers";
 import type { Ctx, Screen } from "../context";
 
 export function renderHome(ctx: Ctx): HTMLElement {
-  const records = [...ctx.state.records.values()];
-  const importedEmail = records.filter((record) => record.source === "email" || record.source === "orders").length;
-  const importedCalendar = records.filter((record) => record.source === "calendar").length;
-  const selectedEmail = records.filter((record) => (record.source === "email" || record.source === "orders") && ctx.actions.isIncluded(record)).length;
-  const selectedCalendar = records.filter((record) => record.source === "calendar" && ctx.actions.isIncluded(record)).length;
+  let importedEmail = 0;
+  let importedCalendar = 0;
+  let importedDocuments = 0;
+  let selectedEmail = 0;
+  let selectedCalendar = 0;
+  let selectedDocuments = 0;
+  for (const record of ctx.state.records.values()) {
+    if (record.source === "email" || record.source === "orders") {
+      importedEmail++;
+      if (ctx.actions.isIncluded(record)) selectedEmail++;
+    } else if (record.source === "calendar") {
+      importedCalendar++;
+      if (ctx.actions.isIncluded(record)) selectedCalendar++;
+    } else if (record.source === "documents") {
+      importedDocuments++;
+      if (ctx.actions.isIncluded(record)) selectedDocuments++;
+    }
+  }
   const uploaded = ctx.state.uploadedBySource;
 
   return el(
@@ -18,7 +31,8 @@ export function renderHome(ctx: Ctx): HTMLElement {
       "section",
       { class: "dashboard-counts", "aria-label": "Data counts" },
       dashboardRow("Mail", importedEmail, uploaded.knownBundles || !ctx.state.uploadedCount ? uploaded.email : "—"),
-      dashboardRow("Calendar", importedCalendar, uploaded.knownBundles || !ctx.state.uploadedCount ? uploaded.calendar : "—")
+      dashboardRow("Calendar", importedCalendar, uploaded.knownBundles || !ctx.state.uploadedCount ? uploaded.calendar : "—"),
+      dashboardRow("Documents", importedDocuments, uploaded.knownBundles || !ctx.state.uploadedCount ? uploaded.documents : "—")
     ),
     uploaded.knownBundles < ctx.state.uploadedCount
       ? el("p", { class: "dashboard-note" }, `${ctx.state.uploadedCount - uploaded.knownBundles} earlier submission${ctx.state.uploadedCount - uploaded.knownBundles === 1 ? "" : "s"} contained ${uploaded.legacyRecords.toLocaleString()} records total. Its email/calendar split was not recorded, so it is not guessed above. New submissions will appear exactly.`)
@@ -26,9 +40,10 @@ export function renderHome(ctx: Ctx): HTMLElement {
     el(
       "section",
       { class: "dashboard-workflows major-workflows" },
-      majorWorkflow("1", "Import data", `${(importedEmail + importedCalendar).toLocaleString()} records`, "sources", ctx),
-      majorWorkflow("2", "Upload data", `${(selectedEmail + selectedCalendar).toLocaleString()} selected`, "items", ctx),
-      majorWorkflow("3", "Write tasks", `${ctx.state.tasks.length.toLocaleString()} saved`, "tasks", ctx)
+      majorWorkflow("1", "Upload & import data", `${(importedEmail + importedCalendar + importedDocuments).toLocaleString()} imported · ${(selectedEmail + selectedCalendar + selectedDocuments).toLocaleString()} selected`, "items", ctx),
+      majorWorkflow("2", "Write tasks", `${ctx.state.tasks.length.toLocaleString()} saved · recommendations from your data`, "tasks", ctx),
+      majorWorkflow("3", "My tasks", "Feedback, revisions & sign-off", "my-tasks", ctx),
+      majorWorkflow("4", "Metrics & admin", "Contributions and team quality", "metrics", ctx)
     )
   );
 }

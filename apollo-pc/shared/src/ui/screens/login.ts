@@ -80,7 +80,7 @@ export function renderLogin(ctx: Ctx): HTMLElement {
         el(
           "p",
           { class: "login-sub" },
-          "Import, review, and selectively upload mail and calendar data."
+          "Upload or import mail, calendar, and documents; then write app-guided tasks from what you select."
         )
       ),
       el("p", { class: "login-eyebrow" }, "PARTICIPANT WORKSPACE"),

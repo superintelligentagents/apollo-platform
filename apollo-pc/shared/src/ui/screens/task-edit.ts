@@ -1,7 +1,27 @@
+import { metadataFields } from "../components/metadata";
+import { appIdsForRecord, MYPCBENCH_APPS, type MyPCBenchApp } from "../../app-catalog";
 import { MIN_STEP_LENGTH, PC_TEMPLATES } from "../../templates";
 import type { SourceRecord } from "../../types";
 import { el } from "../components/helpers";
 import type { Ctx } from "../context";
+
+type PickerHistoryCache = {
+  records: Ctx["state"]["records"];
+  recordCount: number;
+  historyRevision: number;
+  guideId: string;
+  attachmentKey: string;
+  selectedRecordCount: number;
+  guidedRecords: SourceRecord[];
+  emailCount: number;
+  calendarCount: number;
+  documentCount: number;
+};
+
+const pickerHistoryCache = new WeakMap<Ctx["state"], PickerHistoryCache>();
+const pickerSearchCache = new WeakMap<SourceRecord, string>();
+const pendingPickerRenders = new WeakMap<Ctx["state"], ReturnType<typeof setTimeout>>();
+const PICKER_TYPING_DELAY_MS = 180;
 
 export function renderTaskEdit(ctx: Ctx): HTMLElement {
   const s = ctx.state;
@@ -10,9 +30,27 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
   if (!draft) return root;
   const template = s.activeTemplate ?? PC_TEMPLATES.find((t) => t.id === draft.templateId) ?? null;
   const isFreeForm = template?.id === "free-form-long-horizon";
+  const savedGuideId = draft.templateId.startsWith("mypcbench-") ? draft.templateId.slice("mypcbench-".length) : "";
+  const guideId = s.pickerApp === "__all__" ? "" : s.pickerApp || savedGuideId;
+  const guide = MYPCBENCH_APPS.find((app) => app.id === guideId) ?? null;
+  const guidePath = guide?.workflowAppIds
+    .map((id) => MYPCBENCH_APPS.find((candidate) => candidate.id === id)?.name ?? id)
+    .join(" → ") ?? "";
 
-  root.append(el("h2", { class: "display" }, template ? template.title : "Edit task"));
-  if (template) root.append(el("p", { class: "screen-sub" }, template.tagline));
+  root.append(el("p", { class: "step-kicker mono" }, "WRITE TASK"), el("h2", { class: "display" }, guide ? guide.task.title : template ? template.title : "Edit task"));
+  if (guide) root.append(
+    el("p", { class: "screen-sub" }, `${guide.name} follows the ${guide.analogue} workflow. Use the attached records as evidence, confirm current state in the live apps, and keep each phase dependent on what you found before it.`),
+    el(
+      "div",
+      { class: "task-horizon-summary", role: "status" },
+      el("strong", null, "LONG-HORIZON DRAFT"),
+      el("span", { class: "mono" }, `${draft.steps.length} dependent phases`),
+      el("span", { class: "mono" }, `${guide.workflowAppIds.length} connected apps`),
+      el("span", { class: "mono" }, `${draft.referencedRecordIds.length} attached record${draft.referencedRecordIds.length === 1 ? "" : "s"}`),
+      el("small", null, guidePath),
+    ),
+  );
+  else if (template) root.append(el("p", { class: "screen-sub" }, template.tagline));
 
   const layout = el("div", { class: "task-edit-layout" });
 
@@ -30,9 +68,10 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
   request.value = draft.request;
   const updateRequestCounter = () => {
     const length = draft.request.trim().length;
-    requestCounter.textContent = length < 15 ? `${length} · ${15 - length} more needed` : `${length} · ready`;
-    requestCounter.classList.toggle("ok", length >= 15);
-    requestCounter.classList.toggle("warn", length > 0 && length < 15);
+    const minimum = guide ? 120 : 15;
+    requestCounter.textContent = length < minimum ? `${length} · ${minimum - length} more needed` : `${length} · ready`;
+    requestCounter.classList.toggle("ok", length >= minimum);
+    requestCounter.classList.toggle("warn", length > 0 && length < minimum);
   };
   request.addEventListener("input", () => {
     draft.request = request.value;
@@ -154,7 +193,9 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
         { class: "field-hint" },
         isFreeForm
           ? "Break the request into checkable steps. Open a step to add details."
-          : "Use one step for each meaningful phase. One complete step is enough."
+          : guide
+            ? "Keep at least four dependent phases: establish constraints, inspect current state, act across the connected apps, and verify the result."
+            : "Use one step for each meaningful phase. One complete step is enough."
       ),
       s.formErrors.steps ? el("p", { class: "field-error" }, s.formErrors.steps) : null,
       stepsWrap
@@ -178,14 +219,40 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
     draft.notes = notes.value;
     ctx.autosave();
   });
+  const difficulty = el(
+    "select",
+    { class: "field-input", "aria-label": "Task difficulty" },
+    el("option", { value: "low" }, "Low"),
+    el("option", { value: "medium" }, "Medium"),
+    el("option", { value: "high" }, "High")
+  ) as HTMLSelectElement;
+  difficulty.value = draft.difficulty;
+  difficulty.addEventListener("change", () => {
+    draft.difficulty = difficulty.value as typeof draft.difficulty;
+    ctx.autosave();
+  });
+  const requiredOutputs = el("textarea", {
+    class: "field-input",
+    rows: "3",
+    placeholder: "One required result per line",
+    "aria-label": "Required outputs",
+  }) as HTMLTextAreaElement;
+  requiredOutputs.value = draft.requiredOutputs.join("\n");
+  requiredOutputs.addEventListener("input", () => {
+    draft.requiredOutputs = requiredOutputs.value.split("\n").map((value) => value.trim()).filter(Boolean);
+    ctx.autosave();
+  });
   form.append(
     el(
       "details",
       { class: "task-options", open: !!template?.requiresExpectedAnswer },
       el("summary", null, template?.requiresExpectedAnswer ? "Expected answer" : "More task details"),
       field("TASK TITLE (optional)", title),
+      field("DIFFICULTY", difficulty),
+      field("REQUIRED OUTPUTS (optional)", requiredOutputs),
       field(template?.requiresExpectedAnswer ? "EXPECTED ANSWER (required)" : "EXPECTED ANSWER (optional)", expected, s.formErrors.expected),
-      field("NOTES (optional)", notes)
+      field("NOTES (optional)", notes),
+      metadataFields(ctx, (key) => el("p", { class: "field-error" }, s.formErrors[key] || ""))
     )
   );
 
@@ -205,16 +272,34 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
           },
         },
         "Discard"
+      ),
+      el(
+        "span",
+        { class: "task-save-status mono", role: "status", "aria-live": "polite", "data-save-status": "", "data-state": ctx.state.saveStatus },
+        ctx.state.saveStatus === "error" ? "Save failed — keep this tab open" : ctx.state.saveStatus === "saving" ? "Saving…" : "Saved locally",
       )
     );
 
   // ---- Right: selected data for inspiration and optional grounding
   const picker = el("aside", { class: "record-picker data-inspiration", "aria-label": "Uploaded data inspiration" });
+  const documentInput = el("input", {
+    type: "file",
+    multiple: true,
+    accept: ".pdf,.docx,.txt,.md,.csv,.json,.html,.htm",
+    style: "display:none",
+    "data-testid": "task-document-upload",
+    onchange: (event: Event) => {
+      const input = event.target as HTMLInputElement;
+      const files = [...(input.files ?? [])];
+      input.value = "";
+      if (files.length) void importTaskDocuments(ctx, draft.taskId, files);
+    },
+  }) as HTMLInputElement;
   picker.append(
     el("div", { class: "inspiration-head" },
-      el("p", { class: "step-kicker mono" }, "YOUR DATA"),
-      el("h3", null, "Find task inspiration"),
-      el("p", { class: "field-hint" }, "Browse selected mail and calendar. Check a record to attach it.")
+      el("div", null, el("p", { class: "step-kicker mono" }, "YOUR DATA"), el("h3", null, "Find task inspiration"), el("p", { class: "field-hint" }, "Browse selected mail, calendar events, and document text. Check a record to attach it.")),
+      documentInput,
+      el("button", { class: "btn primary small", type: "button", disabled: !!s.importing, "data-testid": "task-add-document", onclick: () => documentInput.click() }, s.importing?.kind === "documents" ? "Reading document…" : "+ Upload document")
     ),
     el(
       "div",
@@ -223,11 +308,11 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
     )
   );
 
-  const selectedRecords = [...s.records.values()].filter((r) =>
-    (r.source === "email" || r.source === "calendar") && ctx.actions.isIncluded(r)
-  );
-  const emailCount = selectedRecords.filter((r) => r.source === "email").length;
-  const calendarCount = selectedRecords.length - emailCount;
+  picker.append(appGuideControl(ctx, draft, guideId, guide));
+
+  const attached = new Set(draft.referencedRecordIds);
+  const history = pickerHistoryFor(ctx, guideId, attached, draft.referencedRecordIds.join("\u0000"));
+  const { guidedRecords, emailCount, calendarCount, documentCount, selectedRecordCount } = history;
   const setPickerSource = (source: typeof s.pickerSource) => {
     s.pickerSource = source;
     s.pickerPage = 0;
@@ -236,9 +321,10 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
     ctx.rerender();
   };
   picker.append(el("div", { class: "picker-tabs", role: "group", "aria-label": "Filter inspiration by source" },
-    pickerTab("All", selectedRecords.length, s.pickerSource === "all", () => setPickerSource("all")),
+    pickerTab("All", guidedRecords.length, s.pickerSource === "all", () => setPickerSource("all")),
     pickerTab("Mail", emailCount, s.pickerSource === "email", () => setPickerSource("email")),
     pickerTab("Calendar", calendarCount, s.pickerSource === "calendar", () => setPickerSource("calendar")),
+    pickerTab("Documents", documentCount, s.pickerSource === "documents", () => setPickerSource("documents")),
     pickerTab("Selected", draft.referencedRecordIds.length, s.pickerSource === "selected", () => setPickerSource("selected"))
   ));
 
@@ -252,17 +338,20 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
       s.pickerPage = 0;
       s.pickerOpenId = null;
       s.pickerOpenBody = null;
-      ctx.rerender();
+      const pending = pendingPickerRenders.get(s);
+      if (pending !== undefined) clearTimeout(pending);
+      pendingPickerRenders.set(s, setTimeout(() => {
+        pendingPickerRenders.delete(s);
+        ctx.rerender();
+      }, PICKER_TYPING_DELAY_MS));
     },
   });
   picker.append(search);
 
-  const attached = new Set(draft.referencedRecordIds);
   const q = s.pickerQuery.trim().toLowerCase();
-  const matches = selectedRecords
+  const matches = guidedRecords
     .filter((r) => s.pickerSource === "all" || (s.pickerSource === "selected" ? attached.has(r.id) : r.source === s.pickerSource))
-    .filter((r) => !q || pickerSearchText(r).includes(q))
-    .sort((a, b) => Number(attached.has(b.id)) - Number(attached.has(a.id)) || (b.timestamp || "").localeCompare(a.timestamp || ""));
+    .filter((r) => !q || pickerSearchText(r).includes(q));
   const pickerPageSize = 50;
   const pickerPages = Math.max(1, Math.ceil(matches.length / pickerPageSize));
   const pickerPage = Math.min(s.pickerPage, pickerPages - 1);
@@ -289,7 +378,7 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
       el("label", { class: "picker-attach", title: on ? "Attached to this task" : "Attach to this task" },
         el("input", { type: "checkbox", checked: on, "aria-label": `${on ? "Detach" : "Attach"} ${pickerTitle(r)}`, onchange: () => ctx.actions.toggleTaskRecord(r.id) })
       ),
-      el("span", { class: "item-kind mono" }, r.source === "email" ? "MAIL" : "CAL"),
+      el("span", { class: "item-kind mono" }, r.source === "email" ? "MAIL" : r.source === "calendar" ? "CAL" : "DOC"),
       el(
         "button",
         { class: "picker-open-button", type: "button", "aria-expanded": String(open), onclick: toggleOpen },
@@ -302,6 +391,8 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
       const content = el("div", { class: "picker-record-content" });
       if (r.source === "calendar") {
         content.append(el("p", null, r.description || "No description."));
+      } else if (r.source === "documents") {
+        content.append(el("p", null, r.text || "No extracted text."));
       } else if (s.pickerOpenBody !== null) {
         content.append(el("p", null, s.pickerOpenBody || "No email content."));
       } else {
@@ -323,7 +414,7 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
       row
     );
   }
-  if (!matches.length) list.append(el("p", { class: "empty-note" }, s.pickerSource === "selected" ? "No records attached to this task yet." : selectedRecords.length ? "No records match this filter." : "Select mail or calendar records for upload to see them here."));
+  if (!matches.length) list.append(el("p", { class: "empty-note" }, s.pickerSource === "selected" ? "No records attached to this task yet. Upload a document here or check a record in another tab." : selectedRecordCount ? "No records match this app guide and filter." : "Upload a document here, or add mail and calendar data in the data workspace."));
   picker.append(list);
   if (pickerPages > 1) picker.append(el("div", { class: "picker-pager" },
     el("button", { class: "btn ghost small", type: "button", disabled: pickerPage === 0, onclick: () => { s.pickerPage = pickerPage - 1; s.pickerOpenId = null; s.pickerOpenBody = null; ctx.rerender(); } }, "← Previous"),
@@ -336,19 +427,135 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
   return root;
 }
 
+function pickerHistoryFor(ctx: Ctx, guideId: string, attached: Set<string>, attachmentKey: string): PickerHistoryCache {
+  const s = ctx.state;
+  const cached = pickerHistoryCache.get(s);
+  if (
+    cached &&
+    cached.records === s.records &&
+    cached.recordCount === s.records.size &&
+    cached.historyRevision === s.historyRevision &&
+    cached.guideId === guideId &&
+    cached.attachmentKey === attachmentKey
+  ) return cached;
+
+  const guidedRecords: SourceRecord[] = [];
+  let selectedRecordCount = 0;
+  let emailCount = 0;
+  let calendarCount = 0;
+  let documentCount = 0;
+  for (const record of s.records.values()) {
+    if (record.source !== "email" && record.source !== "calendar" && record.source !== "documents") continue;
+    if (!ctx.actions.isIncluded(record)) continue;
+    selectedRecordCount++;
+    if (guideId && !attached.has(record.id) && !appIdsForRecord(record).includes(guideId)) continue;
+    guidedRecords.push(record);
+    if (record.source === "email") emailCount++;
+    else if (record.source === "calendar") calendarCount++;
+    else documentCount++;
+  }
+  guidedRecords.sort((a, b) => Number(attached.has(b.id)) - Number(attached.has(a.id)) || (b.timestamp || "").localeCompare(a.timestamp || ""));
+  const next: PickerHistoryCache = {
+    records: s.records,
+    recordCount: s.records.size,
+    historyRevision: s.historyRevision,
+    guideId,
+    attachmentKey,
+    selectedRecordCount,
+    guidedRecords,
+    emailCount,
+    calendarCount,
+    documentCount,
+  };
+  pickerHistoryCache.set(s, next);
+  return next;
+}
+
+function appGuideControl(ctx: Ctx, draft: NonNullable<Ctx["state"]["taskDraft"]>, guideId: string, guide: MyPCBenchApp | null): HTMLElement {
+  const select = el(
+    "select",
+    {
+      class: "field-input compact",
+      "data-testid": "task-app-guide",
+      onchange: (event: Event) => {
+        ctx.state.pickerApp = (event.target as HTMLSelectElement).value || "__all__";
+        ctx.state.pickerPage = 0;
+        ctx.state.pickerOpenId = null;
+        ctx.state.pickerOpenBody = null;
+        ctx.rerender();
+      },
+    },
+    el("option", { value: "", selected: !guideId }, "All data · no app filter"),
+    ...MYPCBENCH_APPS.map((app) => el("option", { value: app.id, selected: guideId === app.id }, `${app.name} · like ${app.analogue}`))
+  );
+  const root = el("section", { class: `task-app-guide ${guide ? "active" : ""}` }, el("label", { class: "field" }, el("span", { class: "field-label" }, "MyPCBench app guide & data filter"), select));
+  if (!guide) {
+    root.append(el("p", { class: "field-hint" }, "Choose any of the 17 apps to filter your data and use its workflow as a writing guideline."));
+    return root;
+  }
+  const alreadyApplied = draft.templateId === `mypcbench-${guide.id}`;
+  root.append(
+    el("div", { class: "task-app-guide-copy" }, el("span", { class: "app-analogue mono" }, `${guide.name.toUpperCase()} · LIKE ${guide.analogue.toUpperCase()}`), el("strong", null, guide.task.title), el("p", null, guide.description), el("p", { class: "mono app-guide-steps" }, guide.task.steps.map((step, index) => `${index + 1}. ${step.title}`).join("  ·  "))),
+    el("div", { class: "task-app-guide-actions" }, el("a", { class: "btn ghost small", href: guide.url, target: "_blank", rel: "noreferrer" }, `Open ${guide.name} ↗`), alreadyApplied ? el("span", { class: "chip ok" }, "Guide applied") : el("button", { class: "btn small", type: "button", "data-testid": "apply-app-guide", onclick: () => applyAppGuide(ctx, draft, guide) }, "Use as task starting point"))
+  );
+  return root;
+}
+
+function applyAppGuide(ctx: Ctx, draft: NonNullable<Ctx["state"]["taskDraft"]>, guide: MyPCBenchApp): void {
+  if (draft.request.trim() && !window.confirm("Replace the current task wording with this app guide? Attached records will stay selected.")) return;
+  const source = guide.task;
+  Object.assign(draft, {
+    templateId: `mypcbench-${guide.id}`,
+    category: source.category,
+    title: source.title,
+    request: source.request,
+    steps: source.steps.map((step, index) => ({ ...step, order: index })),
+    successCriteria: [...source.successCriteria],
+    requiredOutputs: [...source.requiredOutputs],
+    subjects: [...source.subjects],
+    notes: `MyPCBench app: ${guide.name}`,
+  });
+  ctx.state.pickerApp = guide.id;
+  ctx.autosave();
+  ctx.rerender();
+}
+
+async function importTaskDocuments(ctx: Ctx, taskId: string, files: File[]): Promise<void> {
+  const before = new Set([...ctx.state.records.values()].filter((record) => record.source === "documents").map((record) => record.id));
+  await ctx.actions.importFiles("documents", files);
+  const draft = ctx.state.taskDraft;
+  if (!draft || draft.taskId !== taskId) return;
+  for (const record of ctx.state.records.values()) {
+    if (record.source !== "documents" || !ctx.actions.isIncluded(record)) continue;
+    const matchesChosenFile = files.some((file) => record.filename === file.name && record.size === file.size);
+    if (before.has(record.id) && !matchesChosenFile) continue;
+    if (!draft.referencedRecordIds.includes(record.id)) draft.referencedRecordIds.push(record.id);
+  }
+  ctx.state.pickerSource = "documents";
+  ctx.state.pickerPage = 0;
+  ctx.autosave();
+  ctx.rerender();
+}
+
 function pickerTab(label: string, count: number, active: boolean, onclick: () => void): HTMLElement {
   return el("button", { class: `picker-tab ${active ? "active" : ""}`, type: "button", "aria-label": `${label}, ${count.toLocaleString()} records`, "aria-pressed": String(active), title: `${count.toLocaleString()} records`, onclick }, label);
 }
 
 function pickerSearchText(r: SourceRecord): string {
-  if (r.source === "email") return `${r.subject} ${r.snippet}`.toLowerCase();
-  if (r.source === "calendar") return `${r.summary} ${r.description}`.toLowerCase();
-  return "";
+  const cached = pickerSearchCache.get(r);
+  if (cached !== undefined) return cached;
+  let text = "";
+  if (r.source === "email") text = `${r.searchText} ${r.snippet.toLowerCase()}`;
+  else if (r.source === "calendar") text = `${r.searchText} ${r.description.toLowerCase()}`;
+  else if (r.source === "documents") text = r.searchText;
+  pickerSearchCache.set(r, text);
+  return text;
 }
 
 function pickerPreview(r: SourceRecord): string {
-  if (r.source === "email") return r.snippet || "No email content preview";
-  if (r.source === "calendar") return r.description || "No description";
+  if (r.source === "email") return r.snippet.slice(0, 180) || "No email content preview";
+  if (r.source === "calendar") return r.description.slice(0, 180) || "No description";
+  if (r.source === "documents") return r.text.slice(0, 180) || "No extracted text";
   return "";
 }
 
@@ -358,6 +565,8 @@ function pickerTitle(r: SourceRecord): string {
       return r.subject || "(no subject)";
     case "calendar":
       return r.summary || "(untitled event)";
+    case "documents":
+      return r.title || r.filename;
     case "contacts":
       return r.fullName || r.emails[0] || "(contact)";
     case "messages":

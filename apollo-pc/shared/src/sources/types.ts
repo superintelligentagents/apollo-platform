@@ -20,6 +20,7 @@ export type ParseStats = {
 
 export type ParseOptions = {
   maxBodyChars: number;
+  maxDocumentChars?: number;
   // Records older than this ISO date are dropped AT PARSE TIME — the true
   // consent boundary for volume, and the memory-control lever for multi-GB
   // mailboxes. Null = no floor.

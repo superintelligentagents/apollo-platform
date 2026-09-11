@@ -119,6 +119,21 @@ describe("actual email sender-domain filters", () => {
 });
 
 describe("MyPCBench real-service and clone filters", () => {
+  it("partitions the annotator's email history by real analogue and clone", () => {
+    const ctx = testCtx([
+      email("flight", "trips@delta.com", "Flight itinerary"),
+      email("shop", "orders@amazon.com", "Order shipped"),
+    ]);
+    const root = renderEmailItems(ctx);
+    const select = root.querySelector<HTMLSelectElement>('[data-testid="history-app-filter"]')!;
+    expect([...select.options].map((option) => option.textContent)).toContain("Dinoco Airlines · like Delta · 1");
+    select.value = "dinoco";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    const filtered = renderEmailItems(ctx);
+    expect(filtered.querySelectorAll(".item-row")).toHaveLength(1);
+    expect(filtered.querySelector(".item-row")?.textContent).toContain("Flight itinerary");
+  });
+
   it("covers all 17 canonical apps and the legacy clone names", () => {
     expect(MYPCBENCH_EMAIL_SERVICES).toHaveLength(17);
     expect(MYPCBENCH_EMAIL_SERVICES.map(({ realName, cloneName }) => `${realName} ↔ ${cloneName}`)).toEqual([

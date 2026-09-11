@@ -69,6 +69,7 @@ DEFAULT_VM_PATH = DEFAULT_OSWORLD_ROOT / "vmware_vm_data/Ubuntu0/Ubuntu0.vmx"
 DEFAULT_DOCKER_VM_PATH = Path("/home/ljang/osworld_src/docker_vm_data/Ubuntu.qcow2")
 DEFAULT_WORK_DIR = Path(".work/osworld_runner/latest")
 APOLLO_RUN_ID_PREFIX = "apollo_b64_"
+PC_CONTEXT_SCHEMA_VERSION = "apollo-pc-osworld-context-v1"
 VALID_SIGNOFF_ACTIONS = {"accepted", "amended"}
 MUSE_SPARK_VM_PREREQUISITES = [
     {
@@ -298,6 +299,9 @@ def fetch_trajectory_task_ids(
             for item in items
             if isinstance(item, Mapping)
             if model is None or _text(item.get("model"), 200) == model
+            # A completed NEEDS_RERUN is an explicit request for a replacement
+            # run. Any pending/reviewed replacement still blocks duplicates.
+            if _text(item.get("human_final_grade"), 30).upper() != "NEEDS_RERUN"
             for task_id in [_text(item.get("task_id"), 300)]
             if task_id
         )
@@ -448,11 +452,29 @@ def start_urls(task: Mapping[str, Any], mode: str = "google") -> list[str]:
     return urls[:12] or ["https://www.google.com/"]
 
 
-def osworld_config(task: Mapping[str, Any], domain: str, start_url_mode: str = "google") -> dict[str, Any]:
+def osworld_config(
+    task: Mapping[str, Any],
+    domain: str,
+    start_url_mode: str = "google",
+    pc_context: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     task_id = _text(task.get("task_id"), 300)
     content = task.get("content") if isinstance(task.get("content"), Mapping) else {}
     final = content.get("final") if isinstance(content.get("final"), Mapping) else {}
     urls = start_urls(task, start_url_mode)
+    if pc_context:
+        context_urls = [
+            _text(value, 4_000)
+            for value in pc_context.get("start_urls", [])
+            if _text(value, 4_000)
+        ]
+        urls = list(dict.fromkeys([*context_urls, *urls]))
+    context_steps = list(pc_context.get("config", [])) if pc_context else []
+    context_apps = [
+        _text(value, 80)
+        for value in (pc_context.get("related_apps", []) if pc_context else [])
+        if _text(value, 80)
+    ]
     return {
         "id": encode_run_id(task_id),
         "snapshot": "chrome",
@@ -460,6 +482,7 @@ def osworld_config(task: Mapping[str, Any], domain: str, start_url_mode: str = "
         "source": urls[0],
         "config": [
             *MUSE_SPARK_VM_PREREQUISITES,
+            *context_steps,
             {
                 "type": "launch",
                 "parameters": {"command": ["google-chrome", "--remote-debugging-port=1337"]},
@@ -471,7 +494,7 @@ def osworld_config(task: Mapping[str, Any], domain: str, start_url_mode: str = "
             {"type": "chrome_open_tabs", "parameters": {"urls_to_open": urls}},
         ],
         "trajectory": f"trajectories/{encode_run_id(task_id)}",
-        "related_apps": ["chrome"],
+        "related_apps": list(dict.fromkeys(["chrome", *context_apps])),
         "evaluator": {"func": "infeasible"},
         "proxy": False,
         "fixed_ip": False,
@@ -480,7 +503,8 @@ def osworld_config(task: Mapping[str, Any], domain: str, start_url_mode: str = "
             "domain": domain,
             "apollo_task_id": task_id,
             "task_content_hash": _text(content.get("task_content_hash"), 80),
-            "creator_pid": _text(task.get("participant_id"), 80).lower(),
+            "creator_pid": _text(task.get("creator_pid") or task.get("participant_id"), 80).lower(),
+            "pc_context_provisioned": bool(pc_context),
         },
     }
 
@@ -563,13 +587,56 @@ def job_paths(
     )
 
 
-def prepare_job(tasks: Sequence[dict[str, Any]], paths: JobPaths, domain: str, start_url_mode: str = "google") -> dict[str, Any]:
+def load_pc_context_config(task_id: str, directory: Path | None) -> dict[str, Any]:
+    if directory is None:
+        raise BridgeError(
+            "PC tasks require --pc-context-config-dir; refusing to run personal-context tasks in an unprovisioned VM"
+        )
+    path = directory.expanduser().resolve() / f"{encode_run_id(task_id)}.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise BridgeError(f"missing private PC context config for {task_id}: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"invalid private PC context config for {task_id}: {path}") from exc
+    if not isinstance(value, Mapping):
+        raise BridgeError(f"private PC context config must be an object: {path}")
+    if value.get("schema_version") != PC_CONTEXT_SCHEMA_VERSION or value.get("task_id") != task_id:
+        raise BridgeError(f"private PC context config does not match task {task_id}: {path}")
+    setup = value.get("config")
+    if not isinstance(setup, list) or not setup or not all(isinstance(step, Mapping) for step in setup):
+        raise BridgeError(f"private PC context config has no OSWorld setup steps: {path}")
+    related_apps = value.get("related_apps", [])
+    if not isinstance(related_apps, list) or not all(isinstance(app, str) and app.strip() for app in related_apps):
+        raise BridgeError(f"private PC context config has invalid related_apps: {path}")
+    start_urls_value = value.get("start_urls", [])
+    if not isinstance(start_urls_value, list) or not all(
+        isinstance(url, str)
+        and (
+            re.fullmatch(r"file:///tmp/apollo-pc-context-[a-f0-9]{16}\.html", url)
+            or _https_url(url)
+        )
+        for url in start_urls_value
+    ):
+        raise BridgeError(f"private PC context config has invalid start_urls: {path}")
+    return dict(value)
+
+
+def prepare_job(
+    tasks: Sequence[dict[str, Any]],
+    paths: JobPaths,
+    domain: str,
+    start_url_mode: str = "google",
+    pc_context_config_dir: Path | None = None,
+) -> dict[str, Any]:
     examples_dir = paths.configs / "examples" / domain
     examples_dir.mkdir(parents=True, exist_ok=True)
     run_ids: list[str] = []
     mapping: dict[str, str] = {}
     for task in tasks:
-        config = osworld_config(task, domain, start_url_mode)
+        task_id = _text(task.get("task_id"), 300)
+        pc_context = load_pc_context_config(task_id, pc_context_config_dir) if queue_accepts_task(task_id, "pc") else None
+        config = osworld_config(task, domain, start_url_mode, pc_context)
         run_id = config["id"]
         run_ids.append(run_id)
         mapping[run_id] = _text(task.get("task_id"), 300)
@@ -1159,6 +1226,12 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--shard-count", type=int, default=1)
     value.add_argument("--shard-index", type=int, default=0)
     value.add_argument("--work-dir", type=Path, default=DEFAULT_WORK_DIR)
+    value.add_argument(
+        "--pc-context-config-dir",
+        type=Path,
+        default=None,
+        help="private per-task OSWorld setup configs for PC runs; required when fetching the PC queue",
+    )
     value.add_argument("--domain", default="apollo_chrome")
     value.add_argument(
         "--start-url-mode",
@@ -1283,7 +1356,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
             if not selected:
                 raise BridgeError("no author-signed tasks without existing trajectories are available")
-            manifest = prepare_job(selected, paths, args.domain, args.start_url_mode)
+            manifest = prepare_job(selected, paths, args.domain, args.start_url_mode, args.pc_context_config_dir)
             print(json.dumps({
                 "stage": "fetch",
                 "job": manifest,

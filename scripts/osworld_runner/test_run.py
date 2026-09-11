@@ -164,7 +164,10 @@ class OSWorldBridgeTests(unittest.TestCase):
 
     def test_trajectory_reporting_collects_task_ids_across_pages(self):
         pages = [
-            {"trajectories": [{"task_id": "task-a"}], "page": {"next_offset": 1}},
+            {"trajectories": [
+                {"task_id": "task-a"},
+                {"task_id": "task-rerun", "human_final_grade": "NEEDS_RERUN"},
+            ], "page": {"next_offset": 1}},
             {"trajectories": [{"task_id": "task-b"}], "page": {}},
         ]
         with patch.object(run, "get_json", side_effect=pages) as get_json:
@@ -172,6 +175,40 @@ class OSWorldBridgeTests(unittest.TestCase):
         self.assertEqual(task_ids, {"task-a", "task-b"})
         self.assertIn("/reporting/trajectories?", get_json.call_args_list[0].args[0])
         self.assertIn("offset=1", get_json.call_args_list[1].args[0])
+
+    def test_pc_config_uses_claimable_creator_instead_of_private_dashboard_id(self):
+        item = task(
+            "pc_task-a",
+            participant_id="pc-0123456789abcdef",
+            creator_pid="actual-author",
+        )
+        config = run.osworld_config(item, "apollo_chrome")
+        self.assertEqual(config["metadata"]["creator_pid"], "actual-author")
+
+    def test_pc_job_requires_and_applies_private_context_setup(self):
+        item = task("pc_fixture", creator_pid="actual-author")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = run.job_paths(root / "job")
+            with self.assertRaisesRegex(run.BridgeError, "pc-context-config-dir"):
+                run.prepare_job([item], paths, "apollo_chrome")
+            context_dir = root / "context"
+            context_dir.mkdir()
+            context_path = context_dir / f"{run.encode_run_id(item['task_id'])}.json"
+            context_path.write_text(json.dumps({
+                "schema_version": run.PC_CONTEXT_SCHEMA_VERSION,
+                "task_id": item["task_id"],
+                "config": [{"type": "launch", "parameters": {"command": ["context-app"]}}],
+                "related_apps": ["context-app"],
+                "start_urls": ["file:///tmp/apollo-pc-context-0123456789abcdef.html"],
+            }), encoding="utf-8")
+            run.prepare_job([item], paths, "apollo_chrome", pc_context_config_dir=context_dir)
+            config_path = paths.configs / "examples" / "apollo_chrome" / f"{run.encode_run_id(item['task_id'])}.json"
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertTrue(config["metadata"]["pc_context_provisioned"])
+            self.assertIn("context-app", config["related_apps"])
+            self.assertIn("context-app", json.dumps(config["config"]))
+            self.assertEqual(config["config"][-1]["parameters"]["urls_to_open"][0], "file:///tmp/apollo-pc-context-0123456789abcdef.html")
 
     def test_meta_payload_translates_chat_messages_to_responses_input(self):
         payload = run.meta_payload({

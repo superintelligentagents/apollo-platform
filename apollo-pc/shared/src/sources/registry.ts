@@ -3,6 +3,7 @@ import { icsParser } from "./ics";
 import { mboxParser } from "./mbox";
 import { vcardParser } from "./vcard";
 import { whatsappParser } from "./whatsapp";
+import { documentParser } from "./documents";
 import type { SourceParser } from "./types";
 
 export type SourceCard = {
@@ -13,8 +14,8 @@ export type SourceCard = {
   derived?: string; // explanation for sources mined from other imports
 };
 
-// v1 scope: email + calendar only (user decision) — orders ride along for
-// free because they're mined from receipt emails. The contacts/messages
+// Participant-facing sources: mail, calendar, and local documents. Orders ride
+// along because they are mined from receipt emails. The contacts/messages
 // parsers stay built and tested; re-add their cards here to re-enable.
 export const SOURCE_CARDS: SourceCard[] = [
   {
@@ -37,6 +38,16 @@ export const SOURCE_CARDS: SourceCard[] = [
       "Go to calendar.google.com → Settings → Import & export → Export.",
       "Unzip the download — one .ics per calendar.",
       "Import the .ics file(s) here. Apple/Outlook .ics exports work too.",
+    ],
+  },
+  {
+    kind: "documents",
+    parser: documentParser,
+    title: "Import Documents",
+    howTo: [
+      "Choose a PDF, Word .docx, text, Markdown, CSV, JSON, or HTML file from this device.",
+      "Apollo extracts text in this browser. The original file is never uploaded.",
+      "Review the extracted text and privacy masks before including it in a task.",
     ],
   },
 ];

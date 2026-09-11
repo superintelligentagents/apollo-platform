@@ -17,7 +17,7 @@ import {
   QueryCommand,
   UpdateCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { randomUUID, createHash, timingSafeEqual } from "node:crypto";
+import { randomUUID, createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { gzipSync, gunzipSync } from "node:zlib";
 
 const {
@@ -210,6 +210,22 @@ export function uploadObjectKey(participantId, taskId, filename, timestamp = Dat
   return `${UPLOAD_PREFIX}${participantId}/${taskId}/${timestamp}-${nonce}_${filename}`;
 }
 
+export function uploadCompletionSignature(key, expiresAt, secret = REVIEW_KEY) {
+  if (!secret || !key || !Number.isFinite(Number(expiresAt))) return "";
+  return createHmac("sha256", secret).update(`${key}\n${Number(expiresAt)}`).digest("base64url");
+}
+
+export function uploadCompletionTokenMatches(key, expiresAt, token, secret = REVIEW_KEY, now = Date.now()) {
+  const expiry = Number(expiresAt);
+  if (!secret || typeof token !== "string" || !Number.isInteger(expiry)) return false;
+  if (expiry < now || expiry > now + 15 * 60 * 1000) return false;
+  const expected = uploadCompletionSignature(key, expiry, secret);
+  if (!expected) return false;
+  const suppliedHash = createHash("sha256").update(token).digest();
+  const expectedHash = createHash("sha256").update(expected).digest();
+  return timingSafeEqual(suppliedHash, expectedHash);
+}
+
 const respond = (statusCode, body, headers = {}) => ({
   statusCode,
   headers: {
@@ -325,6 +341,143 @@ const TRAJECTORY_EDIT_LINKS_PREFIX = `${REVIEW_PREFIX}trajectory-edit-links/`;
 const trajectoryLockKeyFor = (manifestKey) => `${TRAJECTORY_LOCKS_PREFIX}${b64url(manifestKey)}.json`;
 const trajectoryDoneKeyFor = (manifestKey) => `${TRAJECTORY_DONE_PREFIX}${b64url(manifestKey)}`;
 const trajectoryJudgmentKeyFor = (manifestKey) => `${TRAJECTORY_JUDGMENTS_PREFIX}${b64url(manifestKey)}.json`;
+
+/**
+ * A re-judgment written beside a run's manifest, or null.
+ *
+ * Published manifests are immutable, so a later judging pass cannot correct the
+ * scores inside them. It writes `rejudgment.json` under the same run prefix
+ * instead; when one exists the API reports it, because it was produced by the
+ * canonical judge over every screenshot rather than a sampled subset. The
+ * manifest's original judgment stays available beside it.
+ */
+export function cleanTrajectoryRejudgment(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value.schema_version !== "apollo-trajectory-rejudgment-v1") return null;
+  if (!Array.isArray(value.rubrics) || !value.rubrics.length || value.rubrics.length > 100) return null;
+  const rubrics = value.rubrics.map((rubric) => {
+    const status = cleanText(rubric?.llm_status, 20).toUpperCase();
+    const llmStatus = ["SUCCESS", "FAILURE", "ERROR"].includes(status) ? status : "FAILURE";
+    const llmScore = llmStatus === "ERROR" ? null : (llmStatus === "SUCCESS" ? 1 : 0);
+    return {
+      rubric_id: cleanText(rubric?.rubric_id, 100),
+      requirement: cleanText(rubric?.requirement, 30_000),
+      verification: cleanText(rubric?.verification, 20_000),
+      llm_status: llmStatus,
+      llm_score: llmScore,
+      llm_success: llmScore == null ? null : llmScore === 1,
+      llm_reasoning: cleanText(rubric?.llm_reasoning, 30_000),
+    };
+  }).filter((rubric) => rubric.rubric_id && rubric.requirement);
+  if (!rubrics.length) return null;
+  const scored = rubrics.filter((rubric) => rubric.llm_score !== null);
+  const metrics = value.metrics && typeof value.metrics === "object" ? value.metrics : {};
+  const average = Number(metrics.average_rubric_score);
+  return {
+    schema_version: "apollo-trajectory-rejudgment-v1",
+    judge: {
+      repo: cleanText(value.judge?.repo, 200) || null,
+      commit: cleanText(value.judge?.commit, 64) || null,
+      sha256: cleanText(value.judge?.sha256, 64) || null,
+      model: cleanText(value.judge?.model, 120) || null,
+      screenshots: cleanText(String(value.judge?.screenshots ?? ""), 20) || null,
+    },
+    metrics: {
+      average_rubric_score: Number.isFinite(average)
+        ? average
+        : (scored.length ? scored.filter((r) => r.llm_score === 1).length / scored.length : 0),
+      perfect: metrics.perfect === true,
+      judge_errors: Number(metrics.judge_errors) || 0,
+      rubrics_total: rubrics.length,
+      rubrics_scored: scored.length,
+    },
+    rubrics,
+  };
+}
+
+export function trajectoryRejudgmentKeyFor(manifestKey) {
+  return `${String(manifestKey).slice(0, String(manifestKey).lastIndexOf("/"))}/rejudgment.json`;
+}
+
+/**
+ * The judgment a reader should see, and the rubric list to match it.
+ *
+ * Falls back to the packaged judgment whenever no re-judgment exists or the
+ * two disagree about which rubrics the task has, so a stale sidecar can never
+ * silently swap in verdicts for a different rubric set.
+ */
+export function trajectoryJudgmentView(manifest, rejudgment) {
+  const packaged = {
+    manifest,
+    metrics: {
+      average_rubric_score: manifest.metrics.average_rubric_score,
+      perfect: manifest.metrics.perfect,
+      judge_errors: manifest.metrics.judge_errors ?? 0,
+      rubrics_total: manifest.rubrics.length,
+      rubrics_scored: manifest.rubrics.filter((rubric) => rubric.llm_status !== "ERROR").length,
+    },
+  };
+  if (!rejudgment) return packaged;
+  const packagedIds = manifest.rubrics.map((rubric) => rubric.rubric_id).sort();
+  const rejudgedIds = rejudgment.rubrics.map((rubric) => rubric.rubric_id).sort();
+  if (packagedIds.length !== rejudgedIds.length
+      || packagedIds.some((id, index) => id !== rejudgedIds[index])) {
+    return packaged;
+  }
+  const byId = new Map(rejudgment.rubrics.map((rubric) => [rubric.rubric_id, rubric]));
+  return {
+    manifest: {
+      ...manifest,
+      rubrics: manifest.rubrics.map((rubric) => {
+        const scored = byId.get(rubric.rubric_id);
+        return scored
+          ? { ...rubric, llm_status: scored.llm_status, llm_score: scored.llm_score,
+              llm_success: scored.llm_success, llm_reasoning: scored.llm_reasoning }
+          : rubric;
+      }),
+      metrics: { ...manifest.metrics, ...rejudgment.metrics },
+      rejudgment: { judge: rejudgment.judge, metrics: rejudgment.metrics },
+    },
+    metrics: rejudgment.metrics,
+  };
+}
+
+const TRAJECTORY_SUBSETS_PREFIX = `${REVIEW_PREFIX}subsets/`;
+
+/**
+ * A named list of task IDs published alongside the corpus, or null.
+ *
+ * Curated sets (an eval slice, a showcase set) otherwise live only as a file
+ * someone has to be handed, leaving every consumer to intersect IDs by hand.
+ * Naming one here lets both reporting endpoints answer for it directly, and
+ * keeps the membership in S3 where it is versioned rather than in code.
+ */
+export function cleanSubsetName(value) {
+  const name = cleanText(value, 60).toLowerCase();
+  return /^[a-z0-9][a-z0-9._-]{0,59}$/.test(name) ? name : "";
+}
+
+export function subsetKeyFor(name) {
+  return `${TRAJECTORY_SUBSETS_PREFIX}${name}.json`;
+}
+
+export function cleanSubsetDocument(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = Array.isArray(value.task_ids) ? value.task_ids : null;
+  if (!raw || !raw.length || raw.length > 20_000) return null;
+  const taskIds = [];
+  for (const entry of raw) {
+    const taskId = cleanText(entry, 300);
+    if (taskId) taskIds.push(taskId);
+  }
+  if (!taskIds.length) return null;
+  return {
+    name: cleanText(value.name, 60),
+    description: cleanText(value.description, 400),
+    created_at_utc: cleanText(value.created_at_utc, 40),
+    task_ids: taskIds,
+  };
+}
 
 /**
  * A manifest's screenshot path, or "" when it must not be signed.
@@ -579,7 +732,14 @@ async function completedPreQcSubmissionKeysFromSources(keys, candidates) {
       const selected = selectLlmReviewArtifact(applicable, taskContentHash);
       if (!selected || selected.contentHash !== taskContentHash) return;
       const artifact = await readJson(selected.key).then(({ json }) => json);
-      if (isCompletedReviewerPreQcArtifact(artifact)) ready.add(subKey);
+      const complete = isCompletedReviewerPreQcArtifact(artifact);
+      if (DASHBOARD_TABLE) {
+        const record = await dashboardIndexRecord(taskId);
+        if (dashboardRecordMatchesSource(record, subKey)) {
+          await updateDashboardPreQcIndex(record, taskContentHash, selected, artifact);
+        }
+      }
+      if (complete) ready.add(subKey);
     } catch {
       // A task that cannot be read or fingerprinted is not ready for review.
     }
@@ -761,7 +921,19 @@ const reviewerCreditPrefix = (reviewer, outcome) => `${reviewerCreditRoot(review
 const reviewerCreditKeyFor = (reviewer, outcome, subKey) =>
   `${reviewerCreditPrefix(reviewer, outcome)}${createHash("sha256").update(subKey).digest("hex")}.json`;
 
+export function pcTaskContributionCount(keys) {
+  return new Set(
+    (keys ?? [])
+      .filter((key) => /\/pc\/[^/]+\/internal\/bundle-[^/]+\/[^/]*review_task_[^/]+\.json$/.test(key))
+      .map((key) => reviewUnitForKey(key))
+  ).size;
+}
+
 async function participantTaskCount(participantId) {
+  if (APP_SCOPE === "pc") {
+    const keys = await listAll(`${UPLOAD_PREFIX}${participantId}/pc/${participantId}/internal/`);
+    return pcTaskContributionCount(keys);
+  }
   // One CommonPrefix per stable task id. Retries add files inside the same
   // directory and therefore never inflate the count. This targeted LIST does
   // not scan or download raw history objects.
@@ -1848,6 +2020,29 @@ export function buildDashboardIndexRecord(item, scope = dashboardIndexScope(), i
   };
 }
 
+export function dashboardAuthorParticipantId(record) {
+  const participantId = participantIdFromSubKey(record?.source_key);
+  return VALID_PID.test(String(participantId || "")) ? participantId : null;
+}
+
+export function authorDashboardEntityKey(record) {
+  const participantId = dashboardAuthorParticipantId(record);
+  if (!participantId || !record?.task_id) return null;
+  return `AUTHOR#${participantId}#TASK#${b64url(record.task_id)}`;
+}
+
+export function buildAuthorDashboardIndexRecord(record) {
+  const entityKey = authorDashboardEntityKey(record);
+  if (!entityKey) return null;
+  return {
+    ...record,
+    entity_key: entityKey,
+    entity_type: "AUTHOR_TASK",
+    author_participant_id: dashboardAuthorParticipantId(record),
+    source_index_revision: record.index_revision || "",
+  };
+}
+
 export function dashboardSubmissionFromIndexRecord(record, now = Date.now()) {
   const status = effectiveIndexedStatus(record, now);
   const inReview = status === "in_review";
@@ -2135,11 +2330,12 @@ export function pageAdminDashboard(dashboard, options = {}) {
 }
 
 export function summarizePCBundles(bundles) {
-  const totals = { bundles: bundles.length, email: 0, calendar: 0, tasks: 0 };
+  const totals = { bundles: bundles.length, email: 0, calendar: 0, documents: 0, tasks: 0 };
   const users = new Map();
   for (const bundle of bundles) {
     totals.email += bundle.email_count;
     totals.calendar += bundle.calendar_count;
+    totals.documents += Number(bundle.document_count) || 0;
     totals.tasks += bundle.task_count;
     const key = bundle.participant_id || "unknown";
     const current = users.get(key) ?? {
@@ -2149,11 +2345,13 @@ export function summarizePCBundles(bundles) {
       bundles: 0,
       email_count: 0,
       calendar_count: 0,
+      document_count: 0,
       task_count: 0,
     };
     current.bundles += 1;
     current.email_count += bundle.email_count;
     current.calendar_count += bundle.calendar_count;
+    current.document_count += Number(bundle.document_count) || 0;
     current.task_count += bundle.task_count;
     users.set(key, current);
   }
@@ -2198,6 +2396,7 @@ async function pcAdminBundles() {
           participant_email: cleanText(manifest.participant?.email, 240),
           email_count: count("email"),
           calendar_count: count("calendar"),
+          document_count: count("documents"),
           task_count: inlineTasks || count("tasks"),
           edited_count: Number(manifest.redaction?.items_edited) || 0,
           masked_count: Object.values(manifest.redaction?.auto_masks_applied ?? {}).reduce((sum, value) => sum + (Number(value) || 0), 0),
@@ -2226,6 +2425,9 @@ export function restrictPCAdminRecord(kind, currentRecord, requestedRecord) {
   } else if (kind === "calendar") {
     if (typeof requestedRecord.summary === "string") safe.summary = requestedRecord.summary.slice(0, 10_000);
     if (typeof requestedRecord.description === "string") safe.description = requestedRecord.description.slice(0, 200_000);
+  } else if (kind === "documents") {
+    if (typeof requestedRecord.title === "string") safe.title = requestedRecord.title.slice(0, 10_000);
+    if (typeof requestedRecord.text === "string") safe.text = requestedRecord.text.slice(0, 200_000);
   }
   safe.id = currentRecord.id;
   return safe;
@@ -2297,8 +2499,8 @@ export function buildPCAdminEdit({ existing, sourceRecord, finalRecord, bundleId
 async function pcAdminDetail(body) {
   const bundleId = cleanText(body.bundle_id, 180);
   const kind = String(body.kind || "");
-  if (!bundleId || !["email", "calendar", "tasks"].includes(kind)) {
-    return { status: 400, body: { error: "bundle_id and kind (email, calendar, or tasks) required" } };
+  if (!bundleId || !["email", "calendar", "documents", "tasks"].includes(kind)) {
+    return { status: 400, body: { error: "bundle_id and kind (email, calendar, documents, or tasks) required" } };
   }
   const bundles = await pcAdminBundles();
   const bundle = bundles.find((candidate) => candidate.summary.bundle_id === bundleId);
@@ -2351,8 +2553,8 @@ async function pcAdminSave(body) {
   const itemId = cleanText(body.item_id, 180);
   const finalRecord = body.final_record;
   const baseRevision = Number(body.base_revision_count);
-  if (!bundleId || !["email", "calendar"].includes(kind) || !itemId) {
-    return { status: 400, body: { error: "bundle_id, email/calendar kind, and item_id required" } };
+  if (!bundleId || !["email", "calendar", "documents"].includes(kind) || !itemId) {
+    return { status: 400, body: { error: "bundle_id, email/calendar/documents kind, and item_id required" } };
   }
   if (!finalRecord || typeof finalRecord !== "object" || Array.isArray(finalRecord)) {
     return { status: 400, body: { error: "final_record must be an object" } };
@@ -2424,10 +2626,14 @@ export function buildAdminItemFromDocuments({
   if (!source || !sourceKey) return null;
   const sourceTask = source.task ?? source;
   const finalTask = done?.outcome === "approved" ? outcome?.task ?? null : null;
-  const isRedacted = source.participant?.participant_id === "redacted" || sourceKey.includes("/pc/");
-  const participantId = isRedacted
+  const isPc = sourceKey.includes("/pc/");
+  const isRedacted = source.participant?.participant_id === "redacted" || isPc;
+  const pcParticipant = isPc
+    ? `pc-${createHash("sha256").update(participantIdFromSubKey(sourceKey) || "unknown").digest("hex").slice(0, 16)}`
+    : null;
+  const participantId = pcParticipant || (isRedacted
     ? "redacted"
-    : cleanText(source.participant?.participant_id || participantIdFromSubKey(sourceKey) || "unknown", 80);
+    : cleanText(source.participant?.participant_id || participantIdFromSubKey(sourceKey) || "unknown", 80));
   const original = cleanTaskSnapshot(sourceTask);
   const final = cleanTaskSnapshot(finalTask);
   const originalMetadata = taskMetadataForReporting(sourceTask);
@@ -2479,7 +2685,9 @@ export function buildAdminItemFromDocuments({
   return {
     task_id: taskId,
     participant_id: participantId,
-    participant_name: isRedacted ? "Anonymous / redacted" : cleanText(source.participant?.name || participantId, 160),
+    participant_name: pcParticipant
+      ? `Annotator ${pcParticipant.slice(3, 11)}`
+      : isRedacted ? "Anonymous / redacted" : cleanText(source.participant?.name || participantId, 160),
     participant_email: isRedacted ? "" : cleanText(source.participant?.email, 240),
     mode: cleanText(source.mode || (sourceKey.includes("/pc/") ? "pc" : "unknown"), 40),
     submitted_at: cleanText(source.created_at || submittedAt, 60),
@@ -2525,6 +2733,99 @@ export function buildAdminItemFromDocuments({
 
 let adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
 let authorApprovedShowcaseCache = { catalog: null, checkedAt: 0 };
+
+// PC has no public/model-labelled catalogue. Build its authenticated showcase
+// from current author-approved finals and author-supplied metadata only.
+export function buildPCApprovedShowcase(documents, generatedAt = new Date().toISOString()) {
+  const records = (documents ?? [])
+    .filter((doc) => doc?.task && doc?.author_approval)
+    .map((doc) => {
+      const task = doc.task;
+      const categories = Array.isArray(task.metadata?.subjects)
+        ? task.metadata.subjects.filter((value) => typeof value === "string" && value.trim())
+        : [];
+      return {
+        task_id: doc.task_id,
+        review_content_hash: doc.review_content_hash || "",
+        title: task.task_title || "Untitled task",
+        request: task.agent_request || "",
+        difficulty: task.difficulty || "",
+        steps: task.steps || [],
+        rubrics: (task.steps || []).length
+          ? task.steps.map((step) => step.description)
+          : task.success_criteria || [],
+        primary_category: categories[0] || "Unlabelled",
+        top_level_category: categories[0] || "Unlabelled",
+        categories,
+        confidence: "unlabelled",
+        rationale: categories.length
+          ? "Author-provided metadata; no automatic classification has been run."
+          : "No category metadata has been recorded.",
+        websites: [],
+        approved_at: doc.author_approval.approved_at || "",
+      };
+    })
+    .sort((a, b) => b.approved_at.localeCompare(a.approved_at));
+  const examples = records.slice(0, 48);
+  const counts = new Map();
+  for (const item of records) counts.set(item.primary_category, (counts.get(item.primary_category) || 0) + 1);
+  const assignments = records.reduce((sum, item) => sum + item.categories.length, 0);
+  const usedCategories = [...counts.keys()].filter((category) => category !== "Unlabelled");
+  return {
+    schema_version: "apollo-admin-author-approved-showcase-v1",
+    generated_at_utc: generatedAt,
+    source_tasks: records.length,
+    selected_tasks: examples.length,
+    requested_limit: 48,
+    selection_strategy: "newest-author-approved",
+    taxonomy: { name: "PC author-provided metadata", source_url: "" },
+    summary: {
+      total_category_assignments: assignments,
+      average_categories_per_task: records.length ? assignments / records.length : 0,
+      primary_categories_used: usedCategories.length,
+      top_level_categories_used: usedCategories.length,
+      category_count_distribution: [...new Set(records.map((item) => item.categories.length))].map((categoryCount) => {
+        const count = records.filter((item) => item.categories.length === categoryCount).length;
+        return { category_count: categoryCount, count, share: count / records.length };
+      }),
+      confidence_distribution: [],
+      tasks_with_websites: 0,
+      tasks_without_websites: records.length,
+      website_coverage_share: 0,
+      website_mentions: 0,
+      unique_websites: 0,
+      top_websites: [],
+    },
+    primary_top_level_distribution: [...counts].map(([category, count]) => ({
+      category,
+      count,
+      share: count / records.length,
+      showcase_examples: examples.filter((item) => item.primary_category === category).length,
+    })),
+    primary_category_distribution: [...counts].map(([category, count]) => ({ category, count })),
+    examples,
+  };
+}
+
+async function pcApprovedShowcase() {
+  const keys = await listAll(AUTHOR_APPROVED_PREFIX);
+  const documents = [];
+  for (let offset = 0; offset < keys.length; offset += 25) {
+    documents.push(...await Promise.all(keys.slice(offset, offset + 25).map(async (key) => {
+      const [approved, current] = await Promise.all([
+        readJson(key).then(({ json }) => json),
+        readJson(`${REVIEW_PREFIX}finished/${key.slice(AUTHOR_APPROVED_PREFIX.length)}`)
+          .then(({ json }) => json)
+          .catch((error) => {
+            if (isMissingObjectError(error)) return null;
+            throw error;
+          }),
+      ]);
+      return current && current.review_content_hash === approved.review_content_hash ? approved : null;
+    })));
+  }
+  return buildPCApprovedShowcase(documents);
+}
 
 async function authorApprovedShowcase() {
   if (authorApprovedShowcaseCache.catalog && Date.now() - authorApprovedShowcaseCache.checkedAt < 60_000) {
@@ -2747,11 +3048,13 @@ export async function putDashboardIndexItem(item, options = {}) {
   if (!DASHBOARD_TABLE) return false;
   const record = buildDashboardIndexRecord(item);
   if (!record) return false;
-  const existing = await dashboardDb.send(new GetCommand({
-    TableName: DASHBOARD_TABLE,
-    Key: { scope: record.scope, entity_key: record.entity_key },
-    ConsistentRead: true,
-  })).then((response) => response.Item ?? null);
+  const durable = await putDashboardTaskRecord(record, options);
+  await syncAuthorDashboardIndex(durable.task_id);
+  invalidateDashboardIndexCache();
+  return true;
+}
+
+export function mergeDashboardIndexRecord(existing, record, options = {}) {
   // A delayed registration must never roll a reviewed task back to pending.
   const existingStatus = existing ? effectiveIndexedStatus(existing) : "pending";
   const matchingAudit = existing && existing.task_content_hash === record.task_content_hash
@@ -2796,9 +3099,77 @@ export async function putDashboardIndexItem(item, options = {}) {
         lock_expires_at: existing.lock_expires_at,
       }
     : { ...record, ...matchingAudit };
-  await dashboardDb.send(new PutCommand({ TableName: DASHBOARD_TABLE, Item: durable }));
-  invalidateDashboardIndexCache();
+  return durable;
+}
+
+export function buildDashboardConditionalPutRequest({ tableName, record, existing, nextRevision }) {
+  if (!tableName || !record?.scope || !record?.entity_key || !nextRevision) return null;
+  const request = {
+    TableName: tableName,
+    Item: { ...record, index_revision: nextRevision },
+    ExpressionAttributeNames: {},
+  };
+  if (!existing) {
+    request.ExpressionAttributeNames["#entity"] = "entity_key";
+    request.ConditionExpression = "attribute_not_exists(#entity)";
+    return request;
+  }
+  request.ExpressionAttributeNames["#revision"] = "index_revision";
+  if (existing.index_revision) {
+    request.ConditionExpression = "#revision = :expectedRevision";
+    request.ExpressionAttributeValues = { ":expectedRevision": existing.index_revision };
+  } else {
+    request.ConditionExpression = "attribute_not_exists(#revision)";
+  }
+  return request;
+}
+
+async function conditionalPutDashboardRecord(record, merge, options = {}) {
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const existing = await dashboardDb.send(new GetCommand({
+      TableName: DASHBOARD_TABLE,
+      Key: { scope: record.scope, entity_key: record.entity_key },
+      ConsistentRead: true,
+    })).then((response) => response.Item ?? null);
+    if (options.rejectOlder && existing?.indexed_at && record?.indexed_at
+      && String(existing.indexed_at) > String(record.indexed_at)) return existing;
+    const next = merge ? merge(existing, record, options) : record;
+    const request = buildDashboardConditionalPutRequest({
+      tableName: DASHBOARD_TABLE,
+      record: next,
+      existing,
+      nextRevision: randomUUID(),
+    });
+    try {
+      await dashboardDb.send(new PutCommand(request));
+      return request.Item;
+    } catch (error) {
+      if (error?.name !== "ConditionalCheckFailedException" || attempt === 4) throw error;
+    }
+  }
+  throw new Error("Dashboard index update exhausted its conflict retries");
+}
+
+async function putDashboardTaskRecord(record, options = {}) {
+  return conditionalPutDashboardRecord(record, mergeDashboardIndexRecord, options);
+}
+
+async function putAuthorDashboardIndexRecord(taskRecord) {
+  const authorRecord = buildAuthorDashboardIndexRecord(taskRecord);
+  if (!authorRecord) return false;
+  await conditionalPutDashboardRecord(authorRecord, null, { rejectOlder: true });
   return true;
+}
+
+async function syncAuthorDashboardIndex(taskId) {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const record = await dashboardIndexRecord(taskId);
+    if (!record) return false;
+    await putAuthorDashboardIndexRecord(record);
+    const current = await dashboardIndexRecord(taskId);
+    if (current?.index_revision === record.index_revision) return true;
+  }
+  throw new Error("Author dashboard index did not converge on the current task revision");
 }
 
 export async function markDashboardIndexReady(expectedCount, backfilledAt = new Date().toISOString()) {
@@ -2849,6 +3220,123 @@ export async function loadDashboardIndexRecords() {
   return records;
 }
 
+export async function loadAuthorDashboardIndexRecords(participantId) {
+  if (!DASHBOARD_TABLE || !VALID_PID.test(String(participantId || ""))) return [];
+  const records = [];
+  let ExclusiveStartKey;
+  do {
+    const response = await dashboardDb.send(new QueryCommand({
+      TableName: DASHBOARD_TABLE,
+      KeyConditionExpression: "#scope = :scope AND begins_with(#entity, :author)",
+      ExpressionAttributeNames: { "#scope": "scope", "#entity": "entity_key" },
+      ExpressionAttributeValues: { ":scope": dashboardIndexScope(), ":author": `AUTHOR#${participantId}#TASK#` },
+      ExclusiveStartKey,
+      ConsistentRead: true,
+    }));
+    records.push(...(response.Items ?? []));
+    ExclusiveStartKey = response.LastEvaluatedKey;
+  } while (ExclusiveStartKey);
+  return records;
+}
+
+async function dashboardAuthorIndexReady() {
+  if (!DASHBOARD_TABLE) return false;
+  const response = await dashboardDb.send(new GetCommand({
+    TableName: DASHBOARD_TABLE,
+    Key: { scope: dashboardIndexScope(), entity_key: "AUTHOR_META" },
+    ConsistentRead: true,
+  }));
+  return response.Item?.ready === true;
+}
+
+export function indexedAuthorTaskStatus(record, now = Date.now()) {
+  const status = effectiveIndexedStatus(record, now);
+  if (status !== "pending") return status;
+  const preQcCurrent = record?.pre_qc_complete === true
+    && record.pre_qc_task_content_hash
+    && record.pre_qc_task_content_hash === record.task_content_hash;
+  return preQcCurrent ? "pending" : "awaiting_codex";
+}
+
+async function indexedMyTasksPage(participantId, body) {
+  if (!(await dashboardAuthorIndexReady())) return null;
+  const records = await loadAuthorDashboardIndexRecords(participantId);
+  records.sort((a, b) => String(b.submitted_at || "").localeCompare(String(a.submitted_at || ""))
+    || String(b.source_key || "").localeCompare(String(a.source_key || "")));
+  const offset = Math.max(0, Number(body.offset) || 0);
+  const limit = Math.min(200, Math.max(1, Number(body.limit) || 50));
+  const pageRecords = records.slice(offset, offset + limit);
+  const unresolvedAuditKeys = pageRecords
+    .filter((record) => indexedAuthorTaskStatus(record) === "awaiting_codex")
+    .map((record) => record.source_key);
+  const audited = unresolvedAuditKeys.length
+    ? await completedPreQcSubmissionKeys(unresolvedAuditKeys)
+    : new Set();
+  const approvedTotal = records.filter((record) => effectiveIndexedStatus(record) === "approved").length;
+  const awaitingSignoffTotal = records.filter((record) => (
+    effectiveIndexedStatus(record) === "approved" && !record.signoff_at
+  )).length;
+  const buildItem = async (record) => {
+    const source = await readJson(record.source_key).then(({ json }) => json).catch(() => null);
+    const task = source?.task ?? source;
+    const original = cleanTaskSnapshot(task);
+    const rubrics = cleanRubrics(null, original, null);
+    const indexedStatus = indexedAuthorTaskStatus(record);
+    const status = indexedStatus === "awaiting_codex" && audited.has(record.source_key)
+      ? "pending"
+      : indexedStatus;
+    const item = {
+      task_id: cleanText(source?.task_id || record.task_id, 300),
+      sub_key: record.source_key,
+      title: cleanText(task?.task_title ?? task?.title ?? record.original_title, 300),
+      request: String(task?.agent_request ?? task?.request ?? "").slice(0, 300),
+      status,
+      submitted_at: source?.created_at || record.submitted_at || null,
+      content_hash: original ? reportingTaskContentHash(original, null, rubrics) : record.task_content_hash || null,
+      rejection_count: Math.max(0, Math.floor(Number(record.appeal_number) || 0)) + (status === "rejected" ? 1 : 0),
+    };
+    if (status === "approved") {
+      const finished = record.done_target
+        ? await readJson(record.done_target).then(({ json }) => json).catch(() => null)
+        : null;
+      item.reviewer_changed = record.changed_in_qc == null ? reviewerChangedTask(finished) : Boolean(record.changed_in_qc);
+      item.revision_count = Number(record.final_gold_revision) || finalGoldRevision(finished);
+      item.signed_off_at = record.signoff_at || "";
+      item.signoff_action = record.signoff_action || "";
+      item.needs_signoff = !record.signoff_at;
+    }
+    if (status === "rejected") {
+      const rejected = record.done_target
+        ? await readJson(record.done_target).then(({ json }) => json).catch(() => null)
+        : null;
+      item.rejection_reason = cleanText(rejected?.reason || record.rejection_reason, 500) || "";
+      item.can_appeal = rejectionCanAppeal(item.rejection_count, rejected);
+      if (item.rejection_count === 1 && !item.can_appeal) {
+        item.appeal_unavailable_reason = "This rejection cannot be appealed yet. Ask the task lead to unlock it.";
+      }
+    }
+    if (status === "returned") {
+      const returned = record.done_target
+        ? await readJson(record.done_target).then(({ json }) => json).catch(() => null)
+        : null;
+      item.returned_reason = cleanText(returned?.reason || record.rejection_reason, 500) || "";
+    }
+    return item;
+  };
+  const items = [];
+  for (let index = 0; index < pageRecords.length; index += 25) {
+    items.push(...await Promise.all(pageRecords.slice(index, index + 25).map(buildItem)));
+  }
+  return {
+    items,
+    offset,
+    limit,
+    source_total: records.length,
+    approved_total: approvedTotal,
+    awaiting_signoff_total: awaitingSignoffTotal,
+  };
+}
+
 async function updateDashboardPreQcIndex(record, taskContentHash, candidate = null, artifact = null) {
   if (!DASHBOARD_TABLE || !record?.task_id || !record?.source_key || !taskContentHash) return false;
   const complete = candidate ? isCompletedReviewerPreQcArtifact(artifact) : false;
@@ -2860,6 +3348,7 @@ async function updateDashboardPreQcIndex(record, taskContentHash, candidate = nu
     ":status": cleanText(artifact?.status, 80),
     ":complete": complete,
     ":indexed": new Date().toISOString(),
+    ":indexRevision": randomUUID(),
   };
   const sourceCondition = dashboardSourceCondition(record.source_key);
   try {
@@ -2867,10 +3356,11 @@ async function updateDashboardPreQcIndex(record, taskContentHash, candidate = nu
       TableName: DASHBOARD_TABLE,
       Key: { scope: dashboardIndexScope(), entity_key: `TASK#${record.task_id}` },
       ConditionExpression: sourceCondition.ConditionExpression,
-      UpdateExpression: "SET task_content_hash = :hash, pre_qc_artifact_key = :artifact, pre_qc_task_content_hash = :reviewHash, pre_qc_pipeline_version = :version, pre_qc_status = :status, pre_qc_complete = :complete, pre_qc_indexed_at = :indexed",
+      UpdateExpression: "SET task_content_hash = :hash, pre_qc_artifact_key = :artifact, pre_qc_task_content_hash = :reviewHash, pre_qc_pipeline_version = :version, pre_qc_status = :status, pre_qc_complete = :complete, pre_qc_indexed_at = :indexed, indexed_at = :indexed, index_revision = :indexRevision",
       ExpressionAttributeNames: sourceCondition.ExpressionAttributeNames,
       ExpressionAttributeValues: { ...values, ...sourceCondition.ExpressionAttributeValues },
     }));
+    await syncAuthorDashboardIndex(record.task_id);
     return complete;
   } catch (error) {
     if (error?.name === "ConditionalCheckFailedException") return false;
@@ -2972,7 +3462,13 @@ export async function reconcileDashboardIndex(records) {
       // Invalid legacy marker: leave the source of truth untouched and ignore.
     }
   }
-  const indexedByUnit = new Map(records.map((record) => [record.review_unit, record.source_key]));
+  // Rebuild legacy PC rows that collapsed every author into participant_id
+  // "redacted" so each annotator receives a stable private dashboard row.
+  const indexedByUnit = new Map(
+    records
+      .filter((record) => !(record.source_key?.includes("/pc/") && record.participant_id === "redacted"))
+      .map((record) => [record.review_unit, record.source_key])
+  );
   const missingOrNewer = [...newestByUnit.entries()]
     .filter(([unit, marker]) => indexedByUnit.get(unit) !== marker.sourceKey)
     .map(([, marker]) => marker);
@@ -2991,6 +3487,10 @@ export async function reconcileDashboardIndex(records) {
 
 let dashboardIndexCache = { dashboard: null, checkedAt: 0, pending: null };
 
+export function dashboardIndexRequiresS3Reconciliation(scope = dashboardIndexScope()) {
+  return scope === "v2";
+}
+
 export async function indexedAdminDashboard() {
   if (!DASHBOARD_TABLE) return null;
   const now = Date.now();
@@ -3002,8 +3502,10 @@ export async function indexedAdminDashboard() {
       const meta = await dashboardIndexMetadata();
       if (!meta?.ready) return null;
       let records = await loadDashboardIndexRecords();
-      const reconciliation = await reconcileDashboardIndex(records);
-      if (reconciliation.indexed) records = await loadDashboardIndexRecords();
+      if (dashboardIndexRequiresS3Reconciliation()) {
+        const reconciliation = await reconcileDashboardIndex(records);
+        if (reconciliation.indexed) records = await loadDashboardIndexRecords();
+      }
       return dashboardFromIndexRecords(records);
     })();
   }
@@ -3192,7 +3694,18 @@ async function reopenReviewOutcome(taskId, adminEmail, reason = "") {
   }
 }
 
-async function adminListDashboard() {
+async function adminListDashboard({ fresh = false } = {}) {
+  if (fresh && DASHBOARD_TABLE) {
+    const meta = await dashboardIndexMetadata();
+    if (meta?.ready) {
+      let records = await loadDashboardIndexRecords();
+      if (dashboardIndexRequiresS3Reconciliation()) {
+        const reconciliation = await reconcileDashboardIndex(records);
+        if (reconciliation.indexed) records = await loadDashboardIndexRecords();
+      }
+      return dashboardFromIndexRecords(records);
+    }
+  }
   try {
     const indexed = await indexedAdminDashboard();
     if (indexed) return indexed;
@@ -3268,6 +3781,7 @@ export function buildDashboardStatusUpdateRequest({
     ":amendedAt": details.amended_at || "",
     ":revision": Number(details.final_gold_revision) || 0,
     ":indexed": indexedAt,
+    ":indexRevision": randomUUID(),
     ":expectedSource": expectedSourceKey,
   };
   const clearSignoff = status === "pending"
@@ -3277,7 +3791,7 @@ export function buildDashboardStatusUpdateRequest({
     TableName: tableName,
     Key: { scope, entity_key: `TASK#${taskId}` },
     ConditionExpression: "attribute_exists(#entity) AND #source = :expectedSource",
-    UpdateExpression: `SET #status = :status, reviewer = :reviewer, reviewed_at = :reviewed, rejection_reason = :reason, done_target = :target, lock_expires_at = :expires, changed = :changed, changed_in_qc = :changedInQc, final_title = :finalTitle, final_difficulty = :finalDifficulty, final_region = :finalRegion, final_subjects = :finalSubjects, claimed_at = :claimedAt, amended_by = :amendedBy, amended_at = :amendedAt, final_gold_revision = :revision, indexed_at = :indexed${clearSignoff}`,
+    UpdateExpression: `SET #status = :status, reviewer = :reviewer, reviewed_at = :reviewed, rejection_reason = :reason, done_target = :target, lock_expires_at = :expires, changed = :changed, changed_in_qc = :changedInQc, final_title = :finalTitle, final_difficulty = :finalDifficulty, final_region = :finalRegion, final_subjects = :finalSubjects, claimed_at = :claimedAt, amended_by = :amendedBy, amended_at = :amendedAt, final_gold_revision = :revision, indexed_at = :indexed, index_revision = :indexRevision${clearSignoff}`,
     ExpressionAttributeNames: { "#entity": "entity_key", "#status": "status", "#source": "source_key" },
     ExpressionAttributeValues: values,
   };
@@ -3295,6 +3809,7 @@ async function setDashboardIndexStatus(taskId, status, details = {}) {
   });
   try {
     await dashboardDb.send(new UpdateCommand(request));
+    await syncAuthorDashboardIndex(taskId);
     invalidateDashboardIndexCache();
     return true;
   } catch (error) {
@@ -3326,6 +3841,96 @@ async function registerDashboardSubmission(taskId, participantId) {
   return { indexed: true, task_id: taskId };
 }
 
+export function pcUploadCompletionKind(key, uploadPrefix = UPLOAD_PREFIX) {
+  const participantId = participantIdFromSubKey(key);
+  if (!participantId || !String(key).startsWith(`${uploadPrefix}${participantId}/pc/${participantId}/internal/bundle-`)) {
+    return null;
+  }
+  const filename = String(key).slice(String(key).lastIndexOf("/") + 1).replace(/^\d{13}-[A-Za-z0-9]+_/, "");
+  if (filename === "manifest.json") return "manifest";
+  if (/^review_task_[A-Za-z0-9_-]{1,120}\.json$/.test(filename)) return "review_task";
+  return null;
+}
+
+export function validatePCUploadCompletionSource(key, source, uploadPrefix = UPLOAD_PREFIX) {
+  const kind = pcUploadCompletionKind(key, uploadPrefix);
+  if (!kind || !source || typeof source !== "object" || Array.isArray(source)) {
+    return { ok: false, kind, error: "Upload is not a valid completable PC object" };
+  }
+  const participantId = participantIdFromSubKey(key);
+  const outerPrefix = `${uploadPrefix}${participantId}/`;
+  const filename = String(key).slice(String(key).lastIndexOf("/") + 1).replace(/^\d{13}-[A-Za-z0-9]+_/, "");
+  const bundleId = String(key).slice(outerPrefix.length, String(key).lastIndexOf("/"));
+  if (kind === "manifest") {
+    const privacyStatus = String(source.privacy_audit?.status || "");
+    const valid = source.schema_version === "odyssey_personal_context_v1"
+      && source.bundle_id === bundleId
+      && source.participant?.participant_id === participantId
+      && Array.isArray(source.parts)
+      && ["pass", "review"].includes(privacyStatus)
+      && Number(source.privacy_audit?.blocking_findings) === 0;
+    return valid
+      ? { ok: true, kind, participantId, bundleId }
+      : { ok: false, kind, error: "Uploaded PC manifest does not match its bundle or privacy gate" };
+  }
+
+  const filenameTaskId = filename.slice("review_task_".length, -".json".length);
+  const participant = source.participant;
+  const provenance = source.provenance;
+  const noPrivateTopLevel = !["records", "entities", "aliases", "correlation_hints", "expected_answer", "referenced_record_ids"]
+    .some((field) => Object.hasOwn(source, field));
+  const valid = source.schema_version === "odyssey_long_task_v2"
+    && source.task_id === `pc_${filenameTaskId}`
+    && participant?.participant_id === "redacted"
+    && participant?.name == null
+    && participant?.email == null
+    && source.task && typeof source.task === "object" && !Array.isArray(source.task)
+    && String(source.task.agent_request || "").trim().length > 0
+    && Array.isArray(provenance?.source_journeys) && provenance.source_journeys.length === 0
+    && Array.isArray(provenance?.attached_urls) && provenance.attached_urls.length === 0
+    && noPrivateTopLevel;
+  return valid
+    ? { ok: true, kind, participantId, bundleId }
+    : { ok: false, kind, error: "Uploaded PC task sidecar is invalid or contains private bundle fields" };
+}
+
+async function completePCUpload(body) {
+  const key = cleanText(body.key, 2_000);
+  if (APP_SCOPE !== "pc" || !uploadCompletionTokenMatches(key, body.expires_at, body.token)) {
+    return { status: 401, body: { error: "Invalid or expired upload completion token" } };
+  }
+  const kind = pcUploadCompletionKind(key);
+  if (!kind) return { status: 400, body: { error: "Upload is not a completable PC object" } };
+  const source = await readJson(key).then(({ json }) => json).catch((error) => {
+    if (isMissingObjectError(error)) return null;
+    throw error;
+  });
+  if (!source) return { status: 409, body: { error: "Uploaded object is not visible yet" } };
+  const validation = validatePCUploadCompletionSource(key, source);
+  if (!validation.ok) return { status: 400, body: { error: validation.error } };
+
+  if (kind === "manifest") {
+    await s3.send(new PutObjectCommand({
+      Bucket: S3_BUCKET,
+      Key: pcBundleIndexKeyFor(key),
+      Body: key,
+      ContentType: "text/plain",
+    }));
+    return { status: 200, body: { ok: true, kind, indexed: true } };
+  }
+
+  await s3.send(new PutObjectCommand({
+    Bucket: S3_BUCKET,
+    Key: inboxKeyFor(key),
+    Body: key,
+    ContentType: "text/plain",
+  }));
+  const item = buildAdminItemFromDocuments({ source, sourceKey: key });
+  const indexed = item ? await putDashboardIndexItem(item) : false;
+  adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
+  return { status: 200, body: { ok: true, kind, indexed, task_id: item?.task_id || source.task_id } };
+}
+
 export function selectReportingPage(dashboard, options = {}) {
   const includeContent = Boolean(options.includeContent);
   const includeLlmReviews = Boolean(options.includeLlmReviews);
@@ -3333,9 +3938,11 @@ export function selectReportingPage(dashboard, options = {}) {
   const requestedStatus = ["pending", "in_review", "approved", "rejected"].includes(options.status)
     ? options.status
     : "";
+  const subsetIds = options.subsetIds instanceof Set ? options.subsetIds : null;
   const filteredItems = (dashboard.items ?? []).filter((item) =>
     (!requestedTaskId || item.task_id === requestedTaskId) &&
-    (!requestedStatus || item.status === requestedStatus)
+    (!requestedStatus || item.status === requestedStatus) &&
+    (!subsetIds || subsetIds.has(item.task_id))
   );
   const offset = requestedTaskId ? 0 : Math.max(0, Number(options.offset) || 0);
   const requestedLimit = Number(options.limit);
@@ -3485,6 +4092,10 @@ export function buildReportingReport(dashboard, generatedAt = new Date().toISOSt
     return {
     task_id: item.task_id,
     participant_id: item.participant_id,
+    // The private admin identifier above is deliberately not claimable. The
+    // authenticated execution pipeline needs the upload owner so a PC author
+    // can claim and grade their own trajectory.
+    creator_pid: participantIdFromSubKey(item.source_key || "") || item.participant_id,
     canonical_participant_id: canonicalId,
     participant_name: canonicalNames.get(canonicalId) ?? canonicalNames.get(item.participant_id) ?? item.participant_name,
     participant_name_raw: item.participant_name,
@@ -4366,7 +4977,14 @@ async function recoverStaleFinalizingReview(subKey) {
           done_target: descriptor.target,
         });
       } else {
-        await setDashboardIndexStatus(rawTaskId, "pending", { expected_source_key: subKey });
+        await setDashboardIndexStatus(rawTaskId, "returned", {
+          expected_source_key: subKey,
+          reviewer: creditedReviewer,
+          reviewed_at: finalCompletedAt,
+          claimed_at: String(done.claimed_at || lockRecord.json.claimed_at || ""),
+          rejection_reason: cleanText(outcomeDocument.reason, 500),
+          done_target: descriptor.target,
+        });
       }
     },
     // This must remain last: the finalizing lock is the durable retry trigger
@@ -4596,6 +5214,18 @@ function bearerToken(headers = {}) {
   return match?.[1]?.trim() || "";
 }
 
+async function loadSubset(params) {
+  const requested = cleanText(params.subset, 60);
+  if (!requested) return { name: "", ids: null, error: null };
+  const name = cleanSubsetName(requested);
+  if (!name) return { name: requested, ids: null, error: "subset name is not a valid identifier" };
+  const document = cleanSubsetDocument(
+    await readJson(subsetKeyFor(name)).then(({ json }) => json).catch(() => null),
+  );
+  if (!document) return { name, ids: null, error: `no published subset named "${name}"` };
+  return { name, ids: new Set(document.task_ids), document, error: null };
+}
+
 async function handleReporting(event) {
   if (!reportingKeyMatches(bearerToken(event.headers))) {
     return respond(401, { error: "Bad or missing reporting bearer token" }, { "Cache-Control": "no-store" });
@@ -4611,6 +5241,8 @@ async function handleReporting(event) {
   const maxLimit = includeLlmReviews ? 25 : includeLlmFlags ? 200 : includeContent ? 150 : 5_000;
   const limit = Math.min(maxLimit, Math.max(1, Number(params.limit) || defaultLimit));
   const offset = Math.max(0, Number(params.offset) || 0);
+  const subset = await loadSubset(params);
+  if (subset.error) return respond(404, { error: subset.error }, { "Cache-Control": "no-store" });
   const [dashboard, aliases, skipCounts] = await Promise.all([adminDashboard(), participantAliases(), reviewSkipCounts()]);
   const options = {
     includeContent,
@@ -4620,12 +5252,19 @@ async function handleReporting(event) {
     status,
     limit,
     offset,
+    subsetIds: subset.ids,
     participantAliases: aliases,
     skipCounts,
   };
   if (includeLlmReviews) await hydrateReportingLlmReviews(dashboard, options);
   if (includeLlmFlags) await hydrateReportingLlmFlags(dashboard, options);
-  return respond(200, buildReportingReport(dashboard, new Date().toISOString(), options), { "Cache-Control": "no-store" });
+  const report = buildReportingReport(dashboard, new Date().toISOString(), options);
+  if (subset.ids) {
+    // Say which named set answered, so a caller can tell an empty page from a
+    // filter that silently matched nothing.
+    report.subset = { name: subset.name, task_ids: subset.ids.size, description: subset.document.description };
+  }
+  return respond(200, report, { "Cache-Control": "no-store" });
 }
 
 async function preQcReviewForClaimedTask(subKey) {
@@ -5017,9 +5656,11 @@ export function buildOsworldExportReport(items, generatedAt = new Date().toISOSt
   const requestedStatus = ["pending", "in_review", "reviewed"].includes(options.status) ? options.status : "";
   const anyGrade = options.grade === "any";
   const snapshot = /^[a-z0-9_-]{1,40}$/i.test(String(options.snapshot || "")) ? String(options.snapshot) : "chrome";
+  const subsetIds = options.subsetIds instanceof Set ? options.subsetIds : null;
   const filtered = items.filter((item) =>
     (!requestedTaskId || item.task_id === requestedTaskId)
     && (!requestedStatus || item.status === requestedStatus)
+    && (!subsetIds || subsetIds.has(item.task_id))
     && (anyGrade || acceptedHumanPass(item))
   );
   const selected = selectLatestRunPerTask(filtered);
@@ -5052,8 +5693,11 @@ export function buildOsworldExportReport(items, generatedAt = new Date().toISOSt
 export function buildTrajectoryReportingReport(items, generatedAt = new Date().toISOString(), options = {}) {
   const requestedTaskId = cleanText(options.taskId, 300);
   const requestedStatus = ["pending", "in_review", "reviewed"].includes(options.status) ? options.status : "";
+  const subsetIds = options.subsetIds instanceof Set ? options.subsetIds : null;
   const filtered = items.filter((item) =>
-    (!requestedTaskId || item.task_id === requestedTaskId) && (!requestedStatus || item.status === requestedStatus)
+    (!requestedTaskId || item.task_id === requestedTaskId)
+    && (!requestedStatus || item.status === requestedStatus)
+    && (!subsetIds || subsetIds.has(item.task_id))
   );
   const offset = Math.max(0, Number(options.offset) || 0);
   // Content rows carry every step and rubric, so they stay capped well below
@@ -5077,6 +5721,13 @@ export function buildTrajectoryReportingReport(items, generatedAt = new Date().t
       reviewed_at: item.reviewed_at ?? "",
       llm_average_rubric_score: item.llm_average_rubric_score,
       llm_perfect: item.llm_perfect,
+      // Which judging the scores above came from, and the package's own
+      // judgment beside it. Without these a corrected score is
+      // indistinguishable from the original one it replaced.
+      llm_judge_source: item.llm_judge_source ?? "packaged",
+      llm_judge: item.llm_judge ?? null,
+      llm_original_average_rubric_score: item.llm_original_average_rubric_score ?? item.llm_average_rubric_score,
+      llm_original_perfect: item.llm_original_perfect ?? item.llm_perfect,
       llm_judge_errors: item.llm_judge_errors ?? 0,
       llm_rubrics_total: item.llm_rubrics_total ?? null,
       llm_rubrics_scored: item.llm_rubrics_scored ?? null,
@@ -5111,18 +5762,28 @@ async function handleTrajectoryReporting(event) {
   // The OSWorld view is built from manifest + judgment even when the caller
   // did not ask for the raw content, so hydrate whenever either is needed.
   const loadContent = includeContent || includeScreenshots || includeOsworld || formatOsworld;
+  const subset = await loadSubset(params);
+  if (subset.error) return respond(404, { error: subset.error }, { "Cache-Control": "no-store" });
   const state = await trajectoryQueueState();
+  // Narrow before hydrating, not after: every manifest costs S3 reads, and a
+  // named subset is usually a small slice of the corpus.
+  const manifests = subset.ids
+    ? state.manifests.filter((key) => subset.ids.has(taskIdFromTrajectoryManifestKey(key) || ""))
+    : state.manifests;
   const items = [];
-  for (let offset = 0; offset < state.manifests.length; offset += 25) {
-    const batch = await Promise.all(state.manifests.slice(offset, offset + 25).map(async (manifestKey) => {
+  for (let offset = 0; offset < manifests.length; offset += 25) {
+    const batch = await Promise.all(manifests.slice(offset, offset + 25).map(async (manifestKey) => {
       const encoded = b64url(manifestKey);
-      const [manifestRaw, done, lock] = await Promise.all([
+      const [manifestRaw, done, lock, rejudgmentRaw] = await Promise.all([
         readJson(manifestKey).then(({ json }) => json).catch(() => null),
         readDoneRecord(manifestKey, trajectoryDoneKeyFor),
         state.lockSet.has(encoded) ? readJson(trajectoryLockKeyFor(manifestKey)).then(({ json }) => json).catch(() => null) : null,
+        readJson(trajectoryRejudgmentKeyFor(manifestKey)).then(({ json }) => json).catch(() => null),
       ]);
       const manifest = cleanTrajectoryManifest(manifestRaw);
       if (!manifest) return null;
+      const rejudgment = cleanTrajectoryRejudgment(rejudgmentRaw);
+      const judged = trajectoryJudgmentView(manifest, rejudgment);
       const judgment = done?.target ? await readJson(done.target).then(({ json }) => json).catch(() => null) : null;
       return {
         manifest_key: manifestKey,
@@ -5131,17 +5792,21 @@ async function handleTrajectoryReporting(event) {
         status: done ? "reviewed" : lock ? "in_review" : "pending",
         reviewer: done?.reviewer ?? lock?.reviewer ?? "",
         reviewed_at: done?.completed_at ?? "",
-        llm_average_rubric_score: manifest.metrics.average_rubric_score,
-        llm_perfect: manifest.metrics.perfect,
+        llm_average_rubric_score: judged.metrics.average_rubric_score,
+        llm_perfect: judged.metrics.perfect,
+        // Which judging these scores came from, and the manifest's original
+        // beside it, so a grader can always see both.
+        llm_judge_source: rejudgment ? "canonical_full_trajectory" : "packaged",
+        llm_judge: rejudgment ? rejudgment.judge : null,
+        llm_original_average_rubric_score: manifest.metrics.average_rubric_score,
+        llm_original_perfect: manifest.metrics.perfect,
         // average_rubric_score is the mean over rubrics the judge actually
         // scored; rubrics that errored are dropped from that denominator, so
         // a 1.0 can rest on a subset. Surface the counts beside it so callers
         // can tell a full pass from a partial one without fetching content.
-        llm_judge_errors: manifest.metrics.judge_errors ?? 0,
-        llm_rubrics_total: Array.isArray(manifest.rubrics) ? manifest.rubrics.length : null,
-        llm_rubrics_scored: Array.isArray(manifest.rubrics)
-          ? manifest.rubrics.filter((rubric) => rubric?.llm_status !== "ERROR").length
-          : null,
+        llm_judge_errors: judged.metrics.judge_errors ?? 0,
+        llm_rubrics_total: judged.metrics.rubrics_total,
+        llm_rubrics_scored: judged.metrics.rubrics_scored,
         agent: manifest.source.agent,
         model: manifest.source.model,
         run_label: manifest.source.run_label,
@@ -5149,7 +5814,7 @@ async function handleTrajectoryReporting(event) {
         // grade beside it so reporting clients can migrate independently.
         human_outcome: judgment?.trajectory?.task_satisfied ?? judgment?.trajectory?.outcome ?? null,
         human_final_grade: trajectoryOverallOutcome(judgment?.trajectory) || null,
-        manifest: loadContent ? manifest : null,
+        manifest: loadContent ? judged.manifest : null,
         human_judgment: loadContent ? judgment : null,
       };
     }));
@@ -5163,6 +5828,7 @@ async function handleTrajectoryReporting(event) {
     grade: cleanText(params.grade, 10).toLowerCase(),
     taskId: cleanText(params.task_id, 300),
     status: cleanText(params.status, 30),
+    subsetIds: subset.ids,
     limit: params.limit,
     offset: params.offset,
   };
@@ -5193,6 +5859,11 @@ async function handleTrajectoryReporting(event) {
       }));
       return { ...row, manifest: { ...row.manifest, steps: signed } };
     }));
+  }
+  if (subset.ids) {
+    // Name the set that answered, so an empty page is distinguishable from a
+    // filter that matched nothing.
+    report.subset = { name: subset.name, task_ids: subset.ids.size, description: subset.document.description };
   }
   return respond(200, report, { "Cache-Control": "no-store" });
 }
@@ -5482,6 +6153,9 @@ async function handleReview(path, body) {
   if (path === "/review/admin") {
     if (!isAllowedAdminEmail(body.admin_email)) return respond(403, { error: "Admin access required" });
     if (body.action === "showcase") {
+      if (APP_SCOPE === "pc") {
+        return respond(200, await pcApprovedShowcase(), { "Cache-Control": "no-store" });
+      }
       if (APP_SCOPE !== "primary") return respond(404, { error: "Showcase is not available for this app" });
       try {
         return respond(200, await authorApprovedShowcase(), { "Cache-Control": "no-store" });
@@ -5503,7 +6177,7 @@ async function handleReview(path, body) {
       const onlyUnedited = body.only_unedited !== false;
       const outcome = body.outcome === "rejected" ? "rejected" : "approved";
       const limit = Math.max(1, Math.min(20, Math.floor(Number(body.limit) || 20)));
-      const dashboard = await adminListDashboard();
+      const dashboard = await adminListDashboard({ fresh: true });
       const matches = (dashboard.items ?? []).filter((item) =>
         item.status === outcome &&
         normalizeReviewerName(item.reviewer) === targetReviewer &&
@@ -6521,6 +7195,10 @@ async function handleReview(path, body) {
     if (!VALID_PID.test(participantId)) {
       return respond(400, { error: "Invalid participant_id" }, { "Cache-Control": "no-store" });
     }
+    const indexedPage = await indexedMyTasksPage(participantId, body);
+    if (indexedPage) {
+      return respond(200, indexedPage, { "Cache-Control": "no-store" });
+    }
     const { byTaskDir, lockSet, doneByEncodedKey, inboxAge } = await loadReviewIndex({
       readDoneRecords: true,
       doneRecordFilter: (key) => participantIdFromSubKey(key) === participantId,
@@ -6713,7 +7391,14 @@ async function handleReview(path, body) {
       }
       const retryEtag = await verifyLock(sub_key, token);
       if (retryEtag) await deleteLockIfUnchanged(sub_key, retryEtag);
-      await setDashboardIndexStatus(rawTaskId, "pending", { expected_source_key: sub_key })
+      const existingReturned = await readJson(returnedKey).then(({ json }) => json).catch(() => null);
+      await setDashboardIndexStatus(rawTaskId, "returned", {
+        expected_source_key: sub_key,
+        reviewer,
+        reviewed_at: cleanText(existingDone.completed_at || existingReturned?.returned_at, 60),
+        rejection_reason: cleanText(existingReturned?.reason, 500),
+        done_target: returnedKey,
+      })
         .catch((error) => console.error("Dashboard return index update failed", error));
       return respond(200, { ok: true, returned_key: returnedKey, idempotent: true }, { "Cache-Control": "no-store" });
     }
@@ -6764,7 +7449,14 @@ async function handleReview(path, body) {
       return respond(409, { error: "This task was already finished by another reviewer" }, { "Cache-Control": "no-store" });
     }
     await deleteLockIfUnchanged(sub_key, etag);
-    await setDashboardIndexStatus(rawTaskId, "pending", { expected_source_key: sub_key })
+    await setDashboardIndexStatus(rawTaskId, "returned", {
+      expected_source_key: sub_key,
+      reviewer,
+      reviewed_at: completedAt,
+      claimed_at: claimedAt,
+      rejection_reason: cleanText(returnedDoc.reason, 500),
+      done_target: returnedKey,
+    })
       .catch((error) => console.error("Dashboard return index update failed", error));
     adminDashboardCache = { dashboard: null, checkedAt: 0, pending: null };
     return respond(200, { ok: true, returned_key: returnedKey }, { "Cache-Control": "no-store" });
@@ -6814,6 +7506,15 @@ export const handler = async (event) => {
       return respond(400, { error: "Invalid JSON body" });
     }
 
+    if (path === "/upload/complete") {
+      try {
+        const completed = await completePCUpload(body);
+        return respond(completed.status, completed.body, { "Cache-Control": "no-store" });
+      } catch (error) {
+        console.error("PC upload completion failed", error);
+        return respond(503, { error: "Upload succeeded, but indexing is temporarily unavailable" }, { "Cache-Control": "no-store" });
+      }
+    }
     if (path.startsWith("/review/")) {
       return await handleReview(path, body);
     }
@@ -6922,7 +7623,22 @@ export const handler = async (event) => {
         .send(new PutObjectCommand({ Bucket: S3_BUCKET, Key: pcBundleIndexKeyFor(key), Body: key, ContentType: "text/plain" }))
         .catch(() => {});
     }
-    return respond(200, { url: presign.url, fields: presign.fields, key });
+    const completionExpiresAt = Date.now() + 10 * 60 * 1000;
+    const completionKind = isPC ? pcUploadCompletionKind(key) : null;
+    const completionToken = completionKind
+      ? uploadCompletionSignature(key, completionExpiresAt)
+      : "";
+    return respond(200, {
+      url: presign.url,
+      fields: presign.fields,
+      key,
+      ...(completionToken ? {
+        completion: {
+          token: completionToken,
+          expires_at: completionExpiresAt,
+        },
+      } : {}),
+    });
   } catch (err) {
     console.error(err);
     return respond(500, { error: "Unhandled error", detail: err.message || String(err) });

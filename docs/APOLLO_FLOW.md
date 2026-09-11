@@ -6,7 +6,9 @@ The same reviewed lifecycle runs in two isolated queue families: Apollo V2 uses
 
 ```mermaid
 flowchart TD
-    A["Annotator submits task + rubric steps"] --> B["Immutable submission in S3"]
+    P["PC only: import email, calendar, or document locally"] --> Q["PC only: choose a history-ranked MyPCBench app"]
+    Q --> A["Annotator performs the app workflow and writes the grounded task + rubric steps"]
+    A --> B["Immutable submission in S3"]
     B --> C["Codex CLI PRE_QC worker"]
     C --> C1["Task: coherent; reasonable agent choices allowed"]
     C --> C2["Each rubric: live-web reachable + task-compatible"]
@@ -42,7 +44,7 @@ flowchart TD
 | Human task QC | V2 `#/review-queue` or PC `#/review-task` | final, rejected, audit, and reviewer records under the matching root |
 | Author sign-off / appeal | V2 `#/my-tasks` | sign-off receipts, archived prior final gold, or a one-time appeal revision under `v2-review/` |
 | LLM task POST_QC | Dedicated Codex CLI worker/VM with the matching queue | `{review-root}/llm_{pass,fail}/` |
-| Agent model run | Existing OSWorld/Odysseys runner | local/EFS run directory with `steps.jsonl` or `traj.jsonl` and screenshots |
+| Agent model run | Existing OSWorld/Odysseys runner; PC additionally requires a private task-matched context setup | local/EFS run directory with `steps.jsonl` or `traj.jsonl` and screenshots |
 | Trajectory LLM judge | `scripts/trajectory_review/run.py` with the matching queue | resumable evaluator JSON and immutable package under `{review-root}/trajectory-runs/` |
 | Human trajectory QC | V2 `#/trajectory-review` or PC `#/grade`, assigned to the original task creator | `{review-root}/trajectory-judgments/` and done marker |
 | OSWorld export | `scripts/trajectory_review/export_osworld.py` after a complete human `YES` | stock OSWorld examples/meta plus `tasks.json` |
@@ -52,7 +54,7 @@ flowchart TD
 
 Task reviewers see the immutable submitted task beside a working copy, Task coherence and Live-web feasibility, Reachable and Compatible status for every rubric, evidence, and only independently verified suggestions. A suggestion changes the working copy only after the reviewer clicks the apply button.
 
-Authors see their own work in `#/my-tasks`. An approval shows original and reviewed versions side by side without identifying the reviewer, and can be accepted or amended; the complete result is stored under `v2-review/author-approved/`. A rejection shows its reason and step-level notes with the same anonymity, and permits one appeal with an author-written rationale. The rejecting reviewer is excluded; the fresh reviewer sees the anonymous earlier rejection reason and the author's rationale. If that reviewer rejects the appeal, the terminal outcome is stored under `v2-review/rejected-twice/` and the author receives no further appeal action.
+Authors see their own work in `#/my-tasks`. An approval shows original and reviewed versions side by side without identifying the reviewer, and can be accepted or amended; the complete result is stored under the app's `author-approved/` review root. A rejection shows its reason and step-level notes with the same anonymity, and permits one appeal with an author-written rationale. The rejecting reviewer is excluded; the fresh reviewer sees the anonymous earlier rejection reason and the author's rationale. If that reviewer rejects the appeal, the terminal outcome is stored under the app's `rejected-twice/` review root and the author receives no further appeal action.
 
 Trajectory graders see the prompt and rubric/verifier text only as reference, plus chronological screenshots and actions. They independently mark each rubric `Pass`, `Fail`, or `Unclear`, then give the same overall task-satisfaction verdict. The LLM trajectory judgment is deliberately hidden until the human submits, so it cannot bias the grade. Prompt quality and rubric correctness are handled in human task QC, not repeated here.
 
@@ -78,6 +80,11 @@ python3 scripts/trajectory_review/run.py \
 Use `--queue pc` with PC tasks. Run the same command with `--plan --prod` first.
 The plan validates assignments and AWS access without invoking a model or writing
 anything. A queue/task-ID mismatch is rejected before publication.
+
+The OSWorld bridge refuses to fetch/run a PC task without an exact
+`apollo-pc-osworld-context-v1` setup supplied through
+`--pc-context-config-dir`. Context files and provisioned VM state are private
+execution inputs and never enter Git or the reporting API.
 
 ## Immutability boundaries
 
