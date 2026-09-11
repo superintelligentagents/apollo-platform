@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { appIdsForRecord, recommendAppsAsync } from "../src/app-catalog";
+import { appIdsForRecord, historyAppCountsBySourceAsync, recommendAppsAsync } from "../src/app-catalog";
 import type { EmailRecord } from "../src/types";
 import { applyDecisions, serializeDecisions } from "../src/ui/autosave";
 import { initialState, type Ctx } from "../src/ui/context";
@@ -71,6 +71,15 @@ describe("100k-message mailbox performance", () => {
 
     expect(matches.map((record) => record.id)).toEqual([`mail-${MAILBOX_SIZE - 1}`]);
     expect(searchMs).toBeLessThan(1_500);
+
+    const appCountsStarted = performance.now();
+    const appCountsPromise = historyAppCountsBySourceAsync(records.values(), 500);
+    // Data renders its shell and record list after one chunk, then fills in
+    // analogue counts without monopolizing the browser's main thread.
+    expect(performance.now() - appCountsStarted).toBeLessThan(100);
+    const appCounts = await appCountsPromise;
+    expect(appCounts.get("email")?.get("hoolimail")).toBe(MAILBOX_SIZE);
+    expect(appCounts.get("email")?.get("hoolishop")).toBe(20_000);
 
     const recommendationsStarted = performance.now();
     const recommendationPromise = recommendAppsAsync(records.values(), 17, 500);

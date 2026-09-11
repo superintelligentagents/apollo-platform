@@ -128,6 +128,28 @@ describe("task writing data and app guides", () => {
     expect(preview.textContent).toBe(description.slice(0, 180));
     expect(root.textContent).not.toContain(description);
   });
+
+  it("debounces task-history searches while preserving every typed character", () => {
+    vi.useFakeTimers();
+    try {
+      const ctx = baseCtx();
+      ctx.state.taskDraft = draft("");
+      const root = renderTaskEdit(ctx);
+      const search = root.querySelector<HTMLInputElement>('input[placeholder="Search subject, content, summary…"]')!;
+
+      for (const value of ["r", "re", "resume"]) {
+        search.value = value;
+        search.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+
+      expect(ctx.state.pickerQuery).toBe("resume");
+      expect(ctx.rerender).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(180);
+      expect(ctx.rerender).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 function draft(templateId: string): NonNullable<Ctx["state"]["taskDraft"]> {

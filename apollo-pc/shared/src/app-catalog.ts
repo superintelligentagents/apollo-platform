@@ -240,6 +240,41 @@ export function historyAppCounts(records: Iterable<SourceRecord>): Map<string, n
   return counts;
 }
 
+export type HistoryAppCountsBySource = Map<SourceKind | "all", Map<string, number>>;
+
+function addHistoryAppCounts(summary: HistoryAppCountsBySource, record: SourceRecord): void {
+  const source = record.source === "orders" ? "email" : record.source;
+  const allCounts = summary.get("all") ?? new Map<string, number>();
+  const sourceCounts = summary.get(source) ?? new Map<string, number>();
+  summary.set("all", allCounts);
+  summary.set(source, sourceCounts);
+  for (const id of appIdsForRecord(record)) {
+    allCounts.set(id, (allCounts.get(id) ?? 0) + 1);
+    sourceCounts.set(id, (sourceCounts.get(id) ?? 0) + 1);
+  }
+}
+
+export function historyAppCountsBySource(records: Iterable<SourceRecord>): HistoryAppCountsBySource {
+  const summary: HistoryAppCountsBySource = new Map();
+  for (const record of records) addHistoryAppCounts(summary, record);
+  return summary;
+}
+
+export async function historyAppCountsBySourceAsync(records: Iterable<SourceRecord>, chunkSize = 500, signal?: AbortSignal): Promise<HistoryAppCountsBySource> {
+  const summary: HistoryAppCountsBySource = new Map();
+  let processed = 0;
+  for (const record of records) {
+    if (signal?.aborted) return summary;
+    addHistoryAppCounts(summary, record);
+    processed++;
+    if (processed % Math.max(1, chunkSize) === 0) {
+      await yieldToBrowser();
+      if (signal?.aborted) return summary;
+    }
+  }
+  return summary;
+}
+
 type Match = { record: SourceRecord; score: number };
 type RecommendationSummary = { app: MyPCBenchApp; score: number; topBySource: Map<SourceKind, Match[]>; sourceCounts: Map<SourceKind, number> };
 

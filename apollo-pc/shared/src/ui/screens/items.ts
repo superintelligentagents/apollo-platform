@@ -1,5 +1,5 @@
 import { scrubText, type ScrubMatch } from "../../scrub";
-import { appIdsForRecord, historyAppCounts, MYPCBENCH_APPS } from "../../app-catalog";
+import { appIdsForRecord, historyAppCountsBySource, historyAppCountsBySourceAsync, MYPCBENCH_APPS, type HistoryAppCountsBySource } from "../../app-catalog";
 import { CALENDAR_CATEGORIES, EMAIL_CATEGORIES, linkEmailAndCalendar } from "../../organize";
 import { emailMatchesActivity, type EmailActivityStat, type EmailActivitySummary, type EmailDirection } from "../../email-activity";
 import type { EmailServiceOption } from "../../email-services";
@@ -11,12 +11,14 @@ import { mailboxIndexFor, type DomainCount, type MailboxIndex } from "../mailbox
 
 const PAGE_SIZE = 100;
 const FILTER_TYPING_DELAY_MS = 180;
+const SYNC_APP_COUNT_LIMIT = 2_000;
 const SOURCE_TABS: (SourceKind | "all")[] = ["all", "email", "calendar", "documents"];
 
 type EditControl = "input" | "textarea" | "boolean" | "json";
 export type EditableField = { field: string; label: string; value: string; control?: EditControl; rows?: number; hint?: string };
 let linkedCache: { records: Map<string, SourceRecord>; size: number; links: ReturnType<typeof linkEmailAndCalendar> } | null = null;
 const pendingFilterRenders = new WeakMap<object, ReturnType<typeof setTimeout>>();
+const appCountCache = new WeakMap<MailboxIndex, { summary: HistoryAppCountsBySource | null; promise: Promise<void> | null }>();
 
 export function renderItems(ctx: Ctx): HTMLElement {
   return renderUpload(ctx);
@@ -38,6 +40,7 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar" | "documents")
   const s = ctx.state;
   const f = s.filters;
   const index = mailboxIndexFor(s.records, s.identity?.email ?? "");
+  const appCountSummary = appCountsFor(ctx, index);
   const hasCachedLinks = linkedCache?.records === s.records && linkedCache.size === s.records.size;
   const links = hasCachedLinks
     ? linkedCache!.links
@@ -85,7 +88,7 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar" | "documents")
       { class: "screen-sub" },
       onlySource === "email" ? "Add mail files, then choose the messages you want to share." : onlySource === "calendar" ? "Add calendar files, then choose the events you want to share." : onlySource === "documents" ? "Add documents, review their locally extracted text, and choose what you want to share." : "Add files, inspect the imported records, and choose what can upload—all in one workspace. Nothing leaves this browser until final review."
     ),
-    dataImportPanel(ctx, onlySource)
+    dataImportPanel(ctx, index, appCountSummary, onlySource)
   );
   if (allRecords.length) {
     root.append(
@@ -146,7 +149,7 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar" | "documents")
       ) : null,
       f.source === "email" ? categoryFilters(ctx, EMAIL_CATEGORIES, index.emailData.length, index.emailCategoryCounts, rerenderWith) : null,
       f.source === "calendar" ? categoryFilters(ctx, CALENDAR_CATEGORIES, index.calendars.length, index.calendarCategoryCounts, rerenderWith) : null,
-      f.source === "email" || f.source === "calendar" || f.source === "documents" || f.source === "all" ? historyAppFilter(index, f.source, f.app, rerenderWith) : null,
+      f.source === "email" || f.source === "calendar" || f.source === "documents" || f.source === "all" ? historyAppFilter(index, appCountSummary, f.source, f.app, rerenderWith) : null,
       f.source === "email" ? inlinePrivacyPanel(ctx) : null,
       f.source === "email" ? emailActivityFilter(index.activity, f.direction, f.correspondent, rerenderWith) : null,
       f.source === "email" ? serviceFilter(index.serviceOptions, f.service, rerenderWith) : null,
@@ -226,7 +229,25 @@ function renderUpload(ctx: Ctx, onlySource?: "email" | "calendar" | "documents")
   return root;
 }
 
-function dataImportPanel(ctx: Ctx, onlySource?: "email" | "calendar" | "documents"): HTMLElement {
+function appCountsFor(ctx: Ctx, index: MailboxIndex): HistoryAppCountsBySource | null {
+  const cached = appCountCache.get(index);
+  if (cached) return cached.summary;
+  if (index.orderedRecords.length <= SYNC_APP_COUNT_LIMIT) {
+    const summary = historyAppCountsBySource(index.orderedRecords);
+    appCountCache.set(index, { summary, promise: null });
+    return summary;
+  }
+  const entry: { summary: HistoryAppCountsBySource | null; promise: Promise<void> | null } = { summary: null, promise: null };
+  appCountCache.set(index, entry);
+  entry.promise = historyAppCountsBySourceAsync(index.orderedRecords).then((summary) => {
+    entry.summary = summary;
+    entry.promise = null;
+    ctx.rerender();
+  });
+  return null;
+}
+
+function dataImportPanel(ctx: Ctx, index: MailboxIndex, appCountSummary: HistoryAppCountsBySource | null, onlySource?: "email" | "calendar" | "documents"): HTMLElement {
   const kinds = (["email", "calendar", "documents"] as const).filter((kind) => !onlySource || kind === onlySource);
   const panel = el(
     "section",
@@ -239,7 +260,7 @@ function dataImportPanel(ctx: Ctx, onlySource?: "email" | "calendar" | "document
     )
   );
   const controls = el("div", { class: "data-import-grid" });
-  for (const kind of kinds) controls.append(dataImportControl(ctx, kind));
+  for (const kind of kinds) controls.append(dataImportControl(ctx, index, appCountSummary, kind));
   panel.append(controls);
   return panel;
 }
@@ -257,11 +278,12 @@ function dateWindowControl(ctx: Ctx): HTMLElement {
   );
 }
 
-function dataImportControl(ctx: Ctx, kind: "email" | "calendar" | "documents"): HTMLElement {
+function dataImportControl(ctx: Ctx, index: MailboxIndex, appCountSummary: HistoryAppCountsBySource | null, kind: "email" | "calendar" | "documents"): HTMLElement {
   const meta = SOURCE_CARDS.find((card) => card.kind === kind)!;
-  const records = [...ctx.state.records.values()].filter((record) => record.source === kind || (kind === "email" && record.source === "orders"));
+  const records = kind === "email" ? index.emailData : kind === "calendar" ? index.calendars : index.bySource.get("documents") ?? [];
   const selected = records.filter((record) => ctx.actions.isIncluded(record)).length;
-  const guideCount = new Set(records.flatMap((record) => appIdsForRecord(record))).size;
+  const appCounts = appCountSummary?.get(kind);
+  const guideCount = appCounts ? [...appCounts.values()].filter((count) => count > 0).length : null;
   const importing = ctx.state.importing?.kind === kind ? ctx.state.importing.progress : null;
   const input = el("input", {
     type: "file",
@@ -285,7 +307,7 @@ function dataImportControl(ctx: Ctx, kind: "email" | "calendar" | "documents"): 
     el("span", { class: "item-kind mono" }, label.toUpperCase()),
     el("strong", null, label),
     el("p", null, importing ? `${importing.recordsEmitted.toLocaleString()} read so far` : records.length ? `${records.length.toLocaleString()} imported · ${selected.toLocaleString()} selected` : hint),
-    records.length ? el("small", { class: "mono" }, `${guideCount.toLocaleString()} MyPCBench guide${guideCount === 1 ? "" : "s"} matched`) : null,
+    records.length ? el("small", { class: "mono" }, guideCount === null ? "Matching MyPCBench guides…" : `${guideCount.toLocaleString()} MyPCBench guide${guideCount === 1 ? "" : "s"} matched`) : null,
     el(
       "div",
       { class: "data-import-actions" },
@@ -363,19 +385,19 @@ function matchesSearch(record: SourceRecord, scope: Ctx["state"]["filters"]["que
   return record.searchText.includes(query);
 }
 
-function historyAppFilter(index: MailboxIndex, source: SourceKind | "all", selected: string, rerenderWith: (patch: { app: string }) => void): HTMLElement {
+function historyAppFilter(index: MailboxIndex, appCountSummary: HistoryAppCountsBySource | null, source: SourceKind | "all", selected: string, rerenderWith: (patch: { app: string }) => void): HTMLElement {
   const records = source === "email" ? index.emailData : source === "all" ? index.orderedRecords : index.bySource.get(source) ?? [];
-  const counts = historyAppCounts(records);
-  const options = MYPCBENCH_APPS.filter((candidate) => (counts.get(candidate.id) ?? 0) > 0);
+  const counts = appCountSummary?.get(source) ?? null;
+  const options = counts ? MYPCBENCH_APPS.filter((candidate) => (counts.get(candidate.id) ?? 0) > 0 || candidate.id === selected) : MYPCBENCH_APPS;
   return el(
     "div",
     { class: "domain-filter app-analogue-filter" },
     el("div", { class: "domain-filter-head" }, el("strong", null, "Related app"), el("span", null, "Partition history by the real-world service and its MyPCBench clone.")),
     el(
       "select",
-      { class: "field-input", "data-testid": "history-app-filter", "aria-label": "Filter by related MyPCBench app", onchange: (event: Event) => rerenderWith({ app: (event.target as HTMLSelectElement).value }) },
-      el("option", { value: "", selected: !selected }, "All related apps"),
-      ...options.map((candidate) => el("option", { value: candidate.id, selected: selected === candidate.id }, `${candidate.name} · like ${candidate.analogue} · ${(counts.get(candidate.id) ?? 0).toLocaleString()}`))
+      { class: "field-input", "data-testid": "history-app-filter", "aria-label": "Filter by related MyPCBench app", disabled: records.length > SYNC_APP_COUNT_LIMIT && !counts, onchange: (event: Event) => rerenderWith({ app: (event.target as HTMLSelectElement).value }) },
+      el("option", { value: "", selected: !selected }, counts ? "All related apps" : "Indexing related apps…"),
+      ...options.map((candidate) => el("option", { value: candidate.id, selected: selected === candidate.id }, counts ? `${candidate.name} · like ${candidate.analogue} · ${(counts.get(candidate.id) ?? 0).toLocaleString()}` : `${candidate.name} · like ${candidate.analogue}`))
     )
   );
 }

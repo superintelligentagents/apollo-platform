@@ -1,7 +1,7 @@
 # PC collector parity validation — 2026-09-10
 
 Deployed to https://apollo-pc-site.vercel.app on 2026-09-10.
-Frontend release: `2026-09-10.8`. Production returned the expected unified-data,
+Frontend release: `2026-09-10.9`. Production returned the expected unified-data,
 long-horizon task, resume example, 17-app-guide, app-path, app-filter, and in-editor
 document-upload markers from the deployed route chunks. Computer-use passes covered the dashboard, unified data
 workspace, recommendations, exact app links, guided task editor, review/submit flow,
@@ -27,7 +27,12 @@ and reduces Dashboard counting from six mailbox scans to one. Chunk yields use t
 browser task scheduler (with MessageChannel and timer fallbacks) so background timer
 throttling does not stretch the analysis. The 100,000-message
 regression verifies a sub-100 ms first yield, complete recommendation analysis under
-four seconds, and reuse of all 100,000 app matches in the editor under 250 ms.
+four seconds, and reuse of all 100,000 app matches in the editor under 250 ms. The
+`2026-09-10.9` pass removes the remaining eager all-history app scans from the Data
+workspace: import cards reuse the mailbox index, app and analogue counts finish in
+500-record browser-scheduled chunks, and the filter becomes available when those
+counts are ready. Task-history search now waits 180 ms after typing before rebuilding
+the editor, so a multi-character query produces one render instead of one per key.
 
 Deployment target: the `apollo-pc-site` production project and
 https://apollo-pc-site.vercel.app alias.
@@ -64,14 +69,14 @@ skipped so unrelated PC pull requests do not fail on the absent showcase directo
 
 ## Automated checks
 
-- PC: 229 tests passed across 37 files.
+- PC: 232 tests passed across 37 files.
 - Shared backend: 116 tests passed.
 - Apollo v2 regression: 186 passed, 1 optional real-history test skipped.
 - OSWorld runner: 23 Python tests; PC context provisioner: 2 Node tests; trajectory packaging/judging: 37 Python tests.
 - PC TypeScript check and production Vite build passed.
 - Scoped diff whitespace check passed.
 
-These are 593 passing tests, plus the live integration scenarios below. Unit tests
+These are 596 passing tests, plus the live integration scenarios below. Unit tests
 and synthetic browser fixtures do not constitute a full production participant
 session or a newly executed model audit.
 

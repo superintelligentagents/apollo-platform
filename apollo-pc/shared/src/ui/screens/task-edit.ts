@@ -20,6 +20,8 @@ type PickerHistoryCache = {
 
 const pickerHistoryCache = new WeakMap<Ctx["state"], PickerHistoryCache>();
 const pickerSearchCache = new WeakMap<SourceRecord, string>();
+const pendingPickerRenders = new WeakMap<Ctx["state"], ReturnType<typeof setTimeout>>();
+const PICKER_TYPING_DELAY_MS = 180;
 
 export function renderTaskEdit(ctx: Ctx): HTMLElement {
   const s = ctx.state;
@@ -336,7 +338,12 @@ export function renderTaskEdit(ctx: Ctx): HTMLElement {
       s.pickerPage = 0;
       s.pickerOpenId = null;
       s.pickerOpenBody = null;
-      ctx.rerender();
+      const pending = pendingPickerRenders.get(s);
+      if (pending !== undefined) clearTimeout(pending);
+      pendingPickerRenders.set(s, setTimeout(() => {
+        pendingPickerRenders.delete(s);
+        ctx.rerender();
+      }, PICKER_TYPING_DELAY_MS));
     },
   });
   picker.append(search);
