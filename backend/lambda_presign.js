@@ -322,6 +322,7 @@ const TRAJECTORY_LOCKS_PREFIX = `${REVIEW_PREFIX}trajectory-locks/`;
 const TRAJECTORY_DONE_PREFIX = `${REVIEW_PREFIX}trajectory-done/`;
 const TRAJECTORY_JUDGMENTS_PREFIX = `${REVIEW_PREFIX}trajectory-judgments/`;
 const TRAJECTORY_EDIT_LINKS_PREFIX = `${REVIEW_PREFIX}trajectory-edit-links/`;
+const TRAJECTORY_JUDGE_PROVENANCE_KEY = `${REVIEW_PREFIX}trajectory-judge-provenance.json`;
 const trajectoryLockKeyFor = (manifestKey) => `${TRAJECTORY_LOCKS_PREFIX}${b64url(manifestKey)}.json`;
 const trajectoryDoneKeyFor = (manifestKey) => `${TRAJECTORY_DONE_PREFIX}${b64url(manifestKey)}`;
 const trajectoryJudgmentKeyFor = (manifestKey) => `${TRAJECTORY_JUDGMENTS_PREFIX}${b64url(manifestKey)}.json`;
@@ -362,6 +363,7 @@ export function cleanTrajectoryRejudgment(value) {
     judge: {
       repo: cleanText(value.judge?.repo, 200) || null,
       commit: cleanText(value.judge?.commit, 64) || null,
+      path: cleanText(value.judge?.path, 300) || null,
       sha256: cleanText(value.judge?.sha256, 64) || null,
       model: cleanText(value.judge?.model, 120) || null,
       screenshots: cleanText(String(value.judge?.screenshots ?? ""), 20) || null,
@@ -377,6 +379,42 @@ export function cleanTrajectoryRejudgment(value) {
     },
     rubrics,
   };
+}
+
+function cleanTrajectoryJudge(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const model = cleanText(value.model, 120);
+  if (!model) return null;
+  return {
+    repo: cleanText(value.repo, 200) || null,
+    commit: cleanText(value.commit, 64) || null,
+    path: cleanText(value.path, 300) || null,
+    sha256: cleanText(value.sha256, 64) || null,
+    model,
+    screenshots: cleanText(String(value.screenshots ?? ""), 20) || null,
+  };
+}
+
+/**
+ * Judge identity for immutable packages that did not record it themselves.
+ *
+ * This registry adds provenance only. It never contains verdicts and can
+ * therefore identify a packaged judgment without turning it into a later
+ * re-judgment or changing any score.
+ */
+export function cleanTrajectoryJudgeProvenance(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value.schema_version !== "apollo-trajectory-judge-provenance-v1") return null;
+  if (!Array.isArray(value.entries) || value.entries.length > 20_000) return null;
+  const entries = new Map();
+  for (const entry of value.entries) {
+    const manifestKey = cleanText(entry?.manifest_key, 1_000);
+    const judge = cleanTrajectoryJudge(entry?.judge);
+    if (!manifestKey.startsWith(TRAJECTORY_RUNS_PREFIX)
+        || !manifestKey.endsWith("/manifest.json") || !judge) continue;
+    entries.set(manifestKey, judge);
+  }
+  return { schema_version: "apollo-trajectory-judge-provenance-v1", entries };
 }
 
 export function trajectoryRejudgmentKeyFor(manifestKey) {
@@ -401,12 +439,12 @@ export function trajectoryJudgmentView(manifest, rejudgment) {
       rubrics_scored: manifest.rubrics.filter((rubric) => rubric.llm_status !== "ERROR").length,
     },
   };
-  if (!rejudgment) return packaged;
+  if (!rejudgment) return { ...packaged, rejudgment: null };
   const packagedIds = manifest.rubrics.map((rubric) => rubric.rubric_id).sort();
   const rejudgedIds = rejudgment.rubrics.map((rubric) => rubric.rubric_id).sort();
   if (packagedIds.length !== rejudgedIds.length
       || packagedIds.some((id, index) => id !== rejudgedIds[index])) {
-    return packaged;
+    return { ...packaged, rejudgment: null };
   }
   const byId = new Map(rejudgment.rubrics.map((rubric) => [rubric.rubric_id, rubric]));
   return {
@@ -423,6 +461,7 @@ export function trajectoryJudgmentView(manifest, rejudgment) {
       rejudgment: { judge: rejudgment.judge, metrics: rejudgment.metrics },
     },
     metrics: rejudgment.metrics,
+    rejudgment,
   };
 }
 
@@ -5286,6 +5325,9 @@ async function handleTrajectoryReporting(event) {
   const subset = await loadSubset(params);
   if (subset.error) return respond(404, { error: subset.error }, { "Cache-Control": "no-store" });
   const state = await trajectoryQueueState();
+  const judgeProvenance = cleanTrajectoryJudgeProvenance(
+    await readJson(TRAJECTORY_JUDGE_PROVENANCE_KEY).then(({ json }) => json).catch(() => null),
+  );
   // Narrow before hydrating, not after: every manifest costs S3 reads, and a
   // named subset is usually a small slice of the corpus.
   const manifests = subset.ids
@@ -5305,6 +5347,8 @@ async function handleTrajectoryReporting(event) {
       if (!manifest) return null;
       const rejudgment = cleanTrajectoryRejudgment(rejudgmentRaw);
       const judged = trajectoryJudgmentView(manifest, rejudgment);
+      const appliedRejudgment = judged.rejudgment;
+      const packagedJudge = judgeProvenance?.entries.get(manifestKey) ?? null;
       const judgment = done?.target ? await readJson(done.target).then(({ json }) => json).catch(() => null) : null;
       return {
         manifest_key: manifestKey,
@@ -5317,8 +5361,8 @@ async function handleTrajectoryReporting(event) {
         llm_perfect: judged.metrics.perfect,
         // Which judging these scores came from, and the manifest's original
         // beside it, so a grader can always see both.
-        llm_judge_source: rejudgment ? "canonical_full_trajectory" : "packaged",
-        llm_judge: rejudgment ? rejudgment.judge : null,
+        llm_judge_source: appliedRejudgment ? "canonical_full_trajectory" : "packaged",
+        llm_judge: appliedRejudgment ? appliedRejudgment.judge : packagedJudge,
         llm_original_average_rubric_score: manifest.metrics.average_rubric_score,
         llm_original_perfect: manifest.metrics.perfect,
         // average_rubric_score is the mean over rubrics the judge actually

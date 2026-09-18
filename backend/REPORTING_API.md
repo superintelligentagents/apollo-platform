@@ -352,6 +352,11 @@ rubric IDs do not match the package's exactly is ignored and the packaged
 judgment stands, so a sidecar left behind by an amended task cannot swap in
 verdicts for a different rubric set.
 
+Older immutable packages sometimes omitted their judge identity. A separate
+`trajectory-judge-provenance.json` registry can fill in `llm_judge` for those
+rows without copying or changing their verdicts. Their `llm_judge_source`
+remains `packaged`.
+
 The 1,589 `gpt-5.6-luna` trajectories were re-judged this way in September 2026,
 on the canonical judge with every screenshot rather than a 12-frame sample.
 
