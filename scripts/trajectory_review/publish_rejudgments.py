@@ -11,7 +11,8 @@ The original judgment is never destroyed: the manifest keeps it, and every
 re-judgment records the judge it came from (repo, commit, SHA-256, model, how
 many screenshots were used) so a grader can tell the two apart.
 
-    publish_rejudgments.py --results rejudged-all.json --trajectories all-traj.json
+    publish_rejudgments.py --results rejudged-all.json --trajectories all-traj.json \
+      --run-model claude-opus-5 --judge-model gemini-3.1-flash-lite-preview
 """
 
 from __future__ import annotations
@@ -85,13 +86,37 @@ def sidecar_key(manifest_key: str) -> str:
     return f"{manifest_key.rsplit('/', 1)[0]}/rejudgment.json"
 
 
+def result_tasks(value: Any) -> list[dict[str, Any]]:
+    """Normalize both historical task maps and current batch result files."""
+    if isinstance(value, Mapping) and isinstance(value.get("tasks"), list):
+        candidates = value["tasks"]
+    elif isinstance(value, Mapping):
+        candidates = []
+        for task_id, task in value.items():
+            if not isinstance(task, Mapping):
+                continue
+            normalized = dict(task)
+            normalized.setdefault("task_id", task_id)
+            candidates.append(normalized)
+    elif isinstance(value, list):
+        candidates = value
+    else:
+        raise ValueError("results must be a task map, a task list, or an object with tasks")
+    tasks = [dict(task) for task in candidates if isinstance(task, Mapping) and task.get("task_id")]
+    task_ids = [str(task["task_id"]) for task in tasks]
+    if len(task_ids) != len(set(task_ids)):
+        raise ValueError("results contain duplicate task_id values")
+    return tasks
+
+
 def upload(document: Mapping[str, Any], key: str, bucket: str, aws_cli: str) -> tuple[str, str]:
     with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8") as handle:
         json.dump(document, handle, indent=2, ensure_ascii=False)
         handle.flush()
         result = subprocess.run(
             [aws_cli, "s3api", "put-object", "--bucket", bucket, "--key", key,
-             "--body", handle.name, "--content-type", "application/json"],
+             "--body", handle.name, "--content-type", "application/json",
+             "--if-none-match", "*"],
             check=False, capture_output=True, text=True,
         )
     return (key, "" if result.returncode == 0 else (result.stderr or "").strip()[-200:])
@@ -103,7 +128,9 @@ def parser() -> argparse.ArgumentParser:
                        help="task_id -> canonical judge result, as written by the re-judge batches")
     value.add_argument("--trajectories", type=Path, required=True,
                        help="reporting rows, used to map task_id to its manifest key")
-    value.add_argument("--model", default="gpt-5.6-luna")
+    value.add_argument("--run-model", help="model that produced the trajectory")
+    value.add_argument("--judge-model", help="model that produced the supplied verdicts")
+    value.add_argument("--model", help="legacy shorthand when run and judge model are the same")
     value.add_argument("--bucket", default="journeys-prolific")
     value.add_argument("--aws-cli", default="aws")
     value.add_argument("--workers", type=int, default=16)
@@ -116,25 +143,41 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser().parse_args(argv)
     results = json.loads(args.results.read_text(encoding="utf-8"))
     rows = json.loads(args.trajectories.read_text(encoding="utf-8"))
+    run_model = args.run_model or args.model or "gpt-5.6-luna"
+    judge_model = args.judge_model or args.model or run_model
+    tasks = result_tasks(results)
+    declared_model = results.get("model") if isinstance(results, Mapping) else None
+    if declared_model and str(declared_model) != judge_model:
+        raise ValueError(
+            f"result file declares judge model {declared_model!r}, not {judge_model!r}"
+        )
     keys = {
         r["task_id"]: r["manifest_key"]
         for r in rows
-        if r.get("model") == args.model and r.get("manifest_key") and r.get("task_id")
+        if r.get("model") == run_model and r.get("manifest_key") and r.get("task_id")
     }
     planned = []
-    for task_id, task in results.items():
+    for task in tasks:
+        task_id = str(task["task_id"])
         manifest_key = keys.get(task_id)
         if not manifest_key:
             continue
-        planned.append((sidecar_key(manifest_key), rejudgment_document(task, args.model)))
+        screenshot_count = task.get("num_screenshots_sent")
+        screenshots = screenshot_count if isinstance(screenshot_count, int) else None
+        planned.append((
+            sidecar_key(manifest_key),
+            rejudgment_document(task, judge_model, screenshots=screenshots),
+        ))
     if args.limit:
         planned = planned[: args.limit]
     if args.plan:
         sample = planned[0] if planned else (None, None)
         print(json.dumps({
             "rejudgments": len(planned),
-            "unmatched": len(results) - len(planned),
+            "unmatched": len(tasks) - len(planned),
             "bucket": args.bucket,
+            "run_model": run_model,
+            "judge_model": judge_model,
             "sample_key": sample[0],
             "sample_metrics": (sample[1] or {}).get("metrics"),
         }, indent=2))

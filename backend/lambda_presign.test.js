@@ -139,6 +139,7 @@ import {
   buildTrajectoryReportingReport,
   safeTrajectoryAssetPath,
   cleanTrajectoryRejudgment,
+  cleanTrajectoryJudgeProvenance,
   selectReportingPage,
   cleanSubsetName,
   cleanSubsetDocument,
@@ -916,10 +917,27 @@ test("a re-judgment for a different rubric set is ignored", () => {
   });
   const view = trajectoryJudgmentView(manifest, stale);
   assert.equal(view.metrics.average_rubric_score, 1);   // packaged judgment stands
+  assert.equal(view.rejudgment, null);
   assert.equal(view.manifest.rubrics[0].llm_reasoning, "old");
   // No re-judgment at all also falls back cleanly.
   assert.equal(trajectoryJudgmentView(manifest, null).metrics.perfect, true);
   assert.equal(cleanTrajectoryRejudgment({ schema_version: "wrong" }), null);
+});
+
+test("packaged judge provenance identifies a judge without replacing verdicts", () => {
+  const provenance = cleanTrajectoryJudgeProvenance({
+    schema_version: "apollo-trajectory-judge-provenance-v1",
+    entries: [{
+      manifest_key: "v2-review/trajectory-runs/abc/run1/manifest.json",
+      judge: { model: "gemini-3.1-flash-lite-preview", screenshots: "all" },
+    }],
+  });
+  assert.equal(
+    provenance.entries.get("v2-review/trajectory-runs/abc/run1/manifest.json").model,
+    "gemini-3.1-flash-lite-preview",
+  );
+  assert.equal(provenance.entries.size, 1);
+  assert.equal(cleanTrajectoryJudgeProvenance({ schema_version: "wrong", entries: [] }), null);
 });
 
 test("the re-judgment key sits beside its manifest", () => {

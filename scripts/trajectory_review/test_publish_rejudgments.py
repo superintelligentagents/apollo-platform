@@ -1,6 +1,10 @@
 import unittest
 
-from scripts.trajectory_review.publish_rejudgments import rejudgment_document, sidecar_key
+from scripts.trajectory_review.publish_rejudgments import (
+    rejudgment_document,
+    result_tasks,
+    sidecar_key,
+)
 
 
 class RejudgmentDocumentTests(unittest.TestCase):
@@ -51,11 +55,29 @@ class RejudgmentDocumentTests(unittest.TestCase):
         document = rejudgment_document(self._task(["SUCCESS"]), "gpt-5.6-luna", screenshots=12)
         self.assertEqual(document["judge"]["screenshots"], 12)
 
+    def test_zero_screenshots_is_recorded_verbatim(self):
+        document = rejudgment_document(self._task(["SUCCESS"]), "gemini", screenshots=0)
+        self.assertEqual(document["judge"]["screenshots"], 0)
+
     def test_the_sidecar_sits_beside_its_manifest(self):
         self.assertEqual(
             sidecar_key("v2-review/trajectory-runs/abc/run1/manifest.json"),
             "v2-review/trajectory-runs/abc/run1/rejudgment.json",
         )
+
+    def test_current_batch_result_shape_is_normalized(self):
+        tasks = result_tasks({
+            "schema_version": "apollo-trajectory-rejudge-batch-v1",
+            "model": "gemini-3.1-flash-lite-preview",
+            "tasks": [self._task(["SUCCESS"])],
+        })
+        self.assertEqual([task["task_id"] for task in tasks], ["v2/alice/internal/task-12345678"])
+
+    def test_historical_task_map_is_still_supported(self):
+        task = self._task(["SUCCESS"])
+        task.pop("task_id")
+        tasks = result_tasks({"v2/alice/internal/task-12345678": task})
+        self.assertEqual(tasks[0]["task_id"], "v2/alice/internal/task-12345678")
 
 
 if __name__ == "__main__":
