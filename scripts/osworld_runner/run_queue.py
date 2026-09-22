@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -781,6 +782,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         state["updated_at_utc"] = utc_now()
         write_private_json(state_path, state)
         log(f"stopped on error: {exc}")
+        # A bare message like "[Errno 4] Interrupted system call" says nothing
+        # about where it came from; keep the traceback next to it.
+        log(traceback.format_exc().rstrip())
         return 1
 
     state["updated_at_utc"] = utc_now()
