@@ -1068,9 +1068,13 @@ def validate_osworld(args: argparse.Namespace, paths: JobPaths, muse_runner: Pat
         vms_dir = Path(os.environ.get("OSWORLD_APPTAINER_VMS_DIR", ""))
         if not sif.is_file():
             raise BridgeError(f"apptainer SIF is missing: set OSWORLD_APPTAINER_SIF ({sif})")
-        if not (vms_dir / "Ubuntu.qcow2").is_file():
+        # The base image is whatever --path-to-vm names: the sbatch stages it by
+        # name so a versioned image can live beside the golden one. Only fall
+        # back to the historical default when no path was given.
+        base_vm = args.path_to_vm.expanduser() if args.path_to_vm else vms_dir / "Ubuntu.qcow2"
+        if not base_vm.is_file():
             raise BridgeError(
-                f"apptainer base VM is missing: {vms_dir / 'Ubuntu.qcow2'};"
+                f"apptainer base VM is missing: {base_vm};"
                 " stage it before running so the provider cannot re-download it"
             )
         if not Path("/dev/kvm").exists():
@@ -1109,7 +1113,11 @@ def osworld_command(args: argparse.Namespace, paths: JobPaths) -> list[str]:
     ]
     if args.temperature is not None:
         command.extend(["--temperature", str(args.temperature)])
-    if args.provider_name in {"vmware", "docker"}:
+    # apptainer too: the provider overlays whatever file it is given, and the
+    # job stages that file by name (OSWORLD_VM_IMAGE), so this is how a
+    # versioned image reaches the guest. Left out, the runner falls back to the
+    # manager's hard-coded Ubuntu.qcow2 and downloads it if absent.
+    if args.provider_name in {"vmware", "docker", "apptainer"}:
         command.extend(["--path_to_vm", str(args.path_to_vm.expanduser().resolve())])
     if args.provider_name == "aws":
         command.extend(["--region", args.aws_region])
@@ -1140,7 +1148,11 @@ def openai_osworld_command(args: argparse.Namespace, paths: JobPaths) -> list[st
         "--domain", args.domain,
         "--client_password", args.client_password,
     ]
-    if args.provider_name in {"vmware", "docker"}:
+    # apptainer too: the provider overlays whatever file it is given, and the
+    # job stages that file by name (OSWORLD_VM_IMAGE), so this is how a
+    # versioned image reaches the guest. Left out, the runner falls back to the
+    # manager's hard-coded Ubuntu.qcow2 and downloads it if absent.
+    if args.provider_name in {"vmware", "docker", "apptainer"}:
         command.extend(["--path_to_vm", str(args.path_to_vm.expanduser().resolve())])
     if args.provider_name == "aws":
         command.extend(["--region", args.aws_region])
@@ -1179,7 +1191,11 @@ def anthropic_osworld_command(args: argparse.Namespace, paths: JobPaths) -> list
         "--domain", args.domain,
         "--client_password", args.client_password,
     ]
-    if args.provider_name in {"vmware", "docker"}:
+    # apptainer too: the provider overlays whatever file it is given, and the
+    # job stages that file by name (OSWORLD_VM_IMAGE), so this is how a
+    # versioned image reaches the guest. Left out, the runner falls back to the
+    # manager's hard-coded Ubuntu.qcow2 and downloads it if absent.
+    if args.provider_name in {"vmware", "docker", "apptainer"}:
         command.extend(["--path_to_vm", str(args.path_to_vm.expanduser().resolve())])
     if args.provider_name == "aws":
         command.extend(["--region", args.aws_region])

@@ -48,10 +48,13 @@ mkdir -p "$SCRATCH/osworld_vms" "$SCRATCH/osworld_apptainer/run" \
 # Some nodes have a broken or exhausted per-job /tmp, which kills Playwright's
 # mkdtemp during Chrome setup — keep all tempfiles on node-local scratch.
 export TMPDIR=$SCRATCH/tmp/$SLURM_JOB_ID
+# Which base image to run. Versioned images live beside the golden one and are
+# never overwritten; pick one with OSWORLD_VM_IMAGE=<file name>.
+VM_IMAGE=${OSWORLD_VM_IMAGE:-Ubuntu.qcow2}
 flock "$SCRATCH/osworld_vms/.stage.lock" bash -c "
-  [[ -s $SCRATCH/osworld_vms/Ubuntu.qcow2 ]] || {
-    rsync -a $DATA/osworld_vms/Ubuntu.qcow2 $SCRATCH/osworld_vms/.staging.qcow2 &&
-    mv $SCRATCH/osworld_vms/.staging.qcow2 $SCRATCH/osworld_vms/Ubuntu.qcow2
+  [[ -s $SCRATCH/osworld_vms/$VM_IMAGE ]] || {
+    rsync -a $DATA/osworld_vms/$VM_IMAGE $SCRATCH/osworld_vms/.staging.$VM_IMAGE &&
+    mv $SCRATCH/osworld_vms/.staging.$VM_IMAGE $SCRATCH/osworld_vms/$VM_IMAGE
   }
 "
 cleanup_overlays() { rm -rf "$SCRATCH/osworld_apptainer/overlays/$SLURM_JOB_ID" "$SCRATCH/tmp/$SLURM_JOB_ID"; }
@@ -75,7 +78,7 @@ export AWS_DEFAULT_REGION=us-east-1 AWS_REGION=us-east-1
 export OSWORLD_PYTHON=$VENV/bin/python
 export OSWORLD_ROOT=/home/ljang/odysseys/osworld_runner
 export OSWORLD_PROVIDER_NAME=apptainer
-export OSWORLD_VM_PATH=$SCRATCH/osworld_vms/Ubuntu.qcow2   # ignored by the apptainer path
+export OSWORLD_VM_PATH=$SCRATCH/osworld_vms/$VM_IMAGE   # ignored by the apptainer path
 export OSWORLD_SHARD_COUNT=${OSWORLD_SHARD_COUNT:?set via --export}
 export OSWORLD_SHARD_INDEX=${OSWORLD_SHARD_INDEX:?set via --export}
 # Work-root prefix separates independent runs (e.g. a bounded OpenAI test)

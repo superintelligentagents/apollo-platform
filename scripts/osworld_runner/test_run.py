@@ -1,3 +1,4 @@
+import os
 import json
 import tempfile
 import unittest
@@ -401,6 +402,49 @@ class OSWorldBridgeTests(unittest.TestCase):
             self.assertEqual(record["failed_task_ids"], ["task-c"])
 
 
+class ApptainerBaseImageGuardTest(unittest.TestCase):
+    """validate_osworld must check the image --path-to-vm names, not a hard-coded
+    Ubuntu.qcow2: versioned images live beside the golden one and are staged by name."""
+
+    def _checkout(self, temp):
+        root = Path(temp) / "osworld"
+        for rel in ("scripts/python/run_multienv.py", "mm_agents/gpt54_agent.py", ".venv/bin/python"):
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text("")
+        muse = Path(temp) / "muse_runner.py"; muse.write_text("")
+        sif = Path(temp) / "osworld.sif"; sif.write_text("")
+        vms = Path(temp) / "vms"; vms.mkdir()                       # deliberately NO Ubuntu.qcow2
+        jobroot = Path(temp) / "job"; jobroot.mkdir()
+        (jobroot / "tasks.json").write_text("[]"); (jobroot / "meta.json").write_text("{}")
+        paths = SimpleNamespace(root=jobroot, tasks=jobroot / "tasks.json", meta=jobroot / "meta.json")
+        return root, muse, sif, vms, paths
+
+    def _args(self, root, image):
+        return SimpleNamespace(osworld_root=root, provider_name="apptainer", path_to_vm=image)
+
+    def test_a_versioned_image_named_by_path_to_vm_is_accepted(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            root, muse, sif, vms, paths = self._checkout(temp)
+            image = vms / "Ubuntu-v2-xleakfix.qcow2"; image.write_text("")
+            with patch.dict(os.environ, {"OSWORLD_APPTAINER_SIF": str(sif), "OSWORLD_APPTAINER_VMS_DIR": str(vms)}):
+                try:
+                    run.validate_osworld(self._args(root, image), paths, muse)
+                except run.BridgeError as err:
+                    # only the host-dependent /dev/kvm check may fail here
+                    self.assertNotIn("base VM", str(err))
+
+    def test_a_missing_image_is_reported_by_its_own_path(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            root, muse, sif, vms, paths = self._checkout(temp)
+            (vms / "Ubuntu.qcow2").write_text("")                    # the default exists...
+            image = vms / "Ubuntu-v2-xleakfix.qcow2"                 # ...but the requested one does not
+            with patch.dict(os.environ, {"OSWORLD_APPTAINER_SIF": str(sif), "OSWORLD_APPTAINER_VMS_DIR": str(vms)}):
+                with self.assertRaisesRegex(run.BridgeError, "Ubuntu-v2-xleakfix.qcow2"):
+                    run.validate_osworld(self._args(root, image), paths, muse)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -420,6 +464,14 @@ class AnthropicBackendTests(unittest.TestCase):
         }
         value.update(overrides)
         return SimpleNamespace(**value)
+
+    def test_apptainer_jobs_pass_the_staged_image_to_the_runner(self):
+        """Without --path_to_vm the runner's DesktopEnv falls back to the manager's
+        hard-coded Ubuntu.qcow2 and downloads it — so a versioned image never runs."""
+        args = self._args(); args.path_to_vm = Path("/scratch/vms/Ubuntu-v2-xleakfix.qcow2")
+        command = run.anthropic_osworld_command(args, run.job_paths(Path("/work"), model="claude-opus-5"))
+        self.assertIn("--path_to_vm", command)
+        self.assertEqual(command[command.index("--path_to_vm") + 1], "/scratch/vms/Ubuntu-v2-xleakfix.qcow2")
 
     def test_the_claude_agent_is_launched_with_its_own_model(self):
         paths = run.job_paths(Path("/work"), model="claude-opus-5")
