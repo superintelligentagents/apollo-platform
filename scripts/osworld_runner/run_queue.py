@@ -375,7 +375,15 @@ def recover_published_batches(
 
 
 def compact_batch(batch_dir: Path) -> None:
-    """Delete only uploaded bulk artifacts while retaining the audit record."""
+    """Delete only uploaded bulk artifacts while retaining the audit record.
+
+    With OSWORLD_KEEP_RESULTS set, nothing is deleted: the full-resolution
+    screenshots, traj.jsonl and logs stay under the batch on /data. The S3
+    package is the only other copy, and it carries the judge's JPEG view, so
+    without this the lossless trajectory survives nowhere.
+    """
+    if os.environ.get("OSWORLD_KEEP_RESULTS", "").strip() not in ("", "0", "false", "no"):
+        return
     bulk_paths = [batch_dir / "results", batch_dir / "logs", batch_dir / "command.log"]
     bulk_paths.extend((batch_dir / "trajectory_review").glob("*/*/screens"))
     for path in bulk_paths:

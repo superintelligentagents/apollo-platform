@@ -111,6 +111,8 @@ export OSWORLD_OPENAI_REASONING_EFFORT=${OSWORLD_OPENAI_REASONING_EFFORT:-medium
 export OSWORLD_JUDGE_MODEL=${OSWORLD_JUDGE_MODEL:-gpt-5.4-mini}
 # Multi-model coverage: skip a task only when THIS model already ran it.
 export OSWORLD_DEDUPE_BY_MODEL=${OSWORLD_DEDUPE_BY_MODEL:-}
+# Keep full-resolution trajectories on /data after publish (the S3 package holds JPEGs).
+export OSWORLD_KEEP_RESULTS=${OSWORLD_KEEP_RESULTS:-1}
 # Re-run campaigns: judge against a clean rubric proposal, restrict the run to
 # the tasks it names, and count a task done only once THIS campaign has run it
 # (dedup by model alone would call every already-covered task done).
