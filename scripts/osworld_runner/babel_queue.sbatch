@@ -68,6 +68,11 @@ export OSWORLD_APPTAINER_RUN_DIR=$SCRATCH/osworld_apptainer/run
 export OSWORLD_APPTAINER_CPUS=${OSWORLD_APPTAINER_CPUS:-4}
 export OSWORLD_APPTAINER_RAM=${OSWORLD_APPTAINER_RAM:-6G}
 export OSWORLD_APPTAINER_BOOT_TIMEOUT=${OSWORLD_APPTAINER_BOOT_TIMEOUT:-300}
+# Display adapter. virtio-vga keeps Xorg responsive under on-screen animation
+# (the Bochs default pins Xorg at 100% and slows keystrokes 4-13x, so typing
+# overran the guest deadline). Set OSWORLD_APPTAINER_VGA=none for the old default.
+export OSWORLD_APPTAINER_VGA=${OSWORLD_APPTAINER_VGA:-virtio-vga}
+[[ "$OSWORLD_APPTAINER_VGA" == "none" ]] && unset OSWORLD_APPTAINER_VGA
 export APPTAINER_CACHEDIR=$SCRATCH/apptainer-cache
 export APPTAINER_TMPDIR=$SCRATCH/apptainer-tmp
 
