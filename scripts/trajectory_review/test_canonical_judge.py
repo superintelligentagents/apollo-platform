@@ -48,6 +48,27 @@ class CanonicalJudgePlanTests(unittest.TestCase):
             review_run.validate_judge_plan_queue(plan, "v2")
 
 
+class OriginalRunDirTests(unittest.TestCase):
+    """prepare.py packages whatever run_dir the judge output names, so after
+    judging the JPEG view the results must point back at the PNG originals."""
+
+    def test_run_dirs_are_pointed_back_at_the_originals(self):
+        with tempfile.TemporaryDirectory() as temp:
+            originals = Path(temp) / "results"; view = Path(temp) / "jpeg_runs"
+            (originals / "run-a").mkdir(parents=True); (view / "run-a").mkdir(parents=True)
+            payload = {"tasks": [{"task_id": "a", "run_dir": str(view / "run-a")}]}
+            out = canonical_judge.point_runs_at_originals(payload, originals)
+            self.assertEqual(out["tasks"][0]["run_dir"], str(originals / "run-a"))
+
+    def test_a_missing_original_leaves_the_view_path_alone(self):
+        with tempfile.TemporaryDirectory() as temp:
+            originals = Path(temp) / "results"; view = Path(temp) / "jpeg_runs"
+            (view / "run-b").mkdir(parents=True)          # original already cleaned up
+            payload = {"tasks": [{"task_id": "b", "run_dir": str(view / "run-b")}]}
+            out = canonical_judge.point_runs_at_originals(payload, originals)
+            self.assertEqual(out["tasks"][0]["run_dir"], str(view / "run-b"))
+
+
 if __name__ == "__main__":
     unittest.main()
 

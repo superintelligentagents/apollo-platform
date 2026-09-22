@@ -113,6 +113,27 @@ def odysseys_task_source(task_source_json: Path, destination: Path) -> dict[str,
     return identifiers
 
 
+def point_runs_at_originals(payload: dict[str, Any], original_runs_dir: Path) -> dict[str, Any]:
+    """Send prepare.py to the original run directories, not the JPEG view.
+
+    The judge sees a JPEG re-encoding of each run and writes that directory
+    as ``run_dir``. prepare.py takes an absolute run_dir as-is, so the S3
+    package was carrying the judge's JPEGs while the lossless PNGs sat in the
+    original run directory. Both trees name a run by the same directory, so
+    swap the parent back -- but only if the original still exists.
+    """
+    tasks = []
+    for task in payload.get("tasks") or []:
+        updated = dict(task)
+        run_dir = str(task.get("run_dir") or "")
+        if run_dir:
+            original = Path(original_runs_dir) / Path(run_dir).name
+            if original.is_dir():
+                updated["run_dir"] = str(original)
+        tasks.append(updated)
+    return {**payload, "tasks": tasks}
+
+
 def restore_judge_status(
     payload: Mapping[str, Any], model: str, identifiers: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
@@ -334,6 +355,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         identifiers = odysseys_task_source(args.task_source_json, task_source)
         judge_path = fetch_canonical_judge(cache_dir)
+        original_runs_dir = args.runs_dir
         if not args.plan and not args.no_jpeg_view:
             args.runs_dir = jpeg_view(args.runs_dir, work_dir / "jpeg_runs")
         if args.plan:
@@ -356,6 +378,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     result = restore_judge_status(payload, args.model, identifiers)
+    result = point_runs_at_originals(result, original_runs_dir)
     args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     errored = sum(task.get("judge_errors", 0) for task in result["tasks"])
     print(json.dumps({
