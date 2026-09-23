@@ -1,3 +1,4 @@
+import sys
 import os
 import tempfile
 import unittest
@@ -36,6 +37,21 @@ class CompactBatchTest(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, {"OSWORLD_KEEP_RESULTS": value}):
                 b = _batch(temp); run_queue.compact_batch(b)
                 self.assertFalse((b / "results").exists(), value)
+
+
+class RunCommandTests(unittest.TestCase):
+    def test_the_child_runs_in_its_own_session_so_its_group_signals_stay_there(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "command.log"
+            run_queue.run_command([sys.executable, "-c", "import os; print(os.getsid(0))"], log)
+            child_sid = int(log.read_text().splitlines()[-1])
+        self.assertNotEqual(child_sid, os.getsid(0))
+
+    def test_a_failing_child_still_raises_with_the_log_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "command.log"
+            with self.assertRaises(run_queue.QueueRunError):
+                run_queue.run_command([sys.executable, "-c", "raise SystemExit(3)"], log)
 
 
 if __name__ == "__main__":

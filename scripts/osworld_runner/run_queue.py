@@ -66,15 +66,29 @@ def log(message: str) -> None:
 
 def run_command(command: Sequence[str], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("ab") as handle:
+    handle = output.open("ab")
+    try:
         handle.write(("\n$ " + " ".join(command) + "\n").encode())
         handle.flush()
+        # Own session: the OSWorld runners signal their process group while
+        # shutting down, and a signal landing here mid-write on the NFS log
+        # surfaced as "[Errno 4] Interrupted system call" and stopped the
+        # shard right after a batch had finished running (twice on 2026-09-22).
         result = subprocess.run(
             list(command),
             stdout=handle,
             stderr=subprocess.STDOUT,
             check=False,
+            start_new_session=True,
         )
+    finally:
+        try:
+            handle.close()
+        except InterruptedError:
+            # Python does not retry close() on EINTR. Everything this
+            # process wrote was flushed above; the child wrote through its
+            # own descriptor. Nothing is lost by moving on.
+            log(f"log close interrupted by a signal; continuing ({output})")
     if result.returncode:
         raise QueueRunError(
             f"command exited {result.returncode}; inspect {output}"
