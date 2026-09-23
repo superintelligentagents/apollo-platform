@@ -217,6 +217,34 @@ def _rewrite_screenshot_fields(line: str, renamed: Mapping[str, str]) -> str:
     return json.dumps(row, ensure_ascii=False)
 
 
+def _compact_typing(line: str) -> str:
+    """Give the judge a typed action's text once, not one press per keystroke.
+
+    The pinned judge quotes each row's ``command`` verbatim. The Anthropic
+    agent types by emitting ``pyautogui.press(<char>)`` per character, so a
+    4 KB script arrives as ~100 KB of prompt; a typing-heavy run then
+    overruns the provider's input limit (1,048,576 tokens on Gemini) and
+    every rubric errors. The sol agent's ``typewrite(text)`` is the compact
+    form, so rewrite the Anthropic shape to match it. Only the copy the
+    judge reads changes; the trajectory on disk is untouched.
+    """
+    try:
+        row = json.loads(line)
+    except ValueError:
+        return line
+    action = row.get("action")
+    if not isinstance(action, dict) or not isinstance(action.get("input"), dict):
+        return line
+    inp = action["input"]
+    is_type = inp.get("action") == "type" or (action.get("name") == "type" and "text" in inp)
+    if not is_type or not isinstance(inp.get("text"), str) or not isinstance(action.get("command"), str):
+        return line
+    if "pyautogui.press(" not in action["command"]:
+        return line
+    action["command"] = f"pyautogui.typewrite({inp['text']!r})\n"
+    return json.dumps(row, ensure_ascii=False)
+
+
 def jpeg_view(runs_dir: Path, destination: Path, quality: int = JPEG_QUALITY) -> Path:
     """A copy of the runs whose screenshots are JPEG, for the judge to read.
 
@@ -260,7 +288,7 @@ def jpeg_view(runs_dir: Path, destination: Path, quality: int = JPEG_QUALITY) ->
             if source.is_file():
                 (target / name).write_text(
                     "".join(
-                        _rewrite_screenshot_fields(line.rstrip("\n"), renamed) + "\n"
+                        _compact_typing(_rewrite_screenshot_fields(line.rstrip("\n"), renamed)) + "\n"
                         for line in source.read_text(encoding="utf-8").splitlines()
                         if line.strip()
                     ),

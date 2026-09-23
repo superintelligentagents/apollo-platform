@@ -69,6 +69,25 @@ class OriginalRunDirTests(unittest.TestCase):
             self.assertEqual(out["tasks"][0]["run_dir"], str(view / "run-b"))
 
 
+class CompactTypingTests(unittest.TestCase):
+    def test_a_per_keystroke_type_action_becomes_one_typewrite_call_in_the_view(self):
+        text = "cat > f.py <<'EOF'\nprint(1)\nEOF\n"
+        command = "".join("pyautogui.press(%r)\n" % ch for ch in text)
+        row = {"step_num": 3, "action": {"name": "computer", "input": {"action": "type", "text": text}, "command": command}, "response": ""}
+        out = json.loads(canonical_judge._compact_typing(json.dumps(row)))
+        self.assertEqual(out["action"]["command"], "pyautogui.typewrite(%r)\n" % text)
+        self.assertEqual(out["action"]["input"]["text"], text)          # the typed text itself is kept
+
+    def test_toolset_type_member_and_other_actions_are_handled_or_left_alone(self):
+        typed = {"action": {"name": "type", "toolset_name": "computer", "input": {"text": "hi"}, "command": "pyautogui.press('h')\npyautogui.press('i')\n"}}
+        self.assertIn("typewrite('hi')", json.loads(canonical_judge._compact_typing(json.dumps(typed)))["action"]["command"])
+        click = json.dumps({"action": {"name": "computer", "input": {"action": "left_click", "coordinate": [1, 2]}, "command": "pyautogui.click(1, 2)\n"}})
+        self.assertEqual(canonical_judge._compact_typing(click), click)
+        sol = json.dumps({"action": {"action_space": "pyautogui", "action": "import pyautogui\npyautogui.typewrite('x', interval=0.03)"}})
+        self.assertEqual(canonical_judge._compact_typing(sol), sol)
+        self.assertEqual(canonical_judge._compact_typing("not json"), "not json")
+
+
 if __name__ == "__main__":
     unittest.main()
 
