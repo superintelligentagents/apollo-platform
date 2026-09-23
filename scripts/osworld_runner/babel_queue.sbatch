@@ -104,6 +104,10 @@ export OSWORLD_OPENAI_ENV_FILE=${OSWORLD_OPENAI_ENV_FILE:-$DATA/apollo-osworld/o
 export OSWORLD_ANTHROPIC_ENV_FILE=${OSWORLD_ANTHROPIC_ENV_FILE:-$DATA/apollo-osworld/anthropic.env}
 export OSWORLD_ANTHROPIC_MODEL=${OSWORLD_ANTHROPIC_MODEL:-claude-opus-5}
 export OSWORLD_ANTHROPIC_EFFORT=${OSWORLD_ANTHROPIC_EFFORT:-high}
+# Per-keystroke pause for the Anthropic agent's typed text (pyautogui default 0.1 s).
+# 0.03 s measured byte-exact on shell symbols, code and prose, 3.3x faster; the
+# controller chunks long text so no piece overruns the guest deadline at any rate.
+export OSWORLD_ANTHROPIC_TYPE_PAUSE=${OSWORLD_ANTHROPIC_TYPE_PAUSE:-0.03}
 # A Gemini rubric judge reads its own key; the agent's provider is unrelated.
 export OSWORLD_GEMINI_ENV_FILE=${OSWORLD_GEMINI_ENV_FILE:-$DATA/apollo-osworld/gemini.env}
 # Canonical-agent parity: leave upstream's own operator prompt in place for
