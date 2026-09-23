@@ -219,7 +219,7 @@ def trajectory_reporting_url(api_url: str, *, offset: int, limit: int = 1_000) -
 
 
 def get_json(
-    url: str, token: str, timeout: float = 60.0, attempts: int = 6
+    url: str, token: str, timeout: float = 60.0, attempts: int = 10
 ) -> Mapping[str, Any]:
     request = Request(
         url,
