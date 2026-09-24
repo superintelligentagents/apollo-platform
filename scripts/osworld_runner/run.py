@@ -219,7 +219,7 @@ def trajectory_reporting_url(api_url: str, *, offset: int, limit: int = 1_000) -
 
 
 def get_json(
-    url: str, token: str, timeout: float = 60.0, attempts: int = 10
+    url: str, token: str, timeout: float = 60.0, attempts: int = 30
 ) -> Mapping[str, Any]:
     request = Request(
         url,
@@ -236,8 +236,11 @@ def get_json(
                 value = json.loads(response.read().decode("utf-8"))
             break
         except HTTPError as exc:
-            # Concurrent shard workers can trip API Gateway throttling; those
-            # responses are transient and safe to retry with backoff.
+            # Concurrent shard workers can trip API Gateway throttling, and the
+            # reporting API has had 5xx outages of 5+ minutes; both are
+            # transient and safe to retry with backoff. The sleep caps at 60 s,
+            # so 30 attempts wait out roughly 27 minutes before a shard gives
+            # up (restarting a shard costs an image check and a VM boot).
             if exc.code in {429, 500, 502, 503, 504} and attempt + 1 < attempts:
                 last_error = exc
                 time.sleep(min(60.0, (2.0**attempt) + random.uniform(0.0, 2.0)))
