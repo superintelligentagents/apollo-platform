@@ -1,8 +1,10 @@
 import sys
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 from scripts.osworld_runner import run_queue
@@ -56,3 +58,54 @@ class RunCommandTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecoverRepublishTests(unittest.TestCase):
+    """A batch whose runs were judged but whose uploads failed is published
+    again on restart instead of being written off (which re-runs its tasks)."""
+
+    def make_batch(self, root, prepared):
+        batch = root / "batch-000001"
+        (batch / "trajectory_review").mkdir(parents=True)
+        (batch / "job.json").write_text(json.dumps({"task_ids": ["v2/x/internal/task-1"], "task_count": 1}))
+        (batch / "trajectory_review/eval_results_full_traj_per_rubric.json").write_text("{}")
+        (batch / "trajectory_review/prepare-summary.json").write_text(json.dumps({"prepared": prepared, "skipped": []}))
+        return batch
+
+    def test_a_judged_batch_with_failed_uploads_is_published_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); batch = self.make_batch(root, prepared=[])
+            calls = []
+            def republish(batch_dir):
+                calls.append(batch_dir)
+                (batch_dir / "trajectory_review/prepare-summary.json").write_text(json.dumps({"prepared": [{"task_id": "v2/x/internal/task-1"}], "skipped": []}))
+                return None
+            state = {"batches_completed": 0, "tasks_published": 0, "runs": []}
+            with mock.patch.object(run_queue, "verify_batch", return_value=[{"task_id": "v2/x/internal/task-1"}]), \
+                 mock.patch.object(run_queue, "batch_verification_record", return_value={"requested_task_count": 1, "published_task_count": 1, "runs": []}), \
+                 mock.patch.object(run_queue, "record_completed_batch"), mock.patch.object(run_queue, "compact_batch"):
+                run_queue.recover_published_batches(root, state, bucket="b", queue="v2", token="t", reporting_attempts=1, reporting_delay=0, republish=republish)
+            self.assertEqual(calls, [batch])
+            self.assertTrue((batch / "verified.json").exists())
+            self.assertFalse((batch / "failed.json").exists())
+
+    def test_a_second_failure_still_writes_the_batch_off(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); batch = self.make_batch(root, prepared=[])
+            state = {"batches_completed": 0, "tasks_published": 0, "runs": []}
+            with mock.patch.object(run_queue, "compact_batch"):
+                run_queue.recover_published_batches(root, state, bucket="b", queue="v2", token="t", reporting_attempts=1, reporting_delay=0,
+                                                    republish=lambda d: run_queue.QueueRunError("still failing"))
+            self.assertTrue((batch / "failed.json").exists())
+
+    def test_a_batch_that_already_published_is_not_republished(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); batch = self.make_batch(root, prepared=[{"task_id": "v2/x/internal/task-1"}])
+            state = {"batches_completed": 0, "tasks_published": 0, "runs": []}
+            calls = []
+            with mock.patch.object(run_queue, "verify_batch", return_value=[]), \
+                 mock.patch.object(run_queue, "batch_verification_record", return_value={"requested_task_count": 1, "published_task_count": 0, "runs": []}), \
+                 mock.patch.object(run_queue, "record_completed_batch"), mock.patch.object(run_queue, "compact_batch"):
+                run_queue.recover_published_batches(root, state, bucket="b", queue="v2", token="t", reporting_attempts=1, reporting_delay=0,
+                                                    republish=lambda d: calls.append(d))
+            self.assertEqual(calls, [])

@@ -21,7 +21,7 @@ import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Callable, Any, Mapping, Sequence
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -334,14 +334,32 @@ def recover_published_batches(
     token: str,
     reporting_attempts: int,
     reporting_delay: float,
+    republish: Callable[[Path], QueueRunError | None] | None = None,
 ) -> None:
-    """Finish verification for a publish that outlived its queue worker."""
+    """Finish verification for a publish that outlived its queue worker.
+
+    A batch whose runs were judged but whose uploads failed (an NFS or S3 blip
+    on the compute node) is published again first when ``republish`` is given:
+    the judge output is on disk and prepare's uploads are idempotent, so that
+    costs minutes, while writing the batch off re-runs its tasks from scratch.
+    """
     for batch_dir in sorted(root.glob("batch-[0-9][0-9][0-9][0-9][0-9][0-9]")):
         if (batch_dir / "verified.json").exists():
             continue
         if not (batch_dir / "job.json").exists():
             continue
         summary_path = batch_dir / "trajectory_review/prepare-summary.json"
+        judged = (batch_dir / "trajectory_review/eval_results_full_traj_per_rubric.json").exists()
+        if judged and republish is not None and not (batch_dir / "failed.json").exists():
+            try:
+                prepared_before = read_json(summary_path).get("prepared") if summary_path.exists() else None
+            except (OSError, json.JSONDecodeError):
+                prepared_before = None
+            if not prepared_before:
+                log(f"{batch_dir.name}: judged runs on disk but nothing published; publishing again")
+                error = republish(batch_dir)
+                if error is not None:
+                    log(f"{batch_dir.name}: publish failed again: {error}")
         if not summary_path.exists():
             continue
         # prepare.py writes its summary even when it publishes nothing, so a
@@ -618,6 +636,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_private_json(state_path, state)
 
     try:
+        def republish(batch_dir: Path) -> QueueRunError | None:
+            number = int(batch_dir.name.removeprefix("batch-"))
+            vendor = "OpenAI" if args.agent_backend == "openai" else "Meta"
+            label = (
+                f"{args.run_label_prefix} {vendor} production shard "
+                f"{args.shard_index + 1}/{args.shard_count} batch {number:06d}"
+            )
+            task_count = int(read_json(batch_dir / "job.json").get("task_count") or 1)
+            return publish_batch_with_retry(
+                command_base(args, batch_dir),
+                min(args.judge_workers, task_count),
+                label,
+                batch_dir / "command.log",
+            )
+
         recover_published_batches(
             root,
             state,
@@ -626,6 +659,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             token=token,
             reporting_attempts=args.reporting_attempts,
             reporting_delay=args.reporting_delay,
+            republish=republish,
         )
         consecutive_empty_batches = 0
         excluded_ids = read_task_id_list(args.exclude_task_ids_file)
