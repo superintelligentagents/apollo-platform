@@ -108,6 +108,12 @@ python3 scripts/trajectory_review/run.py \
 3. Replace only `lambda_presign.js` in that package and re-zip it.
 4. Update `journeys-presign`, wait for success, then update `journeys-pc-presign` with the identical zip.
 5. Verify both functions have the same `CodeSha256` but different roles, `APP_SCOPE`, and `REVIEW_PREFIX` values.
+
+`scripts/deploy_backend.sh` performs steps 2-5 and refuses to ship a package
+that lost files or its bundled dependencies; `--plan` reports the live state and
+the rebuilt package without deploying. It needs console credentials
+(`aws login --profile root`) -- the OSWorld runner user cannot call Lambda.
+Steps 6 and 7 stay manual.
 6. Verify `/presign` rejects a valid PC-shaped request on the V2 API and rejects a valid V2-shaped request on the PC API.
 7. Run `scripts/e2e/validate-cross-app-review.mjs`; it adds disposable audited tasks, proves only the intended queue changes, and removes every created object.
 

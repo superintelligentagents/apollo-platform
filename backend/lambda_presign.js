@@ -327,6 +327,143 @@ const trajectoryDoneKeyFor = (manifestKey) => `${TRAJECTORY_DONE_PREFIX}${b64url
 const trajectoryJudgmentKeyFor = (manifestKey) => `${TRAJECTORY_JUDGMENTS_PREFIX}${b64url(manifestKey)}.json`;
 
 /**
+ * A re-judgment written beside a run's manifest, or null.
+ *
+ * Published manifests are immutable, so a later judging pass cannot correct the
+ * scores inside them. It writes `rejudgment.json` under the same run prefix
+ * instead; when one exists the API reports it, because it was produced by the
+ * canonical judge over every screenshot rather than a sampled subset. The
+ * manifest's original judgment stays available beside it.
+ */
+export function cleanTrajectoryRejudgment(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value.schema_version !== "apollo-trajectory-rejudgment-v1") return null;
+  if (!Array.isArray(value.rubrics) || !value.rubrics.length || value.rubrics.length > 100) return null;
+  const rubrics = value.rubrics.map((rubric) => {
+    const status = cleanText(rubric?.llm_status, 20).toUpperCase();
+    const llmStatus = ["SUCCESS", "FAILURE", "ERROR"].includes(status) ? status : "FAILURE";
+    const llmScore = llmStatus === "ERROR" ? null : (llmStatus === "SUCCESS" ? 1 : 0);
+    return {
+      rubric_id: cleanText(rubric?.rubric_id, 100),
+      requirement: cleanText(rubric?.requirement, 30_000),
+      verification: cleanText(rubric?.verification, 20_000),
+      llm_status: llmStatus,
+      llm_score: llmScore,
+      llm_success: llmScore == null ? null : llmScore === 1,
+      llm_reasoning: cleanText(rubric?.llm_reasoning, 30_000),
+    };
+  }).filter((rubric) => rubric.rubric_id && rubric.requirement);
+  if (!rubrics.length) return null;
+  const scored = rubrics.filter((rubric) => rubric.llm_score !== null);
+  const metrics = value.metrics && typeof value.metrics === "object" ? value.metrics : {};
+  const average = Number(metrics.average_rubric_score);
+  return {
+    schema_version: "apollo-trajectory-rejudgment-v1",
+    judge: {
+      repo: cleanText(value.judge?.repo, 200) || null,
+      commit: cleanText(value.judge?.commit, 64) || null,
+      sha256: cleanText(value.judge?.sha256, 64) || null,
+      model: cleanText(value.judge?.model, 120) || null,
+      screenshots: cleanText(String(value.judge?.screenshots ?? ""), 20) || null,
+    },
+    metrics: {
+      average_rubric_score: Number.isFinite(average)
+        ? average
+        : (scored.length ? scored.filter((r) => r.llm_score === 1).length / scored.length : 0),
+      perfect: metrics.perfect === true,
+      judge_errors: Number(metrics.judge_errors) || 0,
+      rubrics_total: rubrics.length,
+      rubrics_scored: scored.length,
+    },
+    rubrics,
+  };
+}
+
+export function trajectoryRejudgmentKeyFor(manifestKey) {
+  return `${String(manifestKey).slice(0, String(manifestKey).lastIndexOf("/"))}/rejudgment.json`;
+}
+
+/**
+ * The judgment a reader should see, and the rubric list to match it.
+ *
+ * Falls back to the packaged judgment whenever no re-judgment exists or the
+ * two disagree about which rubrics the task has, so a stale sidecar can never
+ * silently swap in verdicts for a different rubric set.
+ */
+export function trajectoryJudgmentView(manifest, rejudgment) {
+  const packaged = {
+    manifest,
+    metrics: {
+      average_rubric_score: manifest.metrics.average_rubric_score,
+      perfect: manifest.metrics.perfect,
+      judge_errors: manifest.metrics.judge_errors ?? 0,
+      rubrics_total: manifest.rubrics.length,
+      rubrics_scored: manifest.rubrics.filter((rubric) => rubric.llm_status !== "ERROR").length,
+    },
+  };
+  if (!rejudgment) return packaged;
+  const packagedIds = manifest.rubrics.map((rubric) => rubric.rubric_id).sort();
+  const rejudgedIds = rejudgment.rubrics.map((rubric) => rubric.rubric_id).sort();
+  if (packagedIds.length !== rejudgedIds.length
+      || packagedIds.some((id, index) => id !== rejudgedIds[index])) {
+    return packaged;
+  }
+  const byId = new Map(rejudgment.rubrics.map((rubric) => [rubric.rubric_id, rubric]));
+  return {
+    manifest: {
+      ...manifest,
+      rubrics: manifest.rubrics.map((rubric) => {
+        const scored = byId.get(rubric.rubric_id);
+        return scored
+          ? { ...rubric, llm_status: scored.llm_status, llm_score: scored.llm_score,
+              llm_success: scored.llm_success, llm_reasoning: scored.llm_reasoning }
+          : rubric;
+      }),
+      metrics: { ...manifest.metrics, ...rejudgment.metrics },
+      rejudgment: { judge: rejudgment.judge, metrics: rejudgment.metrics },
+    },
+    metrics: rejudgment.metrics,
+  };
+}
+
+const TRAJECTORY_SUBSETS_PREFIX = `${REVIEW_PREFIX}subsets/`;
+
+/**
+ * A named list of task IDs published alongside the corpus, or null.
+ *
+ * Curated sets (an eval slice, a showcase set) otherwise live only as a file
+ * someone has to be handed, leaving every consumer to intersect IDs by hand.
+ * Naming one here lets both reporting endpoints answer for it directly, and
+ * keeps the membership in S3 where it is versioned rather than in code.
+ */
+export function cleanSubsetName(value) {
+  const name = cleanText(value, 60).toLowerCase();
+  return /^[a-z0-9][a-z0-9._-]{0,59}$/.test(name) ? name : "";
+}
+
+export function subsetKeyFor(name) {
+  return `${TRAJECTORY_SUBSETS_PREFIX}${name}.json`;
+}
+
+export function cleanSubsetDocument(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const raw = Array.isArray(value.task_ids) ? value.task_ids : null;
+  if (!raw || !raw.length || raw.length > 20_000) return null;
+  const taskIds = [];
+  for (const entry of raw) {
+    const taskId = cleanText(entry, 300);
+    if (taskId) taskIds.push(taskId);
+  }
+  if (!taskIds.length) return null;
+  return {
+    name: cleanText(value.name, 60),
+    description: cleanText(value.description, 400),
+    created_at_utc: cleanText(value.created_at_utc, 40),
+    task_ids: taskIds,
+  };
+}
+
+/**
  * A manifest's screenshot path, or "" when it must not be signed.
  *
  * The previous check appended the path to the run prefix and then asserted the
@@ -3333,9 +3470,11 @@ export function selectReportingPage(dashboard, options = {}) {
   const requestedStatus = ["pending", "in_review", "approved", "rejected"].includes(options.status)
     ? options.status
     : "";
+  const subsetIds = options.subsetIds instanceof Set ? options.subsetIds : null;
   const filteredItems = (dashboard.items ?? []).filter((item) =>
     (!requestedTaskId || item.task_id === requestedTaskId) &&
-    (!requestedStatus || item.status === requestedStatus)
+    (!requestedStatus || item.status === requestedStatus) &&
+    (!subsetIds || subsetIds.has(item.task_id))
   );
   const offset = requestedTaskId ? 0 : Math.max(0, Number(options.offset) || 0);
   const requestedLimit = Number(options.limit);
@@ -4596,6 +4735,18 @@ function bearerToken(headers = {}) {
   return match?.[1]?.trim() || "";
 }
 
+async function loadSubset(params) {
+  const requested = cleanText(params.subset, 60);
+  if (!requested) return { name: "", ids: null, error: null };
+  const name = cleanSubsetName(requested);
+  if (!name) return { name: requested, ids: null, error: "subset name is not a valid identifier" };
+  const document = cleanSubsetDocument(
+    await readJson(subsetKeyFor(name)).then(({ json }) => json).catch(() => null),
+  );
+  if (!document) return { name, ids: null, error: `no published subset named "${name}"` };
+  return { name, ids: new Set(document.task_ids), document, error: null };
+}
+
 async function handleReporting(event) {
   if (!reportingKeyMatches(bearerToken(event.headers))) {
     return respond(401, { error: "Bad or missing reporting bearer token" }, { "Cache-Control": "no-store" });
@@ -4611,6 +4762,8 @@ async function handleReporting(event) {
   const maxLimit = includeLlmReviews ? 25 : includeLlmFlags ? 200 : includeContent ? 150 : 5_000;
   const limit = Math.min(maxLimit, Math.max(1, Number(params.limit) || defaultLimit));
   const offset = Math.max(0, Number(params.offset) || 0);
+  const subset = await loadSubset(params);
+  if (subset.error) return respond(404, { error: subset.error }, { "Cache-Control": "no-store" });
   const [dashboard, aliases, skipCounts] = await Promise.all([adminDashboard(), participantAliases(), reviewSkipCounts()]);
   const options = {
     includeContent,
@@ -4620,12 +4773,19 @@ async function handleReporting(event) {
     status,
     limit,
     offset,
+    subsetIds: subset.ids,
     participantAliases: aliases,
     skipCounts,
   };
   if (includeLlmReviews) await hydrateReportingLlmReviews(dashboard, options);
   if (includeLlmFlags) await hydrateReportingLlmFlags(dashboard, options);
-  return respond(200, buildReportingReport(dashboard, new Date().toISOString(), options), { "Cache-Control": "no-store" });
+  const report = buildReportingReport(dashboard, new Date().toISOString(), options);
+  if (subset.ids) {
+    // Say which named set answered, so a caller can tell an empty page from a
+    // filter that silently matched nothing.
+    report.subset = { name: subset.name, task_ids: subset.ids.size, description: subset.document.description };
+  }
+  return respond(200, report, { "Cache-Control": "no-store" });
 }
 
 async function preQcReviewForClaimedTask(subKey) {
@@ -5017,9 +5177,11 @@ export function buildOsworldExportReport(items, generatedAt = new Date().toISOSt
   const requestedStatus = ["pending", "in_review", "reviewed"].includes(options.status) ? options.status : "";
   const anyGrade = options.grade === "any";
   const snapshot = /^[a-z0-9_-]{1,40}$/i.test(String(options.snapshot || "")) ? String(options.snapshot) : "chrome";
+  const subsetIds = options.subsetIds instanceof Set ? options.subsetIds : null;
   const filtered = items.filter((item) =>
     (!requestedTaskId || item.task_id === requestedTaskId)
     && (!requestedStatus || item.status === requestedStatus)
+    && (!subsetIds || subsetIds.has(item.task_id))
     && (anyGrade || acceptedHumanPass(item))
   );
   const selected = selectLatestRunPerTask(filtered);
@@ -5052,8 +5214,11 @@ export function buildOsworldExportReport(items, generatedAt = new Date().toISOSt
 export function buildTrajectoryReportingReport(items, generatedAt = new Date().toISOString(), options = {}) {
   const requestedTaskId = cleanText(options.taskId, 300);
   const requestedStatus = ["pending", "in_review", "reviewed"].includes(options.status) ? options.status : "";
+  const subsetIds = options.subsetIds instanceof Set ? options.subsetIds : null;
   const filtered = items.filter((item) =>
-    (!requestedTaskId || item.task_id === requestedTaskId) && (!requestedStatus || item.status === requestedStatus)
+    (!requestedTaskId || item.task_id === requestedTaskId)
+    && (!requestedStatus || item.status === requestedStatus)
+    && (!subsetIds || subsetIds.has(item.task_id))
   );
   const offset = Math.max(0, Number(options.offset) || 0);
   // Content rows carry every step and rubric, so they stay capped well below
@@ -5077,6 +5242,13 @@ export function buildTrajectoryReportingReport(items, generatedAt = new Date().t
       reviewed_at: item.reviewed_at ?? "",
       llm_average_rubric_score: item.llm_average_rubric_score,
       llm_perfect: item.llm_perfect,
+      // Which judging the scores above came from, and the package's own
+      // judgment beside it. Without these a corrected score is
+      // indistinguishable from the original one it replaced.
+      llm_judge_source: item.llm_judge_source ?? "packaged",
+      llm_judge: item.llm_judge ?? null,
+      llm_original_average_rubric_score: item.llm_original_average_rubric_score ?? item.llm_average_rubric_score,
+      llm_original_perfect: item.llm_original_perfect ?? item.llm_perfect,
       llm_judge_errors: item.llm_judge_errors ?? 0,
       llm_rubrics_total: item.llm_rubrics_total ?? null,
       llm_rubrics_scored: item.llm_rubrics_scored ?? null,
@@ -5111,18 +5283,28 @@ async function handleTrajectoryReporting(event) {
   // The OSWorld view is built from manifest + judgment even when the caller
   // did not ask for the raw content, so hydrate whenever either is needed.
   const loadContent = includeContent || includeScreenshots || includeOsworld || formatOsworld;
+  const subset = await loadSubset(params);
+  if (subset.error) return respond(404, { error: subset.error }, { "Cache-Control": "no-store" });
   const state = await trajectoryQueueState();
+  // Narrow before hydrating, not after: every manifest costs S3 reads, and a
+  // named subset is usually a small slice of the corpus.
+  const manifests = subset.ids
+    ? state.manifests.filter((key) => subset.ids.has(taskIdFromTrajectoryManifestKey(key) || ""))
+    : state.manifests;
   const items = [];
-  for (let offset = 0; offset < state.manifests.length; offset += 25) {
-    const batch = await Promise.all(state.manifests.slice(offset, offset + 25).map(async (manifestKey) => {
+  for (let offset = 0; offset < manifests.length; offset += 25) {
+    const batch = await Promise.all(manifests.slice(offset, offset + 25).map(async (manifestKey) => {
       const encoded = b64url(manifestKey);
-      const [manifestRaw, done, lock] = await Promise.all([
+      const [manifestRaw, done, lock, rejudgmentRaw] = await Promise.all([
         readJson(manifestKey).then(({ json }) => json).catch(() => null),
         readDoneRecord(manifestKey, trajectoryDoneKeyFor),
         state.lockSet.has(encoded) ? readJson(trajectoryLockKeyFor(manifestKey)).then(({ json }) => json).catch(() => null) : null,
+        readJson(trajectoryRejudgmentKeyFor(manifestKey)).then(({ json }) => json).catch(() => null),
       ]);
       const manifest = cleanTrajectoryManifest(manifestRaw);
       if (!manifest) return null;
+      const rejudgment = cleanTrajectoryRejudgment(rejudgmentRaw);
+      const judged = trajectoryJudgmentView(manifest, rejudgment);
       const judgment = done?.target ? await readJson(done.target).then(({ json }) => json).catch(() => null) : null;
       return {
         manifest_key: manifestKey,
@@ -5131,17 +5313,21 @@ async function handleTrajectoryReporting(event) {
         status: done ? "reviewed" : lock ? "in_review" : "pending",
         reviewer: done?.reviewer ?? lock?.reviewer ?? "",
         reviewed_at: done?.completed_at ?? "",
-        llm_average_rubric_score: manifest.metrics.average_rubric_score,
-        llm_perfect: manifest.metrics.perfect,
+        llm_average_rubric_score: judged.metrics.average_rubric_score,
+        llm_perfect: judged.metrics.perfect,
+        // Which judging these scores came from, and the manifest's original
+        // beside it, so a grader can always see both.
+        llm_judge_source: rejudgment ? "canonical_full_trajectory" : "packaged",
+        llm_judge: rejudgment ? rejudgment.judge : null,
+        llm_original_average_rubric_score: manifest.metrics.average_rubric_score,
+        llm_original_perfect: manifest.metrics.perfect,
         // average_rubric_score is the mean over rubrics the judge actually
         // scored; rubrics that errored are dropped from that denominator, so
         // a 1.0 can rest on a subset. Surface the counts beside it so callers
         // can tell a full pass from a partial one without fetching content.
-        llm_judge_errors: manifest.metrics.judge_errors ?? 0,
-        llm_rubrics_total: Array.isArray(manifest.rubrics) ? manifest.rubrics.length : null,
-        llm_rubrics_scored: Array.isArray(manifest.rubrics)
-          ? manifest.rubrics.filter((rubric) => rubric?.llm_status !== "ERROR").length
-          : null,
+        llm_judge_errors: judged.metrics.judge_errors ?? 0,
+        llm_rubrics_total: judged.metrics.rubrics_total,
+        llm_rubrics_scored: judged.metrics.rubrics_scored,
         agent: manifest.source.agent,
         model: manifest.source.model,
         run_label: manifest.source.run_label,
@@ -5149,7 +5335,7 @@ async function handleTrajectoryReporting(event) {
         // grade beside it so reporting clients can migrate independently.
         human_outcome: judgment?.trajectory?.task_satisfied ?? judgment?.trajectory?.outcome ?? null,
         human_final_grade: trajectoryOverallOutcome(judgment?.trajectory) || null,
-        manifest: loadContent ? manifest : null,
+        manifest: loadContent ? judged.manifest : null,
         human_judgment: loadContent ? judgment : null,
       };
     }));
@@ -5163,6 +5349,7 @@ async function handleTrajectoryReporting(event) {
     grade: cleanText(params.grade, 10).toLowerCase(),
     taskId: cleanText(params.task_id, 300),
     status: cleanText(params.status, 30),
+    subsetIds: subset.ids,
     limit: params.limit,
     offset: params.offset,
   };
@@ -5193,6 +5380,11 @@ async function handleTrajectoryReporting(event) {
       }));
       return { ...row, manifest: { ...row.manifest, steps: signed } };
     }));
+  }
+  if (subset.ids) {
+    // Name the set that answered, so an empty page is distinguishable from a
+    // filter that matched nothing.
+    report.subset = { name: subset.name, task_ids: subset.ids.size, description: subset.document.description };
   }
   return respond(200, report, { "Cache-Control": "no-store" });
 }

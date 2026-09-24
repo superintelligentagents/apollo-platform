@@ -1,0 +1,9 @@
+{
+  "name": "apollo-hard100-showcase",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.637.0",
+    "@aws-sdk/s3-request-presigner": "^3.637.0"
+  }
+}

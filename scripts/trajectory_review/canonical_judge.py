@@ -29,6 +29,7 @@ import argparse
 import base64
 import hashlib
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -112,6 +113,27 @@ def odysseys_task_source(task_source_json: Path, destination: Path) -> dict[str,
     return identifiers
 
 
+def point_runs_at_originals(payload: dict[str, Any], original_runs_dir: Path) -> dict[str, Any]:
+    """Send prepare.py to the original run directories, not the JPEG view.
+
+    The judge sees a JPEG re-encoding of each run and writes that directory
+    as ``run_dir``. prepare.py takes an absolute run_dir as-is, so the S3
+    package was carrying the judge's JPEGs while the lossless PNGs sat in the
+    original run directory. Both trees name a run by the same directory, so
+    swap the parent back -- but only if the original still exists.
+    """
+    tasks = []
+    for task in payload.get("tasks") or []:
+        updated = dict(task)
+        run_dir = str(task.get("run_dir") or "")
+        if run_dir:
+            original = Path(original_runs_dir) / Path(run_dir).name
+            if original.is_dir():
+                updated["run_dir"] = str(original)
+        tasks.append(updated)
+    return {**payload, "tasks": tasks}
+
+
 def restore_judge_status(
     payload: Mapping[str, Any], model: str, identifiers: Mapping[str, str] | None = None
 ) -> dict[str, Any]:
@@ -168,6 +190,147 @@ def restore_judge_status(
     }
 
 
+# OpenAI rejects a request whose images total more than 50 MB. Judge every
+# screenshot when they fit -- that is what makes a verdict trustworthy -- and
+# thin them evenly only when they do not.
+IMAGE_PAYLOAD_BUDGET_BYTES = 40_000_000
+
+
+JPEG_QUALITY = 75
+TRAJECTORY_FILES = ("steps.jsonl", "traj.jsonl")
+SCREENSHOT_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+
+
+def _rewrite_screenshot_fields(line: str, renamed: Mapping[str, str]) -> str:
+    try:
+        row = json.loads(line)
+    except ValueError:
+        return line
+    if not isinstance(row, dict):
+        return line
+    for field in ("screenshot", "screenshot_file"):
+        value = row.get(field)
+        if isinstance(value, str) and value:
+            new_name = renamed.get(Path(value).name)
+            if new_name:
+                row[field] = new_name
+    return json.dumps(row, ensure_ascii=False)
+
+
+def _compact_typing(line: str) -> str:
+    """Give the judge a typed action's text once, not one press per keystroke.
+
+    The pinned judge quotes each row's ``command`` verbatim. The Anthropic
+    agent types by emitting ``pyautogui.press(<char>)`` per character, so a
+    4 KB script arrives as ~100 KB of prompt; a typing-heavy run then
+    overruns the provider's input limit (1,048,576 tokens on Gemini) and
+    every rubric errors. The sol agent's ``typewrite(text)`` is the compact
+    form, so rewrite the Anthropic shape to match it. Only the copy the
+    judge reads changes; the trajectory on disk is untouched.
+    """
+    try:
+        row = json.loads(line)
+    except ValueError:
+        return line
+    action = row.get("action")
+    if not isinstance(action, dict) or not isinstance(action.get("input"), dict):
+        return line
+    inp = action["input"]
+    is_type = inp.get("action") == "type" or (action.get("name") == "type" and "text" in inp)
+    if not is_type or not isinstance(inp.get("text"), str) or not isinstance(action.get("command"), str):
+        return line
+    if "pyautogui.press(" not in action["command"]:
+        return line
+    action["command"] = f"pyautogui.typewrite({inp['text']!r})\n"
+    return json.dumps(row, ensure_ascii=False)
+
+
+def jpeg_view(runs_dir: Path, destination: Path, quality: int = JPEG_QUALITY) -> Path:
+    """A copy of the runs whose screenshots are JPEG, for the judge to read.
+
+    Full-resolution PNG screenshots of a busy page reach ~1.8 MB each, so a
+    hundred-step trajectory exceeds the provider's 50 MB request limit and every
+    rubric comes back a 400. Re-encoding is what makes the whole trajectory
+    sendable: the same frames cost roughly a fifth as many bytes.
+
+    It is a view, not a conversion. The published package keeps the lossless
+    originals; only the bytes shown to the judge are re-encoded. Resolution is
+    left alone deliberately -- the judge has to read page text, and dropping
+    below 768px on the short edge is where that stops being possible, while
+    costing no fewer image tokens than full size does.
+    """
+    from PIL import Image  # only the judging path needs an image library
+
+    destination.mkdir(parents=True, exist_ok=True)
+    run_dirs = {path.parent for name in TRAJECTORY_FILES for path in runs_dir.rglob(name)}
+    for run_dir in sorted(run_dirs):
+        target = destination / run_dir.relative_to(runs_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        renamed: dict[str, str] = {}
+        for path in sorted(run_dir.iterdir()):
+            if not path.is_file():
+                continue
+            if path.suffix.lower() in SCREENSHOT_SUFFIXES:
+                new_name = f"{path.stem}.jpg"
+                try:
+                    with Image.open(path) as image:
+                        image.convert("RGB").save(target / new_name, "JPEG", quality=quality)
+                except OSError:
+                    shutil.copyfile(path, target / path.name)
+                    continue
+                renamed[path.name] = new_name
+            elif path.name not in TRAJECTORY_FILES:
+                shutil.copyfile(path, target / path.name)
+        # The judge reads the screenshot name out of the trajectory, so the
+        # copy has to point at the re-encoded file rather than the original.
+        for name in TRAJECTORY_FILES:
+            source = run_dir / name
+            if source.is_file():
+                (target / name).write_text(
+                    "".join(
+                        _compact_typing(_rewrite_screenshot_fields(line.rstrip("\n"), renamed)) + "\n"
+                        for line in source.read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    ),
+                    encoding="utf-8",
+                )
+    return destination
+
+
+def run_screenshot_totals(runs_dir: Path) -> list[tuple[int, int]]:
+    """(count, base64 bytes) of the screenshots each run would attach."""
+    totals: list[tuple[int, int]] = []
+    run_dirs = {path.parent for name in ("traj.jsonl", "steps.jsonl")
+                for path in runs_dir.rglob(name)}
+    for run_dir in sorted(run_dirs):
+        sizes = [
+            path.stat().st_size
+            for pattern in ("*.png", "*.jpg", "*.jpeg", "*.webp")
+            for path in run_dir.rglob(pattern)
+        ]
+        if sizes:
+            totals.append((len(sizes), sum(sizes) * 4 // 3))  # base64 is what ships
+    return totals
+
+
+def image_cap_for(runs_dir: Path, requested: int, budget: int = IMAGE_PAYLOAD_BUDGET_BYTES) -> int:
+    """A --max-images that keeps every run under the provider's payload limit.
+
+    A trajectory long enough to blow the limit fails every one of its rubrics
+    with a 400, and an all-errored task still reports average_rubric_score 0.0 --
+    a silent zero indistinguishable from a model that did nothing. Capping the
+    count costs some evidence; not capping it costs the whole verdict.
+
+    The cap is set by whichever run is worst off, so one long trajectory cannot
+    take down the batch, and runs that already fit are left alone.
+    """
+    totals = [t for t in run_screenshot_totals(runs_dir) if t[1] > budget]
+    if not totals:
+        return requested
+    fitted = min(max(1, count * budget // payload) for count, payload in totals)
+    return fitted if requested <= 0 else min(requested, fitted)
+
+
 def canonical_command(
     judge_path: Path, args: argparse.Namespace, task_source: Path, raw_output: Path
 ) -> list[str]:
@@ -179,7 +342,7 @@ def canonical_command(
         "--output", str(raw_output),
         "--model", args.model,
         "--num-workers", str(args.num_workers),
-        "--max-images", str(args.max_images),
+        "--max-images", str(image_cap_for(args.runs_dir, args.max_images)),
         "--max-steps", str(args.max_steps),
     ]
     if args.api_base:
@@ -201,6 +364,11 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--api-base", default="")
     value.add_argument("--include-incomplete", action="store_true")
     value.add_argument("--cache-dir", type=Path, default=None)
+    value.add_argument(
+        "--no-jpeg-view", action="store_true",
+        help="send the original screenshots instead of a re-encoded copy; a long "
+             "trajectory will then exceed the provider's request limit",
+    )
     value.add_argument("--plan", action="store_true")
     return value
 
@@ -215,11 +383,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         identifiers = odysseys_task_source(args.task_source_json, task_source)
         judge_path = fetch_canonical_judge(cache_dir)
+        original_runs_dir = args.runs_dir
+        if not args.plan and not args.no_jpeg_view:
+            args.runs_dir = jpeg_view(args.runs_dir, work_dir / "jpeg_runs")
         if args.plan:
             print(json.dumps({
                 "judge": "odysseys-canonical",
                 "commit": CANONICAL_COMMIT,
                 "tasks": len(identifiers),
+                # The caller refuses a plan that would judge another Apollo
+                # queue's tasks, and can only check that against the IDs
+                # themselves. Without them the whole canonical path is
+                # unrunnable through run.py, not merely unchecked.
+                "task_ids": sorted(identifiers.values()),
                 "model": args.model,
                 "max_images": args.max_images,
             }, indent=2))
@@ -230,6 +406,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     result = restore_judge_status(payload, args.model, identifiers)
+    result = point_runs_at_originals(result, original_runs_dir)
     args.output.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     errored = sum(task.get("judge_errors", 0) for task in result["tasks"])
     print(json.dumps({

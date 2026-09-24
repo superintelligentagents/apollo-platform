@@ -18,9 +18,10 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Callable, Any, Mapping, Sequence
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -32,6 +33,8 @@ from scripts.osworld_runner.run import (
     DEFAULT_OSWORLD_ROOT,
     fetch_reporting_tasks,
     fetch_trajectory_task_ids,
+    load_rubric_overlay,
+    apply_rubric_overlay,
     get_json,
     read_task_id_list,
     select_tasks,
@@ -63,19 +66,63 @@ def log(message: str) -> None:
 
 def run_command(command: Sequence[str], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("ab") as handle:
+    handle = output.open("ab")
+    try:
         handle.write(("\n$ " + " ".join(command) + "\n").encode())
         handle.flush()
+        # Own session: the OSWorld runners signal their process group while
+        # shutting down, and a signal landing here mid-write on the NFS log
+        # surfaced as "[Errno 4] Interrupted system call" and stopped the
+        # shard right after a batch had finished running (twice on 2026-09-22).
         result = subprocess.run(
             list(command),
             stdout=handle,
             stderr=subprocess.STDOUT,
             check=False,
+            start_new_session=True,
         )
+    finally:
+        try:
+            handle.close()
+        except InterruptedError:
+            # Python does not retry close() on EINTR. Everything this
+            # process wrote was flushed above; the child wrote through its
+            # own descriptor. Nothing is lost by moving on.
+            log(f"log close interrupted by a signal; continuing ({output})")
     if result.returncode:
         raise QueueRunError(
             f"command exited {result.returncode}; inspect {output}"
         )
+
+
+def required_keys(agent_backend: str, judge_model: str = "") -> tuple[str, ...]:
+    """Secrets a shard needs before it starts.
+
+    The agent and the judge are chosen independently, so their keys are too: a
+    Claude run judged by Gemini needs an Anthropic key and a Gemini one, and
+    neither an OpenAI key nor the Meta key it used to demand by default.
+    """
+    agent = {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+    }.get(agent_backend, "MUSE_SPARK_API_KEY")
+    if agent_backend == "muse-spark":
+        return (agent,)   # the Meta judge reaches the same key through a proxy
+    judge = "GEMINI_API_KEY" if judge_model.lower().startswith("gemini") else "OPENAI_API_KEY"
+    return (agent,) if agent == judge else (agent, judge)
+
+
+def agent_model_for(args: argparse.Namespace) -> str | None:
+    """The model name trajectories are published under, for this backend.
+
+    Dedup compares against it, so a backend missing here would silently dedupe
+    against no model at all and re-run tasks it had already covered.
+    """
+    if args.agent_backend == "openai":
+        return args.openai_model
+    if args.agent_backend == "anthropic":
+        return args.anthropic_model
+    return None
 
 
 def available_tasks(
@@ -86,10 +133,17 @@ def available_tasks(
     shard_index: int,
     excluded_ids: frozenset[str] = frozenset(),
     dedupe_model: str | None = None,
+    dedupe_run_label_prefix: str | None = None,
+    rubric_overlay_json: Path | None = None,
 ) -> tuple[int, int]:
     api_url = DEFAULT_APIS[queue]
     tasks = fetch_reporting_tasks(api_url, token)
-    existing = fetch_trajectory_task_ids(api_url, token, model=dedupe_model)
+    overlay = load_rubric_overlay(rubric_overlay_json)
+    if overlay:
+        tasks, _ = apply_rubric_overlay(tasks, overlay)
+    existing = fetch_trajectory_task_ids(
+        api_url, token, model=dedupe_model, run_label_prefix=dedupe_run_label_prefix
+    )
     selected, _ = select_tasks(
         tasks,
         queue=queue,
@@ -280,14 +334,32 @@ def recover_published_batches(
     token: str,
     reporting_attempts: int,
     reporting_delay: float,
+    republish: Callable[[Path], QueueRunError | None] | None = None,
 ) -> None:
-    """Finish verification for a publish that outlived its queue worker."""
+    """Finish verification for a publish that outlived its queue worker.
+
+    A batch whose runs were judged but whose uploads failed (an NFS or S3 blip
+    on the compute node) is published again first when ``republish`` is given:
+    the judge output is on disk and prepare's uploads are idempotent, so that
+    costs minutes, while writing the batch off re-runs its tasks from scratch.
+    """
     for batch_dir in sorted(root.glob("batch-[0-9][0-9][0-9][0-9][0-9][0-9]")):
         if (batch_dir / "verified.json").exists():
             continue
         if not (batch_dir / "job.json").exists():
             continue
         summary_path = batch_dir / "trajectory_review/prepare-summary.json"
+        judged = (batch_dir / "trajectory_review/eval_results_full_traj_per_rubric.json").exists()
+        if judged and republish is not None and not (batch_dir / "failed.json").exists():
+            try:
+                prepared_before = read_json(summary_path).get("prepared") if summary_path.exists() else None
+            except (OSError, json.JSONDecodeError):
+                prepared_before = None
+            if not prepared_before:
+                log(f"{batch_dir.name}: judged runs on disk but nothing published; publishing again")
+                error = republish(batch_dir)
+                if error is not None:
+                    log(f"{batch_dir.name}: publish failed again: {error}")
         if not summary_path.exists():
             continue
         # prepare.py writes its summary even when it publishes nothing, so a
@@ -336,7 +408,15 @@ def recover_published_batches(
 
 
 def compact_batch(batch_dir: Path) -> None:
-    """Delete only uploaded bulk artifacts while retaining the audit record."""
+    """Delete only uploaded bulk artifacts while retaining the audit record.
+
+    With OSWORLD_KEEP_RESULTS set, nothing is deleted: the full-resolution
+    screenshots, traj.jsonl and logs stay under the batch on /data. The S3
+    package is the only other copy, and it carries the judge's JPEG view, so
+    without this the lossless trajectory survives nowhere.
+    """
+    if os.environ.get("OSWORLD_KEEP_RESULTS", "").strip() not in ("", "0", "false", "no"):
+        return
     bulk_paths = [batch_dir / "results", batch_dir / "logs", batch_dir / "command.log"]
     bulk_paths.extend((batch_dir / "trajectory_review").glob("*/*/screens"))
     for path in bulk_paths:
@@ -348,13 +428,22 @@ def compact_batch(batch_dir: Path) -> None:
             path.unlink()
 
 
+# Each judge words an all-failed batch differently, and matching only one of
+# them turns a batch whose VMs all died into a dead shard instead of a recorded
+# empty batch -- work the queue would otherwise have retried.
+EMPTY_BATCH_MARKERS = (
+    "no eligible trajectory runs found",   # the in-tree judge
+    "No completed runs found in",          # the canonical judge
+)
+
+
 def batch_ran_empty(command_log: Path) -> bool:
     """True when publish failed because every task in the batch failed to run."""
     try:
         tail = command_log.read_bytes()[-20_000:].decode("utf-8", "replace")
     except OSError:
         return False
-    return "no eligible trajectory runs found" in tail
+    return any(marker in tail for marker in EMPTY_BATCH_MARKERS)
 
 
 def publish_batch_with_retry(
@@ -416,15 +505,23 @@ def command_base(args: argparse.Namespace, batch_dir: Path) -> list[str]:
         "--agent-backend", args.agent_backend,
         "--openai-model", args.openai_model,
         "--openai-reasoning-effort", args.openai_reasoning_effort,
+        "--anthropic-model", args.anthropic_model,
+        "--anthropic-effort", args.anthropic_effort,
         "--judge-model", args.judge_model,
         "--judge-max-images", str(args.judge_max_images),
         "--judge-impl", args.judge_impl,
         "--start-url-mode", args.start_url_mode,
+        "--screen-width", str(args.screen_width),
+        "--screen-height", str(args.screen_height),
     ]
     if args.dedupe_by_model:
         command.append("--dedupe-by-model")
     if args.exclude_task_ids_file is not None:
         command.extend(["--exclude-task-ids-file", str(args.exclude_task_ids_file)])
+    if args.rubric_overlay_json is not None:
+        command.extend(["--rubric-overlay-json", str(args.rubric_overlay_json)])
+    if args.dedupe_by_run_label_prefix:
+        command.extend(["--dedupe-by-run-label-prefix", args.dedupe_by_run_label_prefix])
     return command
 
 
@@ -434,8 +531,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--batch-size", type=int, default=3)
     value.add_argument("--num-envs", type=int, default=3)
     value.add_argument("--judge-workers", type=int, default=3)
-    value.add_argument("--max-steps", type=int, default=120)
-    value.add_argument("--max-trajectory-length", type=int, default=120)
+    value.add_argument("--max-steps", type=int, default=100)
+    value.add_argument("--max-trajectory-length", type=int, default=100)
     value.add_argument("--request-timeout", type=float, default=600.0)
     value.add_argument("--max-retries", type=int, default=3)
     value.add_argument("--min-free-gib", type=float, default=35.0)
@@ -451,7 +548,9 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--shard-index", type=int, default=0)
     value.add_argument("--max-batches", type=int, default=0)
     value.add_argument("--exclude-task-ids-file", type=Path, default=None)
-    value.add_argument("--agent-backend", choices=("muse-spark", "openai"), default="muse-spark")
+    value.add_argument("--agent-backend", choices=("muse-spark", "openai", "anthropic"), default="muse-spark")
+    value.add_argument("--anthropic-model", default="claude-opus-5")
+    value.add_argument("--anthropic-effort", default="high")
     value.add_argument("--openai-model", default="gpt-5.6-luna")
     value.add_argument(
         "--openai-reasoning-effort",
@@ -460,9 +559,14 @@ def parser() -> argparse.ArgumentParser:
     )
     value.add_argument("--judge-model", default="gpt-5.4-mini")
     value.add_argument("--dedupe-by-model", action="store_true")
+    value.add_argument("--rubric-overlay-json", type=Path, default=None)
+    value.add_argument("--dedupe-by-run-label-prefix", default="")
+    value.add_argument("--run-label-prefix", default="Apollo author-approved")
     value.add_argument("--judge-max-images", type=int, default=0)
     value.add_argument("--judge-impl", choices=("repo", "canonical"), default="canonical")
     value.add_argument("--start-url-mode", choices=("google", "site_scope"), default="google")
+    value.add_argument("--screen-width", type=int, default=1920)
+    value.add_argument("--screen-height", type=int, default=1080)
     value.add_argument(
         "--block-marker",
         type=Path,
@@ -481,10 +585,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.shard_count < 1 or args.shard_index < 0 or args.shard_index >= args.shard_count:
         raise SystemExit("shard index must be between 0 and shard-count - 1")
     token = os.environ.get("APOLLO_REPORTING_TOKEN", "").strip()
-    key_name = "OPENAI_API_KEY" if args.agent_backend == "openai" else "MUSE_SPARK_API_KEY"
-    agent_key = os.environ.get(key_name, "").strip()
-    if not token or not agent_key:
-        raise SystemExit(f"APOLLO_REPORTING_TOKEN and {key_name} are required")
+    missing = [name for name in required_keys(args.agent_backend, args.judge_model)
+               if not os.environ.get(name, "").strip()]
+    if not token:
+        missing.insert(0, "APOLLO_REPORTING_TOKEN")
+    if missing:
+        raise SystemExit(f"{', '.join(missing)} required for the {args.agent_backend} backend")
 
     root = args.work_root.resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -530,6 +636,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     write_private_json(state_path, state)
 
     try:
+        def republish(batch_dir: Path) -> QueueRunError | None:
+            number = int(batch_dir.name.removeprefix("batch-"))
+            vendor = "OpenAI" if args.agent_backend == "openai" else "Meta"
+            label = (
+                f"{args.run_label_prefix} {vendor} production shard "
+                f"{args.shard_index + 1}/{args.shard_count} batch {number:06d}"
+            )
+            task_count = int(read_json(batch_dir / "job.json").get("task_count") or 1)
+            return publish_batch_with_retry(
+                command_base(args, batch_dir),
+                min(args.judge_workers, task_count),
+                label,
+                batch_dir / "command.log",
+            )
+
         recover_published_batches(
             root,
             state,
@@ -538,6 +659,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             token=token,
             reporting_attempts=args.reporting_attempts,
             reporting_delay=args.reporting_delay,
+            republish=republish,
         )
         consecutive_empty_batches = 0
         excluded_ids = read_task_id_list(args.exclude_task_ids_file)
@@ -565,10 +687,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 shard_count=args.shard_count,
                 shard_index=args.shard_index,
                 excluded_ids=excluded_ids,
-                dedupe_model=(
-                    (args.openai_model if args.agent_backend == "openai" else None)
-                    if args.dedupe_by_model else None
-                ),
+                dedupe_model=(agent_model_for(args) if args.dedupe_by_model else None),
+                dedupe_run_label_prefix=args.dedupe_by_run_label_prefix or None,
+                rubric_overlay_json=args.rubric_overlay_json,
             )
             state["remaining_runnable"] = remaining
             state["existing_trajectory_task_ids"] = existing
@@ -589,7 +710,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             selected_count = min(args.batch_size, remaining)
             vendor = "OpenAI" if args.agent_backend == "openai" else "Meta"
             run_label = (
-                f"Apollo author-approved {vendor} production shard "
+                f"{args.run_label_prefix} {vendor} production shard "
                 f"{args.shard_index + 1}/{args.shard_count} batch {batch_number:06d}"
             )
             log(
@@ -619,10 +740,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                         args.queue, token,
                         shard_count=args.shard_count, shard_index=args.shard_index,
                         excluded_ids=excluded_ids,
-                        dedupe_model=(
-                            (args.openai_model if args.agent_backend == "openai" else None)
-                            if args.dedupe_by_model else None
-                        ),
+                        dedupe_model=(agent_model_for(args) if args.dedupe_by_model else None),
+                        dedupe_run_label_prefix=args.dedupe_by_run_label_prefix or None,
+                        rubric_overlay_json=args.rubric_overlay_json,
                     )
                     if still == 0:
                         state["status"] = "complete"
@@ -710,6 +830,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         state["updated_at_utc"] = utc_now()
         write_private_json(state_path, state)
         log(f"stopped on error: {exc}")
+        # A bare message like "[Errno 4] Interrupted system call" says nothing
+        # about where it came from; keep the traceback next to it.
+        log(traceback.format_exc().rstrip())
         return 1
 
     state["updated_at_utc"] = utc_now()
